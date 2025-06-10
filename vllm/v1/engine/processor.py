@@ -26,6 +26,7 @@ from vllm.v1.structured_output.backend_xgrammar import (
     validate_xgrammar_grammar)
 
 
+# processor: inputs to requests. Init in async_llm.py
 class Processor:
 
     def __init__(
@@ -218,6 +219,7 @@ class Processor:
         if arrival_time is None:
             arrival_time = time.time()
 
+        # input preprocessing.
         # Process inputs, which includes:
         # 1. Tokenize text prompt, with LoRA request if one exists.
         # 2. For multimodal models with a merged preprocessor, preprocess
@@ -248,6 +250,7 @@ class Processor:
         assert isinstance(params, SamplingParams)
         # TODO: can we avoid cloning here in multiproc case?
         sampling_params = params.clone()
+        # relationship between max_tokens and max_model_len
         # If unset max tokens, then generate up to the max_model_len.
         if sampling_params.max_tokens is None:
             sampling_params.max_tokens = (

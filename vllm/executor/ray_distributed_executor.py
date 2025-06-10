@@ -48,6 +48,7 @@ class RayWorkerMetaData:
     ip: str = ""
 
 
+# also base class for v1 ray executor.
 class RayDistributedExecutor(DistributedExecutorBase):
     """Ray-based distributed executor"""
 
@@ -169,6 +170,7 @@ class RayDistributedExecutor(DistributedExecutorBase):
         # the TP group of workers for a PP rank.
         self.pp_tp_workers: List[List[RayWorkerWrapper]] = []
 
+        # explicity set nsight to work with ray.
         if self.parallel_config.ray_workers_use_nsight:
             ray_remote_kwargs = self._configure_ray_workers_use_nsight(
                 ray_remote_kwargs)
@@ -578,6 +580,7 @@ class RayDistributedExecutor(DistributedExecutorBase):
         logger.info("RAY_CGRAPH_get_timeout is set to %s",
                     os.environ["RAY_CGRAPH_get_timeout"])  # noqa: SIM112
 
+        # This is how PP is implemented in v1.
         with InputNode() as input_data:
             # Example DAG: PP=2, TP=4
             #
@@ -626,6 +629,8 @@ class RayDistributedExecutor(DistributedExecutorBase):
 
             forward_dag = MultiOutputNode(outputs)
 
+        # The compiled DAG can choose communication channel (e.g. nccl, shm)
+        # And able to overlap communication with computation.
         return forward_dag.experimental_compile(
             enable_asyncio=enable_asyncio,
             _overlap_gpu_communication=envs.
@@ -648,6 +653,7 @@ class RayDistributedExecutor(DistributedExecutorBase):
         output = await dag_future[0]
         return self.output_decoder.decode(output)
 
+    # important: this is how distributed executor executes model.
     async def _driver_execute_model_async(
         self,
         execute_model_req: Optional[ExecuteModelRequest] = None

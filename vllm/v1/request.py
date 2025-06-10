@@ -15,6 +15,7 @@ if TYPE_CHECKING:
     from vllm.lora.request import LoRARequest
 
 
+# Request used in v1 scheduler.
 class Request:
 
     def __init__(

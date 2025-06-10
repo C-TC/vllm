@@ -45,6 +45,7 @@ POLLING_TIMEOUT_S = 2.5
 _R = TypeVar('_R')  # Return type for collective_rpc
 
 
+# running in a background process. The actual engine core.
 class EngineCore:
     """Inner loop of vLLM's Engine."""
 
@@ -85,6 +86,8 @@ class EngineCore:
         # This warning can be removed once the V1 Scheduler interface is
         # finalized and we can maintain support for scheduler classes that
         # implement it
+        # I don't understand the logic. 
+        # Focus on V1Scheduler in v1/core/sched/scheduler.py
         if Scheduler is not V1Scheduler:
             logger.warning(
                 "Using configured V1 scheduler class %s. "
@@ -189,6 +192,7 @@ class EngineCore:
         self.scheduler.finish_requests(request_ids,
                                        RequestStatus.FINISHED_ABORTED)
 
+    # Engine core step (no PP)
     def step(self) -> EngineCoreOutputs:
         """Schedule, execute, and make output."""
 
@@ -206,6 +210,7 @@ class EngineCore:
 
         return engine_core_outputs
 
+    # Engine core step (with PP)
     def step_with_batch_queue(self) -> Optional[EngineCoreOutputs]:
         """Schedule and execute batches with the batch queue.
         Note that if nothing to output in this step, None is returned.

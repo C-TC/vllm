@@ -200,6 +200,7 @@ def get_kwargs(cls: ConfigType) -> dict[str, Any]:
     return kwargs
 
 
+# arguments for vLLM engine, init in llm.py
 @dataclass
 class EngineArgs:
     """Arguments for vLLM engine."""
@@ -356,6 +357,7 @@ class EngineArgs:
         from vllm.plugins import load_general_plugins
         load_general_plugins()
 
+    # cli args.
     @staticmethod
     def add_cli_args(parser: FlexibleArgumentParser) -> FlexibleArgumentParser:
         """Shared CLI arguments for vLLM engine."""
@@ -1075,6 +1077,7 @@ class EngineArgs:
 
         return speculative_config
 
+    # called in llm.py, used to initialize engine.
     def create_engine_config(
         self,
         usage_context: Optional[UsageContext] = None,
@@ -1295,6 +1298,7 @@ class EngineArgs:
         #############################################################
         # Unsupported Feature Flags on V1.
 
+        # unsupported features on v1, fall back otherwise
         if (self.load_format == LoadFormat.TENSORIZER.value
                 or self.load_format == LoadFormat.SHARDED_STATE.value):
             _raise_or_fallback(
@@ -1565,6 +1569,7 @@ class EngineArgs:
     def _set_default_args_v1(self, usage_context: UsageContext) -> None:
         """Set Default Arguments for V1 Engine."""
 
+        # v1 always uses chunked prefill?
         # V1 always uses chunked prefills.
         self.enable_chunked_prefill = True
 
@@ -1574,6 +1579,7 @@ class EngineArgs:
 
         # V1 should use the new scheduler by default.
         # Swap it only if this arg is set to the original V0 default
+        # new scheduler?
         if self.scheduler_cls == EngineArgs.scheduler_cls:
             self.scheduler_cls = "vllm.v1.core.sched.scheduler.Scheduler"
 
@@ -1593,6 +1599,7 @@ class EngineArgs:
             # This is only used to set default_max_num_batched_tokens
             device_memory = 0
 
+        # hardcoded performance tuning for different hardware.
         if device_memory >= 70 * GiB_bytes:
             # For GPUs like H100 and MI300x, use larger default values.
             default_max_num_batched_tokens = {

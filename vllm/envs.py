@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
+# general: env vars that are supported.
 import hashlib
 import os
 import sys
@@ -137,6 +138,8 @@ def maybe_convert_int(value: Optional[str]) -> Optional[int]:
 
 # begin-env-vars-definition
 
+# env vars for vllm engine
+# including installation and runtime env vars
 environment_variables: dict[str, Callable[[], Any]] = {
 
     # ================== Installation Time Env Vars ==================
@@ -194,6 +197,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
 
     # Root directory for vLLM cache files
     # Defaults to `~/.cache/vllm` unless `XDG_CACHE_HOME` is set
+    # vllm cache root
     "VLLM_CACHE_ROOT":
     lambda: os.path.expanduser(
         os.getenv(
@@ -219,6 +223,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
 
     # path used for ipc when the frontend api server is running in
     # multi-processing mode to communicate with the backend engine process.
+    # rpc?
     'VLLM_RPC_BASE_PATH':
     lambda: os.getenv('VLLM_RPC_BASE_PATH', tempfile.gettempdir()),
 
@@ -228,6 +233,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     lambda: os.environ.get("VLLM_USE_MODELSCOPE", "False").lower() == "true",
 
     # Interval in seconds to log a warning message when the ring buffer is full
+    # ring buffer for messages?
     "VLLM_RINGBUFFER_WARNING_INTERVAL":
     lambda: int(os.environ.get("VLLM_RINGBUFFER_WARNING_INTERVAL", "60")),
 
@@ -279,6 +285,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     lambda: os.environ.get("VLLM_API_KEY", None),
 
     # Whether to log responses from API Server for debugging
+    # debug var for api server response
     "VLLM_DEBUG_LOG_API_SERVER_RESPONSE":
     lambda: os.environ.get("VLLM_DEBUG_LOG_API_SERVER_RESPONSE", "False").
     lower() == "true",
@@ -292,6 +299,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     lambda: os.environ.get("S3_ENDPOINT_URL", None),
 
     # Usage stats collection
+    # usage stats server?
     "VLLM_USAGE_STATS_SERVER":
     lambda: os.environ.get("VLLM_USAGE_STATS_SERVER", "https://stats.vllm.ai"),
     "VLLM_NO_USAGE_STATS":
@@ -303,6 +311,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     lambda: os.environ.get("VLLM_USAGE_SOURCE", "production"),
 
     # Logging configuration
+    # set logging and log level
     # If set to 0, vllm will not configure logging
     # If set to 1, vllm will configure logging using the default configuration
     #    or the configuration file specified by VLLM_LOGGING_CONFIG_PATH
@@ -330,6 +339,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Trace function calls
     # If set to 1, vllm will trace function calls
     # Useful for debugging
+    # function tracing? worth trying, overhead?
     "VLLM_TRACE_FUNCTION":
     lambda: int(os.getenv("VLLM_TRACE_FUNCTION", "0")),
 
@@ -341,6 +351,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # - "ROCM_FLASH": use ROCmFlashAttention
     # - "FLASHINFER": use flashinfer
     # - "FLASHMLA": use FlashMLA
+    # Need to know what backend is used when.
     "VLLM_ATTENTION_BACKEND":
     lambda: os.getenv("VLLM_ATTENTION_BACKEND", None),
 
@@ -351,15 +362,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
 
     # If set, vllm will force flashinfer to use tensor cores;
     # otherwise will use heuristic based on model architecture.
+    # we can even force tensor cores for flashinfer backend?
     "VLLM_FLASHINFER_FORCE_TENSOR_CORES":
     lambda: bool(int(os.getenv("VLLM_FLASHINFER_FORCE_TENSOR_CORES", "0"))),
 
     # Pipeline stage partition strategy
+    # PP layer partition strategy? Could be important.
     "VLLM_PP_LAYER_PARTITION":
     lambda: os.getenv("VLLM_PP_LAYER_PARTITION", None),
 
     # (CPU backend only) CPU key-value cache space.
     # default is 4 GiB
+    # size for kv cache offloading?
     "VLLM_CPU_KVCACHE_SPACE":
     lambda: int(os.getenv("VLLM_CPU_KVCACHE_SPACE", "0")),
 
@@ -371,6 +385,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # (CPU backend only) whether to use prepack for MoE layer. This will be
     # passed to ipex.llm.modules.GatedMLPMOE. On unsupported CPUs, you might
     # need to set this to "0" (False).
+    # prepacking in cpu? interesting, specific to new intel cpu?
     "VLLM_CPU_MOE_PREPACK":
     lambda: bool(int(os.getenv("VLLM_CPU_MOE_PREPACK", "1"))),
 
@@ -378,6 +393,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # processes from the engine, and we use the same mechanism to trigger
     # execution on all workers.
     # Run vLLM with VLLM_USE_RAY_SPMD_WORKER=1 to enable it.
+    # this is the ray backend for PP?
     "VLLM_USE_RAY_SPMD_WORKER":
     lambda: bool(int(os.getenv("VLLM_USE_RAY_SPMD_WORKER", "0"))),
 
@@ -387,6 +403,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Run vLLM with VLLM_USE_RAY_COMPILED_DAG=1 to enable it.
     # Note that this variable is set to 1 in V1 by default
     # when ray distributed executor is used.
+    # how much overhead will ray bring? and how much speedup with this?
     "VLLM_USE_RAY_COMPILED_DAG":
     lambda: bool(int(os.getenv("VLLM_USE_RAY_COMPILED_DAG", "0"))),
 
@@ -398,12 +415,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # - "nccl": use NCCL for communication
     # - "shm": use shared memory and gRPC for communication
     # This flag is ignored if VLLM_USE_RAY_COMPILED_DAG is not set.
+    # ray can use nccl or shm for communication in compiled dag?
     "VLLM_USE_RAY_COMPILED_DAG_CHANNEL_TYPE":
     lambda: os.getenv("VLLM_USE_RAY_COMPILED_DAG_CHANNEL_TYPE", "auto"),
 
     # If the env var is set, it enables GPU communication overlap
     # (experimental feature) in Ray's Compiled Graph. This flag is ignored if
     # VLLM_USE_RAY_COMPILED_DAG is not set.
+    # and what does this overlap mean?
     "VLLM_USE_RAY_COMPILED_DAG_OVERLAP_COMM":
     lambda: bool(int(os.getenv("VLLM_USE_RAY_COMPILED_DAG_OVERLAP_COMM", "0"))
                  ),
@@ -594,8 +613,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     lambda: int(os.getenv("V_SCALE_CONSTANT", "100")),
 
     # If set, enable multiprocessing in LLM for the V1 code path.
+    # what is multiprocessing in vllm?
     "VLLM_ENABLE_V1_MULTIPROCESSING":
     lambda: bool(int(os.getenv("VLLM_ENABLE_V1_MULTIPROCESSING", "1"))),
+    # log batch size interval?
     "VLLM_LOG_BATCHSIZE_INTERVAL":
     lambda: float(os.getenv("VLLM_LOG_BATCHSIZE_INTERVAL", "-1")),
     "VLLM_DISABLE_COMPILE_CACHE":
@@ -630,6 +651,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Number of GPUs per worker in Ray, if it is set to be a fraction,
     # it allows ray to schedule multiple actors on a single GPU,
     # so that users can colocate other actors on the same GPUs as vLLM.
+    # supports colocation of multiple actors for rlhf?
     "VLLM_RAY_PER_WORKER_GPUS":
     lambda: float(os.getenv("VLLM_RAY_PER_WORKER_GPUS", "1.0")),
 
@@ -658,6 +680,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ("1", "true"),
 
     # Rank of the process in the data parallel setting
+    # DP? There is some master node scheduling?
     "VLLM_DP_RANK":
     lambda: int(os.getenv("VLLM_DP_RANK", "0")),
 
@@ -760,6 +783,7 @@ def set_vllm_use_v1(use_v1: bool):
 
 
 def compute_hash() -> str:
+    # hash for computation graph
     """
     WARNING: Whenever a new key is added to this environment
     variables, ensure that it is included in the factors list if

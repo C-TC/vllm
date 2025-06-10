@@ -24,6 +24,7 @@ class FutureWrapper(Future):
         return self.ref.get()
 
 
+# model executor for ray backend in v1.
 class RayDistributedExecutor(RayDistributedExecutorV0, Executor):
     """Ray distributed executor using Ray Compiled Graphs."""
 
@@ -58,4 +59,5 @@ class RayDistributedExecutor(RayDistributedExecutorV0, Executor):
 
         # When PP is used, we return a FutureWrapper immediately so that
         # the scheduler can yield to the next batch.
+        # When PP is used, return a FutureWrapper non-blocking.
         return FutureWrapper(refs[0])

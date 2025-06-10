@@ -200,6 +200,7 @@ def get_field(cls: ConfigType, name: str) -> Field:
         f"{cls.__name__}.{name} must have a default value or default factory.")
 
 
+# Model config, init in arg_utils.py
 class ModelConfig:
     """Configuration for the model.
 
@@ -1292,6 +1293,7 @@ CacheDType = Literal["auto", "fp8", "fp8_e4m3", "fp8_e5m2"]
 PrefixCachingHashAlgo = Literal["builtin", "sha256"]
 
 
+# cache config, init in arg_utils.py
 @config
 @dataclass
 class CacheConfig:
@@ -1565,6 +1567,7 @@ class LoadConfig:
 DistributedExecutorBackend = Literal["ray", "mp", "uni", "external_launcher"]
 
 
+# no EP?
 @config
 @dataclass
 class ParallelConfig:
@@ -1598,6 +1601,7 @@ class ParallelConfig:
     """IP of the data parallel master."""
     data_parallel_master_port: int = 29500
     """Port of the data parallel master."""
+    # it's either TP or EP?
     enable_expert_parallel: bool = False
     """Use expert parallelism instead of tensor parallelism for MoE layers."""
 
@@ -1613,6 +1617,7 @@ class ParallelConfig:
     """This parameter is deprecated and will be removed in a future release.
     Please remove it from your configs"""
 
+    # need this flag to profile ray workers?
     ray_workers_use_nsight: bool = False
     """Whether to profile Ray workers with nsight, see https://docs.ray.io/en/latest/ray-observability/user-guides/profiling.html#profiling-nsight-profiler."""
 
@@ -1816,6 +1821,7 @@ PreemptionMode = Literal["swap", "recompute"]
 SchedulerPolicy = Literal["fcfs", "priority"]
 
 
+# scheduler config
 @config
 @dataclass
 class SchedulerConfig:

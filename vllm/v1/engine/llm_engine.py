@@ -34,6 +34,7 @@ logger = init_logger(__name__)
 _R = TypeVar("_R", default=Any)
 
 
+# v1 engine defined here.
 class LLMEngine:
     """Legacy LLMEngine for backwards compatibility."""
 

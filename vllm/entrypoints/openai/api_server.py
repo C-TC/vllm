@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
+# entrypoint for serving.
 import asyncio
 import atexit
 import gc
@@ -173,6 +174,7 @@ async def build_async_engine_client_from_engine_args(
                 "To disable frontend multiprocessing, set VLLM_USE_V1=0.")
 
         from vllm.v1.engine.async_llm import AsyncLLM
+        # v1 asyncllm.
         async_llm: Optional[AsyncLLM] = None
         try:
             async_llm = AsyncLLM.from_vllm_config(
@@ -1039,6 +1041,7 @@ def create_server_socket(addr: tuple[str, int]) -> socket.socket:
     return sock
 
 
+# async io task definition.
 async def run_server(args, **uvicorn_kwargs) -> None:
     logger.info("vLLM API server version %s", VLLM_VERSION)
     logger.info("args: %s", args)
@@ -1127,4 +1130,6 @@ if __name__ == "__main__":
     args = parser.parse_args()
     validate_parsed_serve_args(args)
 
+    # uvloop to replace the asyncio default event loop.
+    # uvloop for asyncio.
     uvloop.run(run_server(args))

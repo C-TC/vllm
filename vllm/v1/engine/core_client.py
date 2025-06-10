@@ -391,6 +391,7 @@ class MPClient(EngineCoreClient):
                 output_path, index, local_dp_rank)
 
             # Start engine core process(es).
+            # launch one core engine in background process.
             self._init_core_engines(vllm_config, new_core_engine,
                                     self.resources.core_engines)
 
@@ -634,6 +635,7 @@ class SyncMPClient(MPClient):
         self.call_utility("save_sharded_state", path, pattern, max_size)
 
 
+# Used in DP=1 case.
 class AsyncMPClient(MPClient):
     """Asyncio-compatible client for multi-proc EngineCore."""
 
@@ -823,6 +825,8 @@ class AsyncMPClient(MPClient):
                                              args, kwargs)
 
 
+# Used in DP>1 case.
+# engine core, start in background.
 class DPAsyncMPClient(AsyncMPClient):
     """Asyncio-compatible client for multi-proc, multi-engine (data parallel)
     EngineCore."""
@@ -863,6 +867,7 @@ class DPAsyncMPClient(AsyncMPClient):
     async def add_request_async(self, request: EngineCoreRequest) -> None:
         request.current_wave = self.current_wave
 
+        # this is the master scheduler for load balancing?
         chosen_engine = self.get_core_engine_for_request()
         self.reqs_in_flight[request.request_id] = chosen_engine
         chosen_engine.num_reqs_in_flight += 1
@@ -881,17 +886,20 @@ class DPAsyncMPClient(AsyncMPClient):
 
         self._ensure_output_queue_task()
 
+    # load balancing?
     def get_core_engine_for_request(self) -> CoreEngine:
         return min(self.core_engines, key=lambda e: e.num_reqs_in_flight)
 
     @staticmethod
     async def process_engine_outputs(self: "DPAsyncMPClient",
                                      outputs: EngineCoreOutputs):
+        # reduce in flight request count.
         if self.reqs_in_flight:
             for req_id in outputs.finished_requests or ():
                 if engine := self.reqs_in_flight.pop(req_id, None):
                     engine.num_reqs_in_flight -= 1
 
+        # what is wave?
         if outputs.wave_complete is not None:
             # Current wave is complete, move to next wave number
             # and mark engines as paused.

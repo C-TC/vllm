@@ -239,6 +239,7 @@ class OpenAIServingChat(OpenAIServing):
                         params=sampling_params,
                     )
                 else:
+                    # send request to engine client.
                     generator = self.engine_client.generate(
                         engine_prompt,
                         sampling_params,

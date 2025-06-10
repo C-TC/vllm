@@ -221,6 +221,7 @@ class RequestState:
             stop_reason=stop_reason if finished else None)
 
 
+# output processor: requests to outputs. Init in async_llm.py
 class OutputProcessor:
     """Process EngineCoreOutputs into RequestOutputs."""
 
@@ -322,6 +323,7 @@ class OutputProcessor:
 
         request_outputs: list[RequestOutput] = []
         reqs_to_abort: list[str] = []
+        # important: loop over engine core outputs.
         for engine_core_output in engine_core_outputs:
             req_id = engine_core_output.request_id
             req_state = self.request_states.get(req_id)
@@ -330,6 +332,7 @@ class OutputProcessor:
                 continue
 
             # 1) Compute stats for this iteration.
+            # compute stats
             self._update_stats_from_output(req_state, engine_core_output,
                                            engine_core_timestamp,
                                            iteration_stats)

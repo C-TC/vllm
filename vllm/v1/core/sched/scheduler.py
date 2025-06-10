@@ -79,6 +79,7 @@ class Scheduler(SchedulerInterface):
         # req_id -> Request
         self.requests: dict[str, Request] = {}
         # Priority queues for requests.
+        # simple FIFO queue.
         self.waiting: deque[Request] = deque()
         self.running: list[Request] = []
 
@@ -134,6 +135,7 @@ class Scheduler(SchedulerInterface):
             use_eagle=self.use_eagle,
             log_stats=self.log_stats)
 
+    # important: this is the main scheduling loop.
     def schedule(self) -> SchedulerOutput:
         # NOTE(woosuk) on the scheduling algorithm:
         # There's no "decoding phase" nor "prefill phase" in the scheduler.

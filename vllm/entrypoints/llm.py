@@ -244,6 +244,8 @@ class LLM:
         )
 
         # Create the Engine (autoselects V0 vs V1)
+        # initialize the engine with the engine_args
+        # focus on v1 engine
         self.llm_engine = LLMEngine.from_engine_args(
             engine_args=engine_args, usage_context=UsageContext.LLM_CLASS)
         self.engine_class = type(self.llm_engine)

@@ -18,6 +18,7 @@ from vllm.v1.outputs import ModelRunnerOutput
 FailureCallback = Callable[[], None]
 
 
+# all types of executors. Focus on v1 ray executor.
 class Executor(ExecutorBase):
     """
     Abstract class for v1 executors, mainly define some methods for v1.
