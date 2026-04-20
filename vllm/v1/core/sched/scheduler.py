@@ -60,6 +60,9 @@ from vllm.v1.request import Request, RequestStatus, StreamingUpdate
 from vllm.v1.spec_decode.metrics import SpecDecodingStats
 from vllm.v1.structured_output import StructuredOutputManager
 from vllm.v1.utils import record_function_or_nullcontext
+from vllm.entrypoints.openai.chat_completion.workflow_test_hook import (
+    record_scheduler_request,
+)
 
 logger = init_logger(__name__)
 
@@ -1749,6 +1752,15 @@ class Scheduler(SchedulerInterface):
                 request.streaming_queue = deque()
             self._enqueue_waiting_request(request)
             self.requests[request.request_id] = request
+            extra_args = None
+            if request.sampling_params is not None:
+                extra_args = request.sampling_params.extra_args
+            record_scheduler_request(
+                request_id=request.request_id,
+                vllm_xargs=extra_args,
+                dp_rank=self.parallel_config.data_parallel_index,
+                client_index=request.client_index,
+            )
             if self.log_stats:
                 request.record_event(EngineCoreEventType.QUEUED)
 

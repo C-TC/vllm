@@ -14,6 +14,11 @@ from vllm.entrypoints.openai.chat_completion.protocol import (
     ChatCompletionResponse,
 )
 from vllm.entrypoints.openai.chat_completion.serving import OpenAIServingChat
+from vllm.entrypoints.openai.chat_completion.workflow_test_hook import (
+    record_chat_request,
+    router as workflow_test_hook_router,
+    workflow_test_hook_enabled,
+)
 from vllm.entrypoints.openai.engine.protocol import ErrorResponse
 from vllm.entrypoints.openai.orca_metrics import metrics_header
 from vllm.entrypoints.openai.utils import validate_json_request
@@ -53,6 +58,11 @@ def batch_chat(request: Request) -> OpenAIServingChatBatch | None:
 async def create_chat_completion(request: ChatCompletionRequest, raw_request: Request):
     metrics_header_format = raw_request.headers.get(
         ENDPOINT_LOAD_METRICS_FORMAT_HEADER_LABEL, ""
+    )
+    record_chat_request(
+        path=str(raw_request.url.path),
+        request_id=request.request_id,
+        vllm_xargs=request.vllm_xargs,
     )
     handler = chat(raw_request)
     if handler is None:
@@ -104,3 +114,5 @@ async def create_batch_chat_completion(
 
 def attach_router(app: FastAPI):
     app.include_router(router)
+    if workflow_test_hook_enabled():
+        app.include_router(workflow_test_hook_router)

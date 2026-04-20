@@ -1,0 +1,161 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
+from __future__ import annotations
+
+import json
+import os
+from collections import deque
+from dataclasses import asdict, dataclass
+from pathlib import Path
+from threading import Lock
+from typing import Any
+
+from fastapi import APIRouter
+
+_MAX_RECORDS = 256
+_WORKFLOW_TEST_HOOK_ENV = "WORKFLOW_TEST_HOOK"
+_WORKFLOW_TEST_HOOK_FILE_ENV = "WORKFLOW_TEST_HOOK_FILE"
+_DEFAULT_HOOK_FILE = "/tmp/vllm_workflow_test_hook.jsonl"
+
+
+@dataclass(slots=True, frozen=True)
+class WorkflowTestHookRecord:
+    source: str
+    path: str | None
+    request_id: str | None
+    vllm_xargs: dict[str, Any] | None
+    dp_rank: int | None = None
+    client_index: int | None = None
+    pid: int | None = None
+
+
+router = APIRouter()
+_records: deque[WorkflowTestHookRecord] = deque(maxlen=_MAX_RECORDS)
+_records_lock = Lock()
+
+
+def workflow_test_hook_enabled() -> bool:
+    value = os.getenv(_WORKFLOW_TEST_HOOK_ENV, "")
+    return value == "1"
+
+
+def _hook_file_path() -> Path:
+    return Path(os.getenv(_WORKFLOW_TEST_HOOK_FILE_ENV, _DEFAULT_HOOK_FILE))
+
+
+def record_chat_request(
+    *,
+    path: str,
+    request_id: str | None,
+    vllm_xargs: dict[str, Any] | None,
+) -> None:
+    _record_event(
+        source="api_server",
+        path=path,
+        request_id=request_id,
+        vllm_xargs=vllm_xargs,
+    )
+
+
+def record_scheduler_request(
+    *,
+    request_id: str | None,
+    vllm_xargs: dict[str, Any] | None,
+    dp_rank: int | None,
+    client_index: int | None,
+) -> None:
+    _record_event(
+        source="scheduler",
+        path=None,
+        request_id=request_id,
+        vllm_xargs=vllm_xargs,
+        dp_rank=dp_rank,
+        client_index=client_index,
+    )
+
+
+def _record_event(
+    *,
+    source: str,
+    path: str | None,
+    request_id: str | None,
+    vllm_xargs: dict[str, Any] | None,
+    dp_rank: int | None = None,
+    client_index: int | None = None,
+) -> None:
+    if not workflow_test_hook_enabled():
+        return
+    record = WorkflowTestHookRecord(
+        source=source,
+        path=path,
+        request_id=request_id,
+        vllm_xargs=dict(vllm_xargs) if isinstance(vllm_xargs, dict) else None,
+        dp_rank=dp_rank,
+        client_index=client_index,
+        pid=os.getpid(),
+    )
+    with _records_lock:
+        _records.append(record)
+    _append_record_to_file(record)
+
+
+def _append_record_to_file(record: WorkflowTestHookRecord) -> None:
+    hook_file = _hook_file_path()
+    hook_file.parent.mkdir(parents=True, exist_ok=True)
+    with hook_file.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(asdict(record), sort_keys=True))
+        handle.write("\n")
+
+
+def _read_file_records() -> list[dict[str, object]]:
+    hook_file = _hook_file_path()
+    if not hook_file.exists():
+        return []
+    records: list[dict[str, object]] = []
+    with hook_file.open("r", encoding="utf-8") as handle:
+        for line in handle:
+            line = line.strip()
+            if not line:
+                continue
+            payload = json.loads(line)
+            if isinstance(payload, dict):
+                records.append(payload)
+    return records
+
+
+def _clear_file_records() -> int:
+    hook_file = _hook_file_path()
+    if not hook_file.exists():
+        return 0
+    with hook_file.open("r", encoding="utf-8") as handle:
+        cleared = sum(1 for _ in handle)
+    hook_file.write_text("", encoding="utf-8")
+    return cleared
+
+
+@router.get("/debug/workflow_test_hook/records")
+async def get_workflow_test_hook_records() -> dict[str, object]:
+    with _records_lock:
+        memory_records = [asdict(record) for record in _records]
+    file_records = _read_file_records()
+    return {
+        "enabled": True,
+        "memory_records": memory_records,
+        "file_records": file_records,
+        "records": memory_records + file_records,
+    }
+
+
+@router.delete("/debug/workflow_test_hook/records")
+async def clear_workflow_test_hook_records() -> dict[str, object]:
+    with _records_lock:
+        cleared_memory = len(_records)
+        _records.clear()
+    cleared_file = _clear_file_records()
+    return {
+        "enabled": True,
+        "cleared": cleared_memory + cleared_file,
+        "cleared_memory": cleared_memory,
+        "cleared_file": cleared_file,
+    }
