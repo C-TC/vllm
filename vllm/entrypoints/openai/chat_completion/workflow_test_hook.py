@@ -13,6 +13,10 @@ from typing import Any
 
 from fastapi import APIRouter
 
+from vllm.entrypoints.openai.chat_completion.workflow_sideband import (
+    validate_workflow_sideband,
+)
+
 _MAX_RECORDS = 256
 _WORKFLOW_TEST_HOOK_ENV = "WORKFLOW_TEST_HOOK"
 _WORKFLOW_TEST_HOOK_FILE_ENV = "WORKFLOW_TEST_HOOK_FILE"
@@ -25,6 +29,10 @@ class WorkflowTestHookRecord:
     path: str | None
     request_id: str | None
     vllm_xargs: dict[str, Any] | None
+    workflow_sideband_valid: bool | None = None
+    workflow_sideband_present_fields: tuple[str, ...] | None = None
+    workflow_sideband_missing_required_fields: tuple[str, ...] | None = None
+    workflow_sideband_issues: list[dict[str, str]] | None = None
     dp_rank: int | None = None
     client_index: int | None = None
     pid: int | None = None
@@ -86,18 +94,43 @@ def _record_event(
 ) -> None:
     if not workflow_test_hook_enabled():
         return
+    sideband_validation = validate_workflow_sideband(
+        vllm_xargs if isinstance(vllm_xargs, dict) else None
+    )
     record = WorkflowTestHookRecord(
         source=source,
         path=path,
         request_id=request_id,
         vllm_xargs=dict(vllm_xargs) if isinstance(vllm_xargs, dict) else None,
+        workflow_sideband_valid=(
+            sideband_validation.valid if sideband_validation is not None else None
+        ),
+        workflow_sideband_present_fields=(
+            sideband_validation.present_fields
+            if sideband_validation is not None
+            else None
+        ),
+        workflow_sideband_missing_required_fields=(
+            sideband_validation.missing_required_fields
+            if sideband_validation is not None
+            else None
+        ),
+        workflow_sideband_issues=(
+            sideband_validation.issues_as_dicts()
+            if sideband_validation is not None
+            else None
+        ),
         dp_rank=dp_rank,
         client_index=client_index,
         pid=os.getpid(),
     )
     with _records_lock:
         _records.append(record)
-    _append_record_to_file(record)
+    try:
+        _append_record_to_file(record)
+    except OSError:
+        # The hook is observability-only and must never affect request serving.
+        return
 
 
 def _append_record_to_file(record: WorkflowTestHookRecord) -> None:
