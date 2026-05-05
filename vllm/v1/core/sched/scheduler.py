@@ -1628,6 +1628,7 @@ class Scheduler(SchedulerInterface):
             last_group_key=self._workflow_scheduler_last_group_key,
             group_burst=self._workflow_scheduler_group_burst,
             max_burst=workflow_group_aware_max_burst(),
+            block_size=self.block_size,
         )
         if selection is None:
             return WorkflowGroupSelection(
@@ -1670,10 +1671,15 @@ class Scheduler(SchedulerInterface):
             vllm_xargs=extra_args,
             dp_rank=self.parallel_config.data_parallel_index,
             client_index=request.client_index,
+            prompt_token_ids=request.prompt_token_ids,
+            engine_prompt_token_count=request.num_prompt_tokens,
             group_aware_scheduling_enabled=True,
             workflow_scheduler_group_key=selection.group_key,
             workflow_scheduler_selected_rank=selection.selected_rank,
             workflow_scheduler_reason=selection.reason,
+            workflow_scheduler_group_source=selection.group_source,
+            workflow_scheduler_token_lcp_len=selection.token_lcp_len,
+            workflow_scheduler_token_lcp_hash=selection.token_lcp_hash,
         )
 
     def _handle_stopped_request(self, request: Request) -> bool:

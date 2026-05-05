@@ -48,6 +48,9 @@ class WorkflowTestHookRecord:
     workflow_scheduler_group_key: str | None = None
     workflow_scheduler_selected_rank: int | None = None
     workflow_scheduler_reason: str | None = None
+    workflow_scheduler_group_source: str | None = None
+    workflow_scheduler_token_lcp_len: int | None = None
+    workflow_scheduler_token_lcp_hash: str | None = None
     dp_rank: int | None = None
     client_index: int | None = None
     pid: int | None = None
@@ -107,6 +110,9 @@ def record_scheduler_request(
     workflow_scheduler_group_key: str | None = None,
     workflow_scheduler_selected_rank: int | None = None,
     workflow_scheduler_reason: str | None = None,
+    workflow_scheduler_group_source: str | None = None,
+    workflow_scheduler_token_lcp_len: int | None = None,
+    workflow_scheduler_token_lcp_hash: str | None = None,
 ) -> None:
     _record_event(
         source="scheduler",
@@ -122,6 +128,9 @@ def record_scheduler_request(
         workflow_scheduler_group_key=workflow_scheduler_group_key,
         workflow_scheduler_selected_rank=workflow_scheduler_selected_rank,
         workflow_scheduler_reason=workflow_scheduler_reason,
+        workflow_scheduler_group_source=workflow_scheduler_group_source,
+        workflow_scheduler_token_lcp_len=workflow_scheduler_token_lcp_len,
+        workflow_scheduler_token_lcp_hash=workflow_scheduler_token_lcp_hash,
     )
 
 
@@ -144,6 +153,9 @@ def _record_event(
     workflow_scheduler_group_key: str | None = None,
     workflow_scheduler_selected_rank: int | None = None,
     workflow_scheduler_reason: str | None = None,
+    workflow_scheduler_group_source: str | None = None,
+    workflow_scheduler_token_lcp_len: int | None = None,
+    workflow_scheduler_token_lcp_hash: str | None = None,
 ) -> None:
     if not workflow_test_hook_enabled():
         return
@@ -197,6 +209,9 @@ def _record_event(
         workflow_scheduler_group_key=workflow_scheduler_group_key,
         workflow_scheduler_selected_rank=workflow_scheduler_selected_rank,
         workflow_scheduler_reason=workflow_scheduler_reason,
+        workflow_scheduler_group_source=workflow_scheduler_group_source,
+        workflow_scheduler_token_lcp_len=workflow_scheduler_token_lcp_len,
+        workflow_scheduler_token_lcp_hash=workflow_scheduler_token_lcp_hash,
         dp_rank=dp_rank,
         client_index=client_index,
         pid=os.getpid(),

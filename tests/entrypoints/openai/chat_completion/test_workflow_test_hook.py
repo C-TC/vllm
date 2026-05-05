@@ -181,22 +181,38 @@ def test_workflow_test_hook_records_group_aware_scheduler_telemetry(
         vllm_xargs={"workflow_id": "wf"},
         dp_rank=0,
         client_index=1,
+        prompt_token_ids=[10, 20, 30, 40],
         group_aware_scheduling_enabled=True,
-        workflow_scheduler_group_key="spawn_group_id:main:fanout",
+        workflow_scheduler_group_key=(
+            "token_verified_lcp:model=unknown:token_domain=unknown:"
+            "len=4:hash=sha1:lcp"
+        ),
         workflow_scheduler_selected_rank=2,
-        workflow_scheduler_reason="spawn_group_id",
+        workflow_scheduler_reason="token_verified_lcp",
+        workflow_scheduler_group_source="token_verified_lcp",
+        workflow_scheduler_token_lcp_len=4,
+        workflow_scheduler_token_lcp_hash="sha1:lcp",
     )
 
     assert len(_records) == 1
     record = _records[0]
     assert record.source == "scheduler"
     assert record.group_aware_scheduling_enabled is True
-    assert record.workflow_scheduler_group_key == "spawn_group_id:main:fanout"
+    assert record.workflow_scheduler_group_key == (
+        "token_verified_lcp:model=unknown:token_domain=unknown:"
+        "len=4:hash=sha1:lcp"
+    )
     assert record.workflow_scheduler_selected_rank == 2
-    assert record.workflow_scheduler_reason == "spawn_group_id"
+    assert record.workflow_scheduler_reason == "token_verified_lcp"
+    assert record.workflow_scheduler_group_source == "token_verified_lcp"
+    assert record.workflow_scheduler_token_lcp_len == 4
+    assert record.workflow_scheduler_token_lcp_hash == "sha1:lcp"
     file_text = hook_file.read_text(encoding="utf-8")
     assert "workflow_scheduler_group_key" in file_text
-    assert "prompt_token_ids" not in file_text
+    assert "workflow_scheduler_token_lcp_len" in file_text
+    assert "sha1:lcp" in file_text
+    assert "[10, 20, 30, 40]" not in file_text
+    assert '"prompt_token_ids"' not in file_text
 
 
 def test_workflow_test_hook_file_write_failure_does_not_block_request(

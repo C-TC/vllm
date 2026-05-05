@@ -33,46 +33,64 @@ def test_workflow_grouping_env_defaults(monkeypatch) -> None:
     assert workflow_group_aware_max_burst() == 4
 
 
-def test_workflow_grouping_prefers_repeated_token_prompt_hash() -> None:
+def test_workflow_grouping_prefers_token_verified_lcp() -> None:
     req_a0 = _request(
         "a0",
         xargs={"stable_prefix_group_id": "stable-a"},
-        prompt_token_ids=[1, 2, 3],
+        prompt_token_ids=[1, 2, 3, 4, 5, 6],
     )
     req_b = _request(
         "b",
         xargs={"stable_prefix_group_id": "stable-b"},
-        prompt_token_ids=[9, 9],
+        prompt_token_ids=[9, 9, 9, 9],
     )
     req_a1 = _request(
         "a1",
         xargs={"stable_prefix_group_id": "stable-a"},
-        prompt_token_ids=[1, 2, 3],
+        prompt_token_ids=[1, 2, 3, 4, 8, 8],
     )
 
     selection = select_workflow_group_request(
         [req_b, req_a0, req_a1],
         last_group_key=None,
         group_burst=0,
+        block_size=4,
     )
 
     assert selection is not None
     assert selection.request is req_a0
     assert selection.selected_rank == 1
-    assert selection.reason == "token_verified_prompt_hash"
+    assert selection.reason == "token_verified_lcp"
+    assert selection.group_source == "token_verified_lcp"
+    assert selection.token_lcp_len == 4
+    assert selection.token_lcp_hash is not None
+    assert selection.token_lcp_hash.startswith("sha1:")
     assert selection.group_key is not None
-    assert selection.group_key.startswith("token_prompt:sha1:")
+    assert selection.group_key.startswith("token_verified_lcp:")
 
 
 def test_workflow_grouping_falls_back_to_stable_prefix_group() -> None:
-    req_a0 = _request("a0", xargs={"stable_prefix_group_id": "stable-a"})
-    req_b = _request("b", xargs={"stable_prefix_group_id": "stable-b"})
-    req_a1 = _request("a1", xargs={"stable_prefix_group_id": "stable-a"})
+    req_a0 = _request(
+        "a0",
+        xargs={"stable_prefix_group_id": "stable-a"},
+        prompt_token_ids=[1, 2, 3, 4],
+    )
+    req_b = _request(
+        "b",
+        xargs={"stable_prefix_group_id": "stable-b"},
+        prompt_token_ids=[9, 9, 9, 9],
+    )
+    req_a1 = _request(
+        "a1",
+        xargs={"stable_prefix_group_id": "stable-a"},
+        prompt_token_ids=[5, 6, 7, 8],
+    )
 
     selection = select_workflow_group_request(
         [req_b, req_a0, req_a1],
         last_group_key=None,
         group_burst=0,
+        block_size=4,
     )
 
     assert selection is not None
@@ -80,6 +98,7 @@ def test_workflow_grouping_falls_back_to_stable_prefix_group() -> None:
     assert selection.selected_rank == 1
     assert selection.group_key == "stable_prefix_group_id:stable-a"
     assert selection.reason == "stable_prefix_group_id"
+    assert selection.group_source == "stable_prefix_group_id"
 
 
 def test_workflow_grouping_burst_cap_advances_other_group() -> None:
