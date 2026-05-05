@@ -65,6 +65,11 @@ class WorkflowTestHookRecord:
     lease_full_block_count: int | None = None
     lease_ttl_ms: int | None = None
     prepared_prefix_object_status: str | None = None
+    prepared_prefix_ref_status: str | None = None
+    lease_event_status: str | None = None
+    lease_event_reason: str | None = None
+    lease_id_present: bool | None = None
+    prefix_id_present: bool | None = None
     prefix_token_count: int | None = None
     prefix_token_hash: str | None = None
     prepared_prefix_match_status: str | None = None
@@ -193,6 +198,11 @@ def record_workflow_action(
     lease_full_block_count: int | None = None,
     lease_ttl_ms: int | None = None,
     prepared_prefix_object_status: str | None = None,
+    prepared_prefix_ref_status: str | None = None,
+    lease_event_status: str | None = None,
+    lease_event_reason: str | None = None,
+    lease_id_present: bool | None = None,
+    prefix_id_present: bool | None = None,
     prefix_token_count: int | None = None,
     prefix_token_hash: str | None = None,
     engine_token_source: str | None = None,
@@ -225,6 +235,11 @@ def record_workflow_action(
         lease_full_block_count=lease_full_block_count,
         lease_ttl_ms=lease_ttl_ms,
         prepared_prefix_object_status=prepared_prefix_object_status,
+        prepared_prefix_ref_status=prepared_prefix_ref_status,
+        lease_event_status=lease_event_status,
+        lease_event_reason=lease_event_reason,
+        lease_id_present=lease_id_present,
+        prefix_id_present=prefix_id_present,
         prefix_token_count=prefix_token_count,
         prefix_token_hash=prefix_token_hash,
     )
@@ -266,6 +281,11 @@ def _record_event(
     lease_full_block_count: int | None = None,
     lease_ttl_ms: int | None = None,
     prepared_prefix_object_status: str | None = None,
+    prepared_prefix_ref_status: str | None = None,
+    lease_event_status: str | None = None,
+    lease_event_reason: str | None = None,
+    lease_id_present: bool | None = None,
+    prefix_id_present: bool | None = None,
     prefix_token_count: int | None = None,
     prefix_token_hash: str | None = None,
     prepared_prefix_match: dict[str, Any] | None = None,
@@ -340,6 +360,11 @@ def _record_event(
         lease_full_block_count=lease_full_block_count,
         lease_ttl_ms=lease_ttl_ms,
         prepared_prefix_object_status=prepared_prefix_object_status,
+        prepared_prefix_ref_status=prepared_prefix_ref_status,
+        lease_event_status=lease_event_status,
+        lease_event_reason=lease_event_reason,
+        lease_id_present=lease_id_present,
+        prefix_id_present=prefix_id_present,
         prefix_token_count=prefix_token_count,
         prefix_token_hash=prefix_token_hash,
         prepared_prefix_match_status=_prepared_prefix_match_str(

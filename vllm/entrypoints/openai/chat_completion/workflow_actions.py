@@ -85,6 +85,11 @@ class PreparedPrefix:
     lease_ttl_ms: int | None = None
     lease_cleanup_reason: str | None = None
     lease_cleanup_count: int | None = None
+    prepared_prefix_ref_status: str = "not_attempted"
+    lease_event_status: str | None = None
+    lease_event_reason: str | None = None
+    lease_id_present: bool | None = None
+    prefix_id_present: bool | None = None
 
     @classmethod
     def from_verified_action(
@@ -143,15 +148,29 @@ class PreparedPrefix:
                 lease_fields.get("lease_full_block_count")
             ),
             lease_ttl_ms=_optional_int(lease_fields.get("lease_ttl_ms")),
+            prepared_prefix_ref_status=_optional_str(
+                lease_fields.get("prepared_prefix_ref_status")
+            )
+            or "not_attempted",
+            lease_event_status=_optional_str(lease_fields.get("lease_event_status")),
+            lease_event_reason=_optional_str(lease_fields.get("lease_event_reason")),
+            lease_id_present=_optional_bool(lease_fields.get("lease_id_present")),
+            prefix_id_present=_optional_bool(lease_fields.get("prefix_id_present")),
         )
 
     def redacted_status(self) -> dict[str, Any]:
         lease_status = self.lease_status
         lease_reason = self.lease_reason
+        prepared_prefix_ref_status = self.prepared_prefix_ref_status
+        lease_event_status = self.lease_event_status
+        lease_event_reason = self.lease_event_reason
         object_status = self.object_status()
         if lease_status == "leased" and self.expires_at_unix_ms < _now_unix_ms():
             lease_status = "lease_expired"
             lease_reason = "ttl_expired"
+            prepared_prefix_ref_status = "lease_expired"
+            lease_event_status = "lease_expired"
+            lease_event_reason = "ttl_expired"
             object_status = "lease_expired"
         return {
             "action_id": self.action_id,
@@ -182,6 +201,11 @@ class PreparedPrefix:
             "lease_token_count": self.lease_token_count,
             "lease_full_block_count": self.lease_full_block_count,
             "lease_ttl_ms": self.lease_ttl_ms,
+            "prepared_prefix_ref_status": prepared_prefix_ref_status,
+            "lease_event_status": lease_event_status,
+            "lease_event_reason": lease_event_reason,
+            "lease_id_present": self.lease_id_present,
+            "prefix_id_present": self.prefix_id_present,
         }
 
     def object_status(self) -> str:
@@ -261,6 +285,30 @@ class PreparedPrefix:
             _optional_int(lease_update.get("lease_ttl_ms"))
             if "lease_ttl_ms" in lease_update
             else self.lease_ttl_ms
+        )
+        self.prepared_prefix_ref_status = (
+            _optional_str(lease_update.get("prepared_prefix_ref_status"))
+            or self.prepared_prefix_ref_status
+        )
+        self.lease_event_status = (
+            _optional_str(lease_update.get("lease_event_status"))
+            if "lease_event_status" in lease_update
+            else self.lease_event_status
+        )
+        self.lease_event_reason = (
+            _optional_str(lease_update.get("lease_event_reason"))
+            if "lease_event_reason" in lease_update
+            else self.lease_event_reason
+        )
+        self.lease_id_present = (
+            _optional_bool(lease_update.get("lease_id_present"))
+            if "lease_id_present" in lease_update
+            else self.lease_id_present
+        )
+        self.prefix_id_present = (
+            _optional_bool(lease_update.get("prefix_id_present"))
+            if "prefix_id_present" in lease_update
+            else self.prefix_id_present
         )
         if self.lease_status in {
             "lease_consumed",
@@ -864,6 +912,13 @@ def _lifecycle_response(
         lease_token_count=_optional_int(response.get("lease_token_count")),
         lease_full_block_count=_optional_int(response.get("lease_full_block_count")),
         lease_ttl_ms=_optional_int(response.get("lease_ttl_ms")),
+        prepared_prefix_ref_status=_optional_str(
+            response.get("prepared_prefix_ref_status")
+        ),
+        lease_event_status=_optional_str(response.get("lease_event_status")),
+        lease_event_reason=_optional_str(response.get("lease_event_reason")),
+        lease_id_present=_optional_bool(response.get("lease_id_present")),
+        prefix_id_present=_optional_bool(response.get("prefix_id_present")),
         prefix_token_count=prefix_token_count,
         prefix_token_hash=prefix_token_hash,
         engine_token_source=_optional_str(response.get("engine_token_source")),
@@ -981,6 +1036,11 @@ def _initial_lease_fields(
             "lease_token_count": prefix_token_count,
             "lease_full_block_count": None,
             "lease_ttl_ms": ttl_ms,
+            "prepared_prefix_ref_status": "observe_only",
+            "lease_event_status": "observe_only",
+            "lease_event_reason": "retention_mode_observe",
+            "lease_id_present": False,
+            "prefix_id_present": False,
         }
     if prewarm_status == "prewarm_completed":
         return _lease_update_for_prewarm_result(
@@ -995,6 +1055,11 @@ def _initial_lease_fields(
             "lease_token_count": prefix_token_count,
             "lease_full_block_count": None,
             "lease_ttl_ms": ttl_ms,
+            "prepared_prefix_ref_status": "pending_prewarm",
+            "lease_event_status": "pending_prewarm",
+            "lease_event_reason": "waiting_for_prewarm_completion",
+            "lease_id_present": False,
+            "prefix_id_present": False,
         }
     return {
         "lease_status": "not_attempted",
@@ -1002,6 +1067,11 @@ def _initial_lease_fields(
         "lease_token_count": prefix_token_count,
         "lease_full_block_count": None,
         "lease_ttl_ms": ttl_ms,
+        "prepared_prefix_ref_status": "not_attempted",
+        "lease_event_status": "not_attempted",
+        "lease_event_reason": "prewarm_not_completed",
+        "lease_id_present": False,
+        "prefix_id_present": False,
     }
 
 
@@ -1020,6 +1090,11 @@ def _lease_update_for_prewarm_result(
             "lease_token_count": prefix_token_count,
             "lease_full_block_count": None,
             "lease_ttl_ms": ttl_ms,
+            "prepared_prefix_ref_status": "observe_only",
+            "lease_event_status": "observe_only",
+            "lease_event_reason": "retention_mode_observe",
+            "lease_id_present": False,
+            "prefix_id_present": False,
         }
     if prewarm_status == "prewarm_completed":
         if isinstance(engine_lease_update, dict):
@@ -1041,6 +1116,29 @@ def _lease_update_for_prewarm_result(
                 ),
                 "lease_ttl_ms": _optional_int(engine_lease_update.get("lease_ttl_ms"))
                 or ttl_ms,
+                "prepared_prefix_ref_status": _optional_str(
+                    engine_lease_update.get("prepared_prefix_ref_status")
+                )
+                or _optional_str(engine_lease_update.get("lease_status"))
+                or "lease_failed",
+                "lease_event_status": _optional_str(
+                    engine_lease_update.get("lease_event_status")
+                )
+                or _optional_str(engine_lease_update.get("lease_status"))
+                or "lease_failed",
+                "lease_event_reason": _optional_str(
+                    engine_lease_update.get("lease_event_reason")
+                )
+                or _optional_str(engine_lease_update.get("lease_reason"))
+                or "missing_engine_lease_reason",
+                "lease_id_present": _optional_bool(
+                    engine_lease_update.get("lease_id_present")
+                )
+                or False,
+                "prefix_id_present": _optional_bool(
+                    engine_lease_update.get("prefix_id_present")
+                )
+                or False,
             }
         return {
             "lease_status": "lease_unavailable",
@@ -1048,6 +1146,11 @@ def _lease_update_for_prewarm_result(
             "lease_token_count": prefix_token_count,
             "lease_full_block_count": None,
             "lease_ttl_ms": ttl_ms,
+            "prepared_prefix_ref_status": "lease_unavailable",
+            "lease_event_status": "lease_unavailable",
+            "lease_event_reason": "no_safe_internal_cache_lease_api",
+            "lease_id_present": False,
+            "prefix_id_present": False,
         }
     return {
         "lease_status": "not_attempted",
@@ -1055,6 +1158,11 @@ def _lease_update_for_prewarm_result(
         "lease_token_count": prefix_token_count,
         "lease_full_block_count": None,
         "lease_ttl_ms": ttl_ms,
+        "prepared_prefix_ref_status": "not_attempted",
+        "lease_event_status": "not_attempted",
+        "lease_event_reason": prewarm_status,
+        "lease_id_present": False,
+        "prefix_id_present": False,
     }
 
 
@@ -1076,6 +1184,27 @@ def _lease_update_from_engine(
         ),
         "lease_ttl_ms": _optional_int(engine_lease_update.get("lease_ttl_ms"))
         or ttl_ms,
+        "prepared_prefix_ref_status": _optional_str(
+            engine_lease_update.get("prepared_prefix_ref_status")
+        )
+        or _optional_str(engine_lease_update.get("lease_status"))
+        or "lease_failed",
+        "lease_event_status": _optional_str(
+            engine_lease_update.get("lease_event_status")
+        )
+        or _optional_str(engine_lease_update.get("lease_status"))
+        or "lease_failed",
+        "lease_event_reason": _optional_str(
+            engine_lease_update.get("lease_event_reason")
+        )
+        or _optional_str(engine_lease_update.get("lease_reason"))
+        or "missing_engine_lease_reason",
+        "lease_id_present": _optional_bool(engine_lease_update.get("lease_id_present"))
+        or False,
+        "prefix_id_present": _optional_bool(
+            engine_lease_update.get("prefix_id_present")
+        )
+        or False,
     }
 
 
@@ -1098,6 +1227,13 @@ def _record_prepared_prefix_action(response: dict[str, Any]) -> None:
         prepared_prefix_object_status=_optional_str(
             response.get("prepared_prefix_object_status")
         ),
+        prepared_prefix_ref_status=_optional_str(
+            response.get("prepared_prefix_ref_status")
+        ),
+        lease_event_status=_optional_str(response.get("lease_event_status")),
+        lease_event_reason=_optional_str(response.get("lease_event_reason")),
+        lease_id_present=_optional_bool(response.get("lease_id_present")),
+        prefix_id_present=_optional_bool(response.get("prefix_id_present")),
         prefix_token_count=_optional_int(response.get("prefix_token_count")),
         prefix_token_hash=_optional_str(response.get("prefix_token_hash")),
         engine_token_source=_optional_str(response.get("engine_token_source")),
@@ -1151,6 +1287,10 @@ def _optional_int(value: Any) -> int | None:
 
 def _optional_str(value: Any) -> str | None:
     return value if isinstance(value, str) and value else None
+
+
+def _optional_bool(value: Any) -> bool | None:
+    return value if isinstance(value, bool) else None
 
 
 def _prewarm_attempted(prewarm_status: str) -> bool:

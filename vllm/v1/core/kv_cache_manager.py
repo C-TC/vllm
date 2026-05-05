@@ -37,11 +37,22 @@ def _workflow_prefix_lease_max_outstanding() -> int:
 
 
 @dataclass
-class _WorkflowPreparedPrefixLease:
+class _PreparedPrefixLeaseRef:
+    """Engine-private retention reference for a PreparedPrefix.
+
+    The ref owns private cached block references while it is live. Only
+    redacted status events derived from this object may cross back to the API
+    layer; block ids, cache hashes, and KV handles stay inside EngineCore.
+    """
+
+    lease_id: str
+    prefix_id: str
     action_id: str
     blocks: tuple[KVCacheBlock, ...]
     prefix_token_count: int
     full_block_count: int
+    ttl_ms: int
+    state: str
     expires_at_monotonic_s: float
 
 
@@ -52,14 +63,35 @@ def _workflow_lease_result(
     prefix_token_count: int,
     full_block_count: int,
     ttl_ms: int,
-) -> dict[str, int | str]:
+    prepared_prefix_ref_status: str | None = None,
+    lease_event_status: str | None = None,
+    lease_event_reason: str | None = None,
+    lease_id_present: bool = False,
+    prefix_id_present: bool = False,
+) -> dict[str, int | str | bool]:
+    ref_status = prepared_prefix_ref_status or lease_status
+    event_status = lease_event_status or lease_status
+    event_reason = lease_event_reason or lease_reason
     return {
         "lease_status": lease_status,
         "lease_reason": lease_reason,
         "lease_token_count": prefix_token_count,
         "lease_full_block_count": full_block_count,
         "lease_ttl_ms": ttl_ms,
+        "prepared_prefix_ref_status": ref_status,
+        "lease_event_status": event_status,
+        "lease_event_reason": event_reason,
+        "lease_id_present": lease_id_present,
+        "prefix_id_present": prefix_id_present,
     }
+
+
+def _prepared_prefix_lease_id(action_id: str) -> str:
+    return f"workflow-prepared-prefix-lease:{action_id}"
+
+
+def _prepared_prefix_id(action_id: str) -> str:
+    return f"workflow-prepared-prefix:{action_id}"
 
 
 @dataclass
@@ -186,9 +218,7 @@ class KVCacheManager:
         self.num_kv_cache_groups = len(kv_cache_config.kv_cache_groups)
         self.block_pool = self.coordinator.block_pool
         self.kv_cache_config = kv_cache_config
-        self._workflow_prepared_prefix_leases: dict[
-            str, _WorkflowPreparedPrefixLease
-        ] = {}
+        self._workflow_prepared_prefix_leases: dict[str, _PreparedPrefixLeaseRef] = {}
 
         # Pre-constructed KVCacheBlocks with no blocks, callers should use this
         # via create_kv_cache_blocks instead of creating new ones to avoid GC
@@ -511,7 +541,7 @@ class KVCacheManager:
         action_id: str,
         prefix_token_count: int,
         ttl_ms: int,
-    ) -> dict[str, int | str]:
+    ) -> dict[str, int | str | bool]:
         """Create an internal soft lease for full cached PreparedPrefix blocks.
 
         The lease is engine-private. It only keeps cached full prefix blocks
@@ -588,14 +618,16 @@ class KVCacheManager:
         self.release_workflow_prepared_prefix_lease(action_id, status="superseded")
         leased_blocks = tuple(leased_blocks_by_id.values())
         self.block_pool.touch(leased_blocks)
-        self._workflow_prepared_prefix_leases[action_id] = (
-            _WorkflowPreparedPrefixLease(
-                action_id=action_id,
-                blocks=leased_blocks,
-                prefix_token_count=prefix_token_count,
-                full_block_count=full_block_count,
-                expires_at_monotonic_s=time.monotonic() + (ttl_ms / 1000),
-            )
+        self._workflow_prepared_prefix_leases[action_id] = _PreparedPrefixLeaseRef(
+            lease_id=_prepared_prefix_lease_id(action_id),
+            prefix_id=_prepared_prefix_id(action_id),
+            action_id=action_id,
+            blocks=leased_blocks,
+            prefix_token_count=prefix_token_count,
+            full_block_count=full_block_count,
+            ttl_ms=ttl_ms,
+            state="leased",
+            expires_at_monotonic_s=time.monotonic() + (ttl_ms / 1000),
         )
         return _workflow_lease_result(
             "leased",
@@ -603,6 +635,11 @@ class KVCacheManager:
             prefix_token_count=prefix_token_count,
             full_block_count=full_block_count,
             ttl_ms=ttl_ms,
+            prepared_prefix_ref_status="leased",
+            lease_event_status="leased",
+            lease_event_reason="engine_core_cache_blocks_touched",
+            lease_id_present=True,
+            prefix_id_present=True,
         )
 
     def release_workflow_prepared_prefix_lease(
@@ -610,10 +647,11 @@ class KVCacheManager:
         action_id: str,
         *,
         status: str = "lease_released",
-    ) -> dict[str, int | str] | None:
+    ) -> dict[str, int | str | bool] | None:
         lease = self._workflow_prepared_prefix_leases.pop(action_id, None)
         if lease is None:
             return None
+        lease.state = status
         self.block_pool.free_blocks(lease.blocks)
         return _workflow_lease_result(
             status,
@@ -624,11 +662,16 @@ class KVCacheManager:
                 0,
                 int((lease.expires_at_monotonic_s - time.monotonic()) * 1000),
             ),
+            prepared_prefix_ref_status=status,
+            lease_event_status=status,
+            lease_event_reason="lease_ref_count_released",
+            lease_id_present=True,
+            prefix_id_present=True,
         )
 
     def release_expired_workflow_prepared_prefix_leases(
         self,
-    ) -> tuple[dict[str, int | str], ...]:
+    ) -> tuple[dict[str, int | str | bool], ...]:
         """Release expired internal PreparedPrefix leases.
 
         The returned records are intentionally redacted: they contain only

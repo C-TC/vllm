@@ -153,6 +153,9 @@ def test_workflow_actions_accept_prefix_prepare_without_logging_raw_prompt(
     assert payload["prewarm_attempted"] is False
     assert payload["lease_status"] == "observe_only"
     assert payload["lease_reason"] == "retention_mode_observe"
+    assert payload["prepared_prefix_ref_status"] == "observe_only"
+    assert payload["lease_event_status"] == "observe_only"
+    assert payload["lease_id_present"] is False
     assert payload["engine_token_source"] == "engine_authoritative"
     assert payload["prefix_token_count"] == 5
     assert payload["prefix_token_hash"].startswith("sha1:")
@@ -168,6 +171,7 @@ def test_workflow_actions_accept_prefix_prepare_without_logging_raw_prompt(
     assert record.lifecycle_status == "accepted"
     assert record.engine_token_source == "engine_authoritative"
     assert record.lease_status == "observe_only"
+    assert record.prepared_prefix_ref_status == "observe_only"
     assert record.prefix_token_count == 5
     assert record.prefix_token_hash is not None
     hook_text = (tmp_path / "hook.jsonl").read_text(encoding="utf-8")
@@ -409,6 +413,8 @@ def test_workflow_actions_lease_mode_reports_unavailable_without_exposing_handle
     assert status["prewarm_status"] == "prewarm_completed"
     assert status["lease_status"] == "lease_unavailable"
     assert status["prepared_prefix_object_status"] == "lease_unavailable"
+    assert status["prepared_prefix_ref_status"] == "lease_unavailable"
+    assert status["lease_event_status"] == "lease_unavailable"
     assert status["lease_reason"] == "no_safe_internal_cache_lease_api"
     assert "kv" not in json.dumps(status).lower()
 
@@ -442,6 +448,11 @@ def test_workflow_actions_lease_mode_records_engine_core_lease_update(
             "lease_token_count": 5,
             "lease_full_block_count": 1,
             "lease_ttl_ms": 30000,
+            "prepared_prefix_ref_status": "leased",
+            "lease_event_status": "leased",
+            "lease_event_reason": "engine_core_cache_blocks_touched",
+            "lease_id_present": True,
+            "prefix_id_present": True,
         },
     )
 
@@ -454,6 +465,11 @@ def test_workflow_actions_lease_mode_records_engine_core_lease_update(
     assert status["prepared_prefix_object_status"] == "leased"
     assert status["lease_reason"] == "engine_core_cache_blocks_touched"
     assert status["lease_full_block_count"] == 1
+    assert status["prepared_prefix_ref_status"] == "leased"
+    assert status["lease_event_status"] == "leased"
+    assert status["lease_event_reason"] == "engine_core_cache_blocks_touched"
+    assert status["lease_id_present"] is True
+    assert status["prefix_id_present"] is True
     assert "block_id" not in json.dumps(status)
     assert "kv" not in json.dumps(status).lower()
 
@@ -485,6 +501,11 @@ def test_workflow_actions_records_lease_consumed_update(
             "lease_token_count": 5,
             "lease_full_block_count": 1,
             "lease_ttl_ms": 30000,
+            "prepared_prefix_ref_status": "leased",
+            "lease_event_status": "leased",
+            "lease_event_reason": "engine_core_cache_blocks_touched",
+            "lease_id_present": True,
+            "prefix_id_present": True,
         },
     )
 
@@ -496,6 +517,11 @@ def test_workflow_actions_records_lease_consumed_update(
             "lease_token_count": 5,
             "lease_full_block_count": 1,
             "lease_ttl_ms": 29999,
+            "prepared_prefix_ref_status": "lease_consumed",
+            "lease_event_status": "lease_consumed",
+            "lease_event_reason": "lease_ref_count_released",
+            "lease_id_present": True,
+            "prefix_id_present": True,
         },
     )
     status_response = client.get(f"/v1/workflow/coopt/actions/{action_id}")
@@ -505,6 +531,8 @@ def test_workflow_actions_records_lease_consumed_update(
     assert status["lease_status"] == "lease_consumed"
     assert status["prepared_prefix_object_status"] == "lease_consumed"
     assert status["lease_reason"] == "lease_ref_count_released"
+    assert status["prepared_prefix_ref_status"] == "lease_consumed"
+    assert status["lease_event_status"] == "lease_consumed"
     assert "block_id" not in json.dumps(status)
     assert "kv" not in json.dumps(status).lower()
 
@@ -530,6 +558,11 @@ def test_workflow_kv_manager_leases_and_releases_cached_prefix_blocks() -> None:
         "lease_token_count": 4,
         "lease_full_block_count": 2,
         "lease_ttl_ms": 30000,
+        "prepared_prefix_ref_status": "leased",
+        "lease_event_status": "leased",
+        "lease_event_reason": "engine_core_cache_blocks_touched",
+        "lease_id_present": True,
+        "prefix_id_present": True,
     }
     assert cached_block.ref_cnt == 1
     assert "action-lease" in manager._workflow_prepared_prefix_leases
@@ -538,6 +571,9 @@ def test_workflow_kv_manager_leases_and_releases_cached_prefix_blocks() -> None:
 
     assert release is not None
     assert release["lease_status"] == "lease_released"
+    assert release["prepared_prefix_ref_status"] == "lease_released"
+    assert release["lease_event_status"] == "lease_released"
+    assert release["lease_id_present"] is True
     assert cached_block.ref_cnt == 0
     assert "action-lease" not in manager._workflow_prepared_prefix_leases
 
@@ -564,6 +600,7 @@ def test_workflow_kv_manager_releases_expired_leases() -> None:
 
     assert len(released) == 1
     assert released[0]["lease_status"] == "lease_expired"
+    assert released[0]["prepared_prefix_ref_status"] == "lease_expired"
     assert cached_block.ref_cnt == 0
     assert "action-expire" not in manager._workflow_prepared_prefix_leases
 
@@ -584,6 +621,11 @@ def test_workflow_kv_manager_lease_reports_redacted_miss_reason() -> None:
         "lease_token_count": 4,
         "lease_full_block_count": 2,
         "lease_ttl_ms": 30000,
+        "prepared_prefix_ref_status": "lease_unavailable",
+        "lease_event_status": "lease_unavailable",
+        "lease_event_reason": "cache_blocks_missing",
+        "lease_id_present": False,
+        "prefix_id_present": False,
     }
     assert "block_id" not in json.dumps(result)
 

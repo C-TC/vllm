@@ -1760,7 +1760,7 @@ class Scheduler(SchedulerInterface):
     def _workflow_try_lease_prepared_prefix(
         self,
         request: Request,
-    ) -> dict[str, int | str] | None:
+    ) -> dict[str, int | str | bool] | None:
         action_id = _workflow_prefill_only_action_id(request)
         if action_id is None:
             return None
@@ -1772,6 +1772,11 @@ class Scheduler(SchedulerInterface):
                 "lease_token_count": request.num_prompt_tokens,
                 "lease_full_block_count": 0,
                 "lease_ttl_ms": ttl_ms,
+                "prepared_prefix_ref_status": "observe_only",
+                "lease_event_status": "observe_only",
+                "lease_event_reason": "retention_mode_observe",
+                "lease_id_present": False,
+                "prefix_id_present": False,
             }
         if ttl_ms <= 0:
             return {
@@ -1780,6 +1785,11 @@ class Scheduler(SchedulerInterface):
                 "lease_token_count": request.num_prompt_tokens,
                 "lease_full_block_count": 0,
                 "lease_ttl_ms": 0,
+                "prepared_prefix_ref_status": "lease_failed",
+                "lease_event_status": "lease_failed",
+                "lease_event_reason": "missing_ttl",
+                "lease_id_present": False,
+                "prefix_id_present": False,
             }
         return self.kv_cache_manager.try_lease_workflow_prepared_prefix(
             request,
@@ -2065,7 +2075,7 @@ class Scheduler(SchedulerInterface):
     def _workflow_release_consumed_prepared_prefix(
         self,
         request: Request,
-    ) -> dict[str, int | str] | None:
+    ) -> dict[str, int | str | bool] | None:
         action_id = _workflow_matched_prepared_prefix_action_id(request)
         if action_id is None:
             return None
