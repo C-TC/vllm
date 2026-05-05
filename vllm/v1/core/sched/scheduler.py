@@ -117,6 +117,17 @@ def _workflow_prefill_only_retention_mode(request: Request) -> str:
     return raw if isinstance(raw, str) and raw else "observe"
 
 
+def _workflow_matched_prepared_prefix_action_id(request: Request) -> str | None:
+    sampling_params = request.sampling_params
+    extra_args = sampling_params.extra_args if sampling_params is not None else None
+    if not isinstance(extra_args, dict):
+        return None
+    if extra_args.get("workflow_prefill_only") is True:
+        return None
+    action_id = extra_args.get("workflow_prepared_prefix_matched_action_id")
+    return action_id if isinstance(action_id, str) and action_id else None
+
+
 class Scheduler(SchedulerInterface):
     def __init__(
         self,
@@ -434,6 +445,7 @@ class Scheduler(SchedulerInterface):
         scheduled_timestamp = time.monotonic()
 
         self.kv_cache_manager.new_step_starts()
+        self.kv_cache_manager.release_expired_workflow_prepared_prefix_leases()
 
         # First, schedule the RUNNING requests.
         req_index = 0
@@ -2029,6 +2041,9 @@ class Scheduler(SchedulerInterface):
         connector_delay_free_blocks, kv_xfer_params = self._connector_finished(request)
         self.encoder_cache_manager.free(request)
         request_id = request.request_id
+        workflow_prepared_prefix_lease_result = (
+            self._workflow_release_consumed_prepared_prefix(request)
+        )
         self.finished_req_ids.add(request_id)
         if self.finished_req_ids_dict is not None:
             self.finished_req_ids_dict[request.client_index].add(request_id)
@@ -2037,7 +2052,33 @@ class Scheduler(SchedulerInterface):
         if not delay_free_blocks:
             self._free_blocks(request)
 
+        if workflow_prepared_prefix_lease_result is not None:
+            kv_xfer_params = {
+                **(kv_xfer_params or {}),
+                "workflow_prepared_prefix_lease": (
+                    workflow_prepared_prefix_lease_result
+                ),
+            }
+
         return kv_xfer_params
+
+    def _workflow_release_consumed_prepared_prefix(
+        self,
+        request: Request,
+    ) -> dict[str, int | str] | None:
+        action_id = _workflow_matched_prepared_prefix_action_id(request)
+        if action_id is None:
+            return None
+        result = self.kv_cache_manager.release_workflow_prepared_prefix_lease(
+            action_id,
+            status="lease_consumed",
+        )
+        if result is None:
+            return None
+        return {
+            **result,
+            "action_id": action_id,
+        }
 
     def _free_blocks(self, request: Request):
         assert request.is_finished()

@@ -59,6 +59,8 @@ class WorkflowTestHookRecord:
     prewarm_attempted: bool | None = None
     lease_status: str | None = None
     lease_reason: str | None = None
+    lease_cleanup_reason: str | None = None
+    lease_cleanup_count: int | None = None
     lease_token_count: int | None = None
     lease_full_block_count: int | None = None
     lease_ttl_ms: int | None = None
@@ -143,6 +145,7 @@ def record_scheduler_request(
     workflow_scheduler_token_lcp_hash: str | None = None,
 ) -> None:
     internal_prefill_only_action_id = _internal_prefill_only_action_id(vllm_xargs)
+    public_vllm_xargs = _public_workflow_xargs(vllm_xargs)
     _record_event(
         source="scheduler",
         path=None,
@@ -151,7 +154,9 @@ def record_scheduler_request(
         # engine-private control plane. They are not ordinary workflow sideband,
         # so the hook should not validate those fields against the public
         # per-request contract.
-        vllm_xargs=None if internal_prefill_only_action_id is not None else vllm_xargs,
+        vllm_xargs=None
+        if internal_prefill_only_action_id is not None
+        else public_vllm_xargs,
         dp_rank=dp_rank,
         client_index=client_index,
         prompt_token_ids=prompt_token_ids,
@@ -181,6 +186,8 @@ def record_workflow_action(
     prewarm_attempted: bool | None = None,
     lease_status: str | None = None,
     lease_reason: str | None = None,
+    lease_cleanup_reason: str | None = None,
+    lease_cleanup_count: int | None = None,
     lease_token_count: int | None = None,
     lease_full_block_count: int | None = None,
     lease_ttl_ms: int | None = None,
@@ -210,7 +217,10 @@ def record_workflow_action(
         prewarm_attempted=prewarm_attempted,
         lease_status=lease_status,
         lease_reason=lease_reason,
+        lease_cleanup_reason=lease_cleanup_reason,
+        lease_cleanup_count=lease_cleanup_count,
         lease_token_count=lease_token_count,
+        lease_full_block_count=lease_full_block_count,
         lease_ttl_ms=lease_ttl_ms,
         prefix_token_count=prefix_token_count,
         prefix_token_hash=prefix_token_hash,
@@ -247,6 +257,8 @@ def _record_event(
     prewarm_attempted: bool | None = None,
     lease_status: str | None = None,
     lease_reason: str | None = None,
+    lease_cleanup_reason: str | None = None,
+    lease_cleanup_count: int | None = None,
     lease_token_count: int | None = None,
     lease_full_block_count: int | None = None,
     lease_ttl_ms: int | None = None,
@@ -318,6 +330,8 @@ def _record_event(
         prewarm_attempted=prewarm_attempted,
         lease_status=lease_status,
         lease_reason=lease_reason,
+        lease_cleanup_reason=lease_cleanup_reason,
+        lease_cleanup_count=lease_cleanup_count,
         lease_token_count=lease_token_count,
         lease_full_block_count=lease_full_block_count,
         lease_ttl_ms=lease_ttl_ms,
@@ -396,6 +410,17 @@ def _internal_prefill_only_action_id(vllm_xargs: dict[str, Any] | None) -> str |
         return None
     action_id = vllm_xargs.get("workflow_prefix_prepare_action_id")
     return action_id if isinstance(action_id, str) and action_id else None
+
+
+def _public_workflow_xargs(vllm_xargs: dict[str, Any] | None) -> dict[str, Any] | None:
+    if not isinstance(vllm_xargs, dict):
+        return None
+    public = {
+        key: value
+        for key, value in vllm_xargs.items()
+        if key != "workflow_prepared_prefix_matched_action_id"
+    }
+    return public or None
 
 
 def _hash_token_ids(token_ids: list[int] | None) -> str | None:

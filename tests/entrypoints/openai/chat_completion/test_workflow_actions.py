@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -16,6 +17,7 @@ from fastapi.testclient import TestClient
 from vllm.entrypoints.openai.chat_completion import api_router
 from vllm.entrypoints.openai.chat_completion.workflow_actions import (
     mark_workflow_prefix_prewarm_result,
+    mark_workflow_prepared_prefix_lease_result,
     match_prepared_prefix_for_request,
     workflow_coopt_actions_enabled,
 )
@@ -247,6 +249,42 @@ def test_workflow_actions_report_prepared_prefix_mismatch(monkeypatch) -> None:
     assert match["prepared_prefix_mismatch_reason"] == "token_prefix_mismatch"
 
 
+def test_workflow_actions_superseded_prefix_no_longer_matches(monkeypatch) -> None:
+    monkeypatch.setenv("VLLM_ENABLE_WORKFLOW_COOPT_ACTIONS", "1")
+    monkeypatch.setenv("WORKFLOW_PREFIX_PREPARE_MIN_TOKENS", "1")
+    app = FastAPI()
+    app.state.openai_serving_chat = _FakeChatHandler()
+    api_router.attach_router(app)
+    client = TestClient(app)
+    first_action = _valid_prefix_prepare_action(1, key_suffix="supersede")
+    first_action["workflow_instance_id"] = "wf-inst"
+    second_action = _valid_prefix_prepare_action(2, key_suffix="supersede")
+    second_action["workflow_instance_id"] = "wf-inst"
+
+    first = client.post("/v1/workflow/coopt/actions", json=first_action)
+    second = client.post("/v1/workflow/coopt/actions", json=second_action)
+
+    assert first.status_code == 200
+    assert second.status_code == 200
+    first_status = client.get(
+        f"/v1/workflow/coopt/actions/{first_action['action_id']}"
+    ).json()
+    assert first_status["lifecycle_status"] == "superseded"
+    assert first_status["prepared_prefix_match_status"] == "superseded"
+    assert first_status["lease_cleanup_reason"] == "superseded_registry_only"
+    match = match_prepared_prefix_for_request(
+        vllm_xargs={
+            "workflow_instance_id": "wf-inst",
+            "site_id": "main:writer",
+        },
+        prompt_token_ids=[101, 202, 303, 404, 505, 606],
+        model="test-model",
+    )
+    assert match is not None
+    assert match["prepared_prefix_match_status"] == "matched"
+    assert match["prepared_prefix_action_id"] == second_action["action_id"]
+
+
 def test_workflow_actions_reject_invalid_and_old_generation(monkeypatch) -> None:
     monkeypatch.setenv("VLLM_ENABLE_WORKFLOW_COOPT_ACTIONS", "1")
     app = FastAPI()
@@ -413,6 +451,56 @@ def test_workflow_actions_lease_mode_records_engine_core_lease_update(
     assert "kv" not in json.dumps(status).lower()
 
 
+def test_workflow_actions_records_lease_consumed_update(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("VLLM_ENABLE_WORKFLOW_COOPT_ACTIONS", "1")
+    monkeypatch.setenv("WORKFLOW_PREFIX_PREPARE_MIN_TOKENS", "1")
+    monkeypatch.setenv("WORKFLOW_PREFIX_PREPARE_MODE", "experimental_prewarm")
+    monkeypatch.setenv("WORKFLOW_PREFIX_PREPARE_RETENTION_MODE", "lease")
+    app = FastAPI()
+    handler = _FakeChatHandler()
+    app.state.openai_serving_chat = handler
+    api_router.attach_router(app)
+    client = TestClient(app)
+
+    response = client.post(
+        "/v1/workflow/coopt/actions",
+        json=_valid_prefix_prepare_action(key_suffix="lease-consumed"),
+    )
+    action_id = str(response.json()["action_id"])
+    mark_workflow_prefix_prewarm_result(
+        action_id=action_id,
+        prewarm_status="prewarm_completed",
+        lease_update={
+            "lease_status": "leased",
+            "lease_reason": "engine_core_cache_blocks_touched",
+            "lease_token_count": 5,
+            "lease_full_block_count": 1,
+            "lease_ttl_ms": 30000,
+        },
+    )
+
+    mark_workflow_prepared_prefix_lease_result(
+        action_id=action_id,
+        lease_update={
+            "lease_status": "lease_consumed",
+            "lease_reason": "lease_ref_count_released",
+            "lease_token_count": 5,
+            "lease_full_block_count": 1,
+            "lease_ttl_ms": 29999,
+        },
+    )
+    status_response = client.get(f"/v1/workflow/coopt/actions/{action_id}")
+
+    assert status_response.status_code == 200
+    status = status_response.json()
+    assert status["lease_status"] == "lease_consumed"
+    assert status["lease_reason"] == "lease_ref_count_released"
+    assert "block_id" not in json.dumps(status)
+    assert "kv" not in json.dumps(status).lower()
+
+
 def test_workflow_kv_manager_leases_and_releases_cached_prefix_blocks() -> None:
     manager, request = _kv_manager_with_cached_prefix()
     cached_block = manager.block_pool.get_cached_block(
@@ -444,6 +532,32 @@ def test_workflow_kv_manager_leases_and_releases_cached_prefix_blocks() -> None:
     assert release["lease_status"] == "lease_released"
     assert cached_block.ref_cnt == 0
     assert "action-lease" not in manager._workflow_prepared_prefix_leases
+
+
+def test_workflow_kv_manager_releases_expired_leases() -> None:
+    manager, request = _kv_manager_with_cached_prefix()
+    cached_block = manager.block_pool.get_cached_block(
+        request.block_hashes[0],
+        [0],
+        [0],
+    )[0]
+
+    result = manager.try_lease_workflow_prepared_prefix(
+        request,
+        action_id="action-expire",
+        prefix_token_count=4,
+        ttl_ms=1,
+    )
+    assert result["lease_status"] == "leased"
+    assert cached_block.ref_cnt == 1
+
+    time.sleep(0.01)
+    released = manager.release_expired_workflow_prepared_prefix_leases()
+
+    assert len(released) == 1
+    assert released[0]["lease_status"] == "lease_expired"
+    assert cached_block.ref_cnt == 0
+    assert "action-expire" not in manager._workflow_prepared_prefix_leases
 
 
 def test_workflow_kv_manager_lease_reports_redacted_miss_reason() -> None:
@@ -540,6 +654,48 @@ def test_workflow_hook_treats_prefill_only_extra_args_as_internal(
     assert record.action_kind == "prefix_prepare"
     assert record.engine_prompt_token_count == 5
     assert record.prompt_token_ids_hash is not None
+
+
+def test_workflow_hook_strips_internal_matched_prefix_extra_arg(
+    monkeypatch,
+) -> None:
+    _records.clear()
+    monkeypatch.setenv("WORKFLOW_TEST_HOOK", "1")
+
+    record_scheduler_request(
+        request_id="request-1",
+        vllm_xargs={
+            "workflow_id": "wf-def",
+            "workflow_instance_id": "wf",
+            "graph_id": "graph",
+            "block_id": "main",
+            "op_id": "writer",
+            "site_id": "site",
+            "private_release_hint": "may",
+            "effective_release_hint": "may",
+            "release_hint": "may",
+            "workflow_prepared_prefix_matched_action_id": "action-1",
+        },
+        dp_rank=0,
+        client_index=0,
+        prompt_token_ids=[1, 2, 3],
+        engine_prompt_token_count=3,
+    )
+
+    (record,) = tuple(_records)
+    assert record.vllm_xargs == {
+        "workflow_id": "wf-def",
+        "workflow_instance_id": "wf",
+        "graph_id": "graph",
+        "block_id": "main",
+        "op_id": "writer",
+        "site_id": "site",
+        "private_release_hint": "may",
+        "effective_release_hint": "may",
+        "release_hint": "may",
+    }
+    assert record.workflow_sideband_valid is True
+    assert "action-1" not in json.dumps(record.vllm_xargs)
 
 
 def test_workflow_hook_records_prepared_prefix_cache_observation(

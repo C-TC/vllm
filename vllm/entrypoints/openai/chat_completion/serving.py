@@ -43,6 +43,7 @@ from vllm.entrypoints.openai.chat_completion.stream_harmony import (
 )
 from vllm.entrypoints.openai.chat_completion.workflow_actions import (
     mark_workflow_prefix_prewarm_result,
+    mark_workflow_prepared_prefix_lease_result,
     match_prepared_prefix_for_request,
 )
 from vllm.entrypoints.openai.chat_completion.workflow_test_hook import (
@@ -135,6 +136,45 @@ def _prepared_prefix_cache_observation(
         "prepared_prefix_cached_at_least_prefix": num_cached_tokens
         >= prefix_token_count,
     }
+
+
+def _mark_workflow_prepared_prefix_lease_result_from_kv_params(
+    kv_transfer_params: dict[str, object] | None,
+) -> None:
+    if not isinstance(kv_transfer_params, dict):
+        return
+    candidate = kv_transfer_params.get("workflow_prepared_prefix_lease")
+    if not isinstance(candidate, dict):
+        return
+    action_id = candidate.get("action_id")
+    if not isinstance(action_id, str) or not action_id:
+        return
+    mark_workflow_prepared_prefix_lease_result(
+        action_id=action_id,
+        lease_update=dict(candidate),
+    )
+
+
+def _attach_prepared_prefix_match_to_sampling_params(
+    sampling_params: SamplingParams | BeamSearchParams,
+    prepared_prefix_match: dict[str, object] | None,
+) -> None:
+    if not isinstance(sampling_params, SamplingParams):
+        return
+    if not isinstance(prepared_prefix_match, dict):
+        return
+    if prepared_prefix_match.get("prepared_prefix_match_status") != "matched":
+        return
+    action_id = prepared_prefix_match.get("prepared_prefix_action_id")
+    if not isinstance(action_id, str) or not action_id:
+        return
+    extra_args = (
+        dict(sampling_params.extra_args)
+        if isinstance(sampling_params.extra_args, dict)
+        else {}
+    )
+    extra_args["workflow_prepared_prefix_matched_action_id"] = action_id
+    sampling_params.extra_args = extra_args
 
 
 class OpenAIServingChat(OpenAIServing):
@@ -490,6 +530,10 @@ class OpenAIServingChat(OpenAIServing):
                     max_tokens,
                     self.default_sampling_params,
                 )
+            _attach_prepared_prefix_match_to_sampling_params(
+                sampling_params,
+                prepared_prefix_match,
+            )
 
             self._log_inputs(
                 sub_request_id,
@@ -796,6 +840,9 @@ class OpenAIServingChat(OpenAIServing):
 
         try:
             async for res in result_generator:
+                _mark_workflow_prepared_prefix_lease_result_from_kv_params(
+                    res.kv_transfer_params,
+                )
                 if res.prompt_token_ids is not None:
                     num_prompt_tokens = len(res.prompt_token_ids)
                     if res.encoder_prompt_token_ids is not None:
@@ -1522,6 +1569,9 @@ class OpenAIServingChat(OpenAIServing):
                 err_type="InternalServerError",
                 status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
             )
+        _mark_workflow_prepared_prefix_lease_result_from_kv_params(
+            final_res.kv_transfer_params,
+        )
 
         choices: list[ChatCompletionResponseChoice] = []
         if self.tool_call_id_type == "kimi_k2":

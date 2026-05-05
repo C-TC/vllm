@@ -76,11 +76,13 @@ class WorkflowActionRegistry:
                     reject_reason="duplicate_or_old_generation",
                     prewarm_status="not_attempted",
                 )
+            self._supersede_locked(registry_key)
             self._generation_by_key[registry_key] = generation
             self._actions_by_id[action_id] = {
                 "action_id": action_id,
                 "action_kind": action["action_kind"],
                 "generation": generation,
+                "registry_key": registry_key,
                 "created_monotonic_s": time.monotonic(),
                 "lifecycle_status": "created",
             }
@@ -219,6 +221,57 @@ class WorkflowActionRegistry:
         )
         return response
 
+    def mark_lease_result(
+        self,
+        *,
+        action_id: str,
+        lease_update: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        with self._lock:
+            stored = self._actions_by_id.get(action_id)
+            if stored is None:
+                return None
+            lease_update = _lease_update_from_engine(
+                lease_update,
+                prefix_token_count=_optional_int(stored.get("prefix_token_count")),
+                ttl_ms=_optional_int(stored.get("ttl_ms")),
+            )
+            stored.update(lease_update)
+            prepared = self._prepared_prefixes_by_action_id.get(action_id)
+            if prepared is not None:
+                prepared.update(lease_update)
+            if _optional_str(lease_update.get("lease_status")) in {
+                "lease_consumed",
+                "lease_expired",
+                "lease_released",
+            }:
+                self._prepared_prefixes_by_action_id.pop(action_id, None)
+            response = dict(stored)
+        record_workflow_action(
+            action_id=_optional_str(response.get("action_id")),
+            action_kind=_optional_str(response.get("action_kind")),
+            lifecycle_status=_optional_str(response.get("lifecycle_status"))
+            or "accepted",
+            reject_reason=_optional_str(response.get("reject_reason")),
+            prewarm_status=_optional_str(response.get("prewarm_status")),
+            prewarm_attempted=bool(response.get("prewarm_attempted")),
+            lease_status=_optional_str(response.get("lease_status")),
+            lease_reason=_optional_str(response.get("lease_reason")),
+            lease_token_count=_optional_int(response.get("lease_token_count")),
+            lease_full_block_count=_optional_int(
+                response.get("lease_full_block_count")
+            ),
+            lease_ttl_ms=_optional_int(response.get("lease_ttl_ms")),
+            prefix_token_count=_optional_int(response.get("prefix_token_count")),
+            prefix_token_hash=_optional_str(response.get("prefix_token_hash")),
+            engine_token_source=_optional_str(response.get("engine_token_source")),
+            model=_optional_str(response.get("model")),
+            served_model_name=_optional_str(response.get("served_model_name")),
+            tokenizer_id=_optional_str(response.get("tokenizer_id")),
+            chat_template_id=_optional_str(response.get("chat_template_id")),
+        )
+        return response
+
     def _store_prepared_prefix(
         self,
         action: dict[str, Any],
@@ -276,6 +329,15 @@ class WorkflowActionRegistry:
                     }
                 )
             self._evict_locked()
+
+    def _supersede_locked(self, registry_key: str) -> None:
+        for action_id, stored in tuple(self._actions_by_id.items()):
+            if stored.get("registry_key") != registry_key:
+                continue
+            stored["lifecycle_status"] = "superseded"
+            stored["prepared_prefix_match_status"] = "superseded"
+            stored["lease_cleanup_reason"] = "superseded_registry_only"
+            self._prepared_prefixes_by_action_id.pop(action_id, None)
 
     def match_prepared_prefix(
         self,
@@ -413,6 +475,17 @@ def mark_workflow_prefix_prewarm_result(
         action_id=action_id,
         prewarm_status=prewarm_status,
         reject_reason=reject_reason,
+        lease_update=lease_update,
+    )
+
+
+def mark_workflow_prepared_prefix_lease_result(
+    *,
+    action_id: str,
+    lease_update: dict[str, Any],
+) -> dict[str, Any] | None:
+    return _registry.mark_lease_result(
+        action_id=action_id,
         lease_update=lease_update,
     )
 
@@ -797,6 +870,27 @@ def _lease_update_for_prewarm_result(
         "lease_token_count": prefix_token_count,
         "lease_full_block_count": None,
         "lease_ttl_ms": ttl_ms,
+    }
+
+
+def _lease_update_from_engine(
+    engine_lease_update: dict[str, Any],
+    *,
+    prefix_token_count: int | None,
+    ttl_ms: int | None,
+) -> dict[str, Any]:
+    return {
+        "lease_status": _optional_str(engine_lease_update.get("lease_status"))
+        or "lease_failed",
+        "lease_reason": _optional_str(engine_lease_update.get("lease_reason"))
+        or "missing_engine_lease_reason",
+        "lease_token_count": _optional_int(engine_lease_update.get("lease_token_count"))
+        or prefix_token_count,
+        "lease_full_block_count": _optional_int(
+            engine_lease_update.get("lease_full_block_count")
+        ),
+        "lease_ttl_ms": _optional_int(engine_lease_update.get("lease_ttl_ms"))
+        or ttl_ms,
     }
 
 

@@ -520,7 +520,7 @@ class KVCacheManager:
         missing, the caller receives a redacted non-fatal reason and normal
         request execution remains unchanged.
         """
-        self._release_expired_workflow_prepared_prefix_leases()
+        self.release_expired_workflow_prepared_prefix_leases()
         if not self.enable_caching:
             return _workflow_lease_result(
                 "lease_unavailable",
@@ -626,18 +626,29 @@ class KVCacheManager:
             ),
         )
 
-    def _release_expired_workflow_prepared_prefix_leases(self) -> None:
+    def release_expired_workflow_prepared_prefix_leases(
+        self,
+    ) -> tuple[dict[str, int | str], ...]:
+        """Release expired internal PreparedPrefix leases.
+
+        The returned records are intentionally redacted: they contain only
+        lifecycle status and token/block counts, never block ids or cache keys.
+        """
         now = time.monotonic()
         expired = [
             action_id
             for action_id, lease in self._workflow_prepared_prefix_leases.items()
             if lease.expires_at_monotonic_s <= now
         ]
+        released: list[dict[str, int | str]] = []
         for action_id in expired:
-            self.release_workflow_prepared_prefix_lease(
+            result = self.release_workflow_prepared_prefix_lease(
                 action_id,
                 status="lease_expired",
             )
+            if result is not None:
+                released.append(result)
+        return tuple(released)
 
     def reset_prefix_cache(self) -> bool:
         """Reset prefix cache. This function may be used in RLHF
