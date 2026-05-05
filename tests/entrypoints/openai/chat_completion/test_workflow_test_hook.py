@@ -167,6 +167,38 @@ def test_workflow_test_hook_records_scheduler_token_count_without_token_ids(
     assert record.prompt_token_ids_prefix_hash is None
 
 
+def test_workflow_test_hook_records_group_aware_scheduler_telemetry(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    hook_file = tmp_path / "hook.jsonl"
+    _clear_memory_records()
+    monkeypatch.setenv("WORKFLOW_TEST_HOOK", "1")
+    monkeypatch.setenv("WORKFLOW_TEST_HOOK_FILE", str(hook_file))
+
+    record_scheduler_request(
+        request_id="req-grouped",
+        vllm_xargs={"workflow_id": "wf"},
+        dp_rank=0,
+        client_index=1,
+        group_aware_scheduling_enabled=True,
+        workflow_scheduler_group_key="spawn_group_id:main:fanout",
+        workflow_scheduler_selected_rank=2,
+        workflow_scheduler_reason="spawn_group_id",
+    )
+
+    assert len(_records) == 1
+    record = _records[0]
+    assert record.source == "scheduler"
+    assert record.group_aware_scheduling_enabled is True
+    assert record.workflow_scheduler_group_key == "spawn_group_id:main:fanout"
+    assert record.workflow_scheduler_selected_rank == 2
+    assert record.workflow_scheduler_reason == "spawn_group_id"
+    file_text = hook_file.read_text(encoding="utf-8")
+    assert "workflow_scheduler_group_key" in file_text
+    assert "prompt_token_ids" not in file_text
+
+
 def test_workflow_test_hook_file_write_failure_does_not_block_request(
     monkeypatch,
     tmp_path,

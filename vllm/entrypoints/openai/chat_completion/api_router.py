@@ -16,8 +16,10 @@ from vllm.entrypoints.openai.chat_completion.protocol import (
 from vllm.entrypoints.openai.chat_completion.serving import OpenAIServingChat
 from vllm.entrypoints.openai.chat_completion.workflow_test_hook import (
     record_chat_request,
-    router as workflow_test_hook_router,
     workflow_test_hook_enabled,
+)
+from vllm.entrypoints.openai.chat_completion.workflow_test_hook import (
+    router as workflow_test_hook_router,
 )
 from vllm.entrypoints.openai.engine.protocol import ErrorResponse
 from vllm.entrypoints.openai.orca_metrics import metrics_header

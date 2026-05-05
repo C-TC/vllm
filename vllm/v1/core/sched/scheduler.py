@@ -54,6 +54,12 @@ from vllm.v1.core.sched.request_queue import (
     create_request_queue,
 )
 from vllm.v1.core.sched.utils import check_stop, remove_all
+from vllm.v1.core.sched.workflow_grouping import (
+    WorkflowGroupSelection,
+    select_workflow_group_request,
+    workflow_group_aware_max_burst,
+    workflow_group_aware_scheduling_enabled,
+)
 from vllm.v1.engine import EngineCoreEventType, EngineCoreOutput, EngineCoreOutputs
 from vllm.v1.kv_cache_interface import AttentionSpec, KVCacheConfig
 from vllm.v1.metrics.perf import ModelMetrics, PerfStats
@@ -170,6 +176,8 @@ class Scheduler(SchedulerInterface):
         # requests skipped in waiting flow due async deps or constraints.
         self.skipped_waiting = create_request_queue(self.policy)
         self.running: list[Request] = []
+        self._workflow_scheduler_last_group_key: str | None = None
+        self._workflow_scheduler_group_burst = 0
 
         # The request IDs that are finished in between the previous and the
         # current steps. This is used to notify the workers about the finished
@@ -574,7 +582,10 @@ class Scheduler(SchedulerInterface):
                 request_queue = self._select_waiting_queue_for_scheduling()
                 assert request_queue is not None
 
-                request = request_queue.peek_request()
+                request_selection = self._select_waiting_request_for_scheduling(
+                    request_queue
+                )
+                request = request_selection.request
                 request_id = request.request_id
 
                 # try to promote blocked statuses while traversing skipped queue.
@@ -586,7 +597,10 @@ class Scheduler(SchedulerInterface):
                             "%s is still in WAITING_FOR_REMOTE_KVS state.",
                             request_id,
                         )
-                    request_queue.pop_request()
+                    self._pop_selected_waiting_request(
+                        request_queue,
+                        request_selection,
+                    )
                     step_skipped_waiting.prepend_request(request)
                     continue
 
@@ -601,7 +615,10 @@ class Scheduler(SchedulerInterface):
                     )
                 ):
                     # Scheduling would exceed max_loras, skip.
-                    request_queue.pop_request()
+                    self._pop_selected_waiting_request(
+                        request_queue,
+                        request_selection,
+                    )
                     step_skipped_waiting.prepend_request(request)
                     continue
 
@@ -628,7 +645,10 @@ class Scheduler(SchedulerInterface):
                             # The request cannot be scheduled because
                             # the KVConnector couldn't determine
                             # the number of matched tokens.
-                            request_queue.pop_request()
+                            self._pop_selected_waiting_request(
+                                request_queue,
+                                request_selection,
+                            )
                             step_skipped_waiting.prepend_request(request)
                             continue
 
@@ -786,7 +806,10 @@ class Scheduler(SchedulerInterface):
                             preempted=request.num_preemptions > 0,
                         )
 
-                request = request_queue.pop_request()
+                request = self._pop_selected_waiting_request(
+                    request_queue,
+                    request_selection,
+                )
                 if load_kv_async:
                     # If loading async, allocate memory and put request
                     # into the WAITING_FOR_REMOTE_KV state.
@@ -808,6 +831,7 @@ class Scheduler(SchedulerInterface):
                     request.num_computed_tokens = num_computed_tokens
                     continue
 
+                self._record_workflow_scheduler_selection(request, request_selection)
                 self.running.append(request)
                 if self.log_stats:
                     request.record_event(
@@ -1583,6 +1607,74 @@ class Scheduler(SchedulerInterface):
             return self.waiting if waiting_req < skipped_req else self.skipped_waiting
 
         return self.waiting or self.skipped_waiting or None
+
+    def _select_waiting_request_for_scheduling(
+        self,
+        request_queue: RequestQueue,
+    ) -> WorkflowGroupSelection:
+        if (
+            not workflow_group_aware_scheduling_enabled()
+            or request_queue is not self.waiting
+        ):
+            return WorkflowGroupSelection(
+                request=request_queue.peek_request(),
+                selected_rank=0,
+                group_key=None,
+                reason="stock_order",
+            )
+
+        selection = select_workflow_group_request(
+            request_queue,
+            last_group_key=self._workflow_scheduler_last_group_key,
+            group_burst=self._workflow_scheduler_group_burst,
+            max_burst=workflow_group_aware_max_burst(),
+        )
+        if selection is None:
+            return WorkflowGroupSelection(
+                request=request_queue.peek_request(),
+                selected_rank=0,
+                group_key=None,
+                reason="stock_fallback_empty_queue",
+            )
+        return selection
+
+    @staticmethod
+    def _pop_selected_waiting_request(
+        request_queue: RequestQueue,
+        selection: WorkflowGroupSelection,
+    ) -> Request:
+        if selection.selected_rank == 0:
+            return request_queue.pop_request()
+        request_queue.remove_request(selection.request)
+        return selection.request
+
+    def _record_workflow_scheduler_selection(
+        self,
+        request: Request,
+        selection: WorkflowGroupSelection,
+    ) -> None:
+        if not workflow_group_aware_scheduling_enabled():
+            return
+
+        if selection.group_key == self._workflow_scheduler_last_group_key:
+            self._workflow_scheduler_group_burst += 1
+        else:
+            self._workflow_scheduler_last_group_key = selection.group_key
+            self._workflow_scheduler_group_burst = 1 if selection.group_key else 0
+
+        extra_args = None
+        if request.sampling_params is not None:
+            extra_args = request.sampling_params.extra_args
+        record_scheduler_request(
+            request_id=request.request_id,
+            vllm_xargs=extra_args,
+            dp_rank=self.parallel_config.data_parallel_index,
+            client_index=request.client_index,
+            group_aware_scheduling_enabled=True,
+            workflow_scheduler_group_key=selection.group_key,
+            workflow_scheduler_selected_rank=selection.selected_rank,
+            workflow_scheduler_reason=selection.reason,
+        )
 
     def _handle_stopped_request(self, request: Request) -> bool:
         """Return True if finished (can be False for resumable requests)."""

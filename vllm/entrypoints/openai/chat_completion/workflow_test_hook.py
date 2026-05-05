@@ -44,6 +44,10 @@ class WorkflowTestHookRecord:
     prompt_token_ids_hash: str | None = None
     prompt_token_ids_prefix_hash: str | None = None
     prompt_token_ids_prefix_len: int | None = None
+    group_aware_scheduling_enabled: bool | None = None
+    workflow_scheduler_group_key: str | None = None
+    workflow_scheduler_selected_rank: int | None = None
+    workflow_scheduler_reason: str | None = None
     dp_rank: int | None = None
     client_index: int | None = None
     pid: int | None = None
@@ -99,6 +103,10 @@ def record_scheduler_request(
     client_index: int | None,
     prompt_token_ids: list[int] | None = None,
     engine_prompt_token_count: int | None = None,
+    group_aware_scheduling_enabled: bool | None = None,
+    workflow_scheduler_group_key: str | None = None,
+    workflow_scheduler_selected_rank: int | None = None,
+    workflow_scheduler_reason: str | None = None,
 ) -> None:
     _record_event(
         source="scheduler",
@@ -110,6 +118,10 @@ def record_scheduler_request(
         prompt_token_ids=prompt_token_ids,
         engine_prompt_token_count=engine_prompt_token_count,
         engine_token_source="scheduler",
+        group_aware_scheduling_enabled=group_aware_scheduling_enabled,
+        workflow_scheduler_group_key=workflow_scheduler_group_key,
+        workflow_scheduler_selected_rank=workflow_scheduler_selected_rank,
+        workflow_scheduler_reason=workflow_scheduler_reason,
     )
 
 
@@ -128,6 +140,10 @@ def _record_event(
     served_model_name: str | None = None,
     tokenizer_id: str | None = None,
     chat_template_id: str | None = None,
+    group_aware_scheduling_enabled: bool | None = None,
+    workflow_scheduler_group_key: str | None = None,
+    workflow_scheduler_selected_rank: int | None = None,
+    workflow_scheduler_reason: str | None = None,
 ) -> None:
     if not workflow_test_hook_enabled():
         return
@@ -177,6 +193,10 @@ def _record_event(
             if prompt_token_ids is not None
             else None
         ),
+        group_aware_scheduling_enabled=group_aware_scheduling_enabled,
+        workflow_scheduler_group_key=workflow_scheduler_group_key,
+        workflow_scheduler_selected_rank=workflow_scheduler_selected_rank,
+        workflow_scheduler_reason=workflow_scheduler_reason,
         dp_rank=dp_rank,
         client_index=client_index,
         pid=os.getpid(),
