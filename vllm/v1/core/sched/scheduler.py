@@ -84,11 +84,37 @@ def _workflow_prefill_only_action_id(request: Request) -> str | None:
     return action_id if isinstance(action_id, str) and action_id else None
 
 
+def _workflow_prefill_only_extra_args(request: Request) -> dict[str, Any] | None:
+    sampling_params = request.sampling_params
+    extra_args = sampling_params.extra_args if sampling_params is not None else None
+    if not isinstance(extra_args, dict):
+        return None
+    if extra_args.get("workflow_prefill_only") is not True:
+        return None
+    return extra_args
+
+
 def _workflow_prefill_only_ready_to_finish(request: Request) -> bool:
     return (
         _workflow_prefill_only_action_id(request) is not None
         and request.num_computed_tokens >= request.num_prompt_tokens
     )
+
+
+def _workflow_prefill_only_ttl_ms(request: Request) -> int:
+    extra_args = _workflow_prefill_only_extra_args(request)
+    if extra_args is None:
+        return 0
+    raw = extra_args.get("workflow_prefix_prepare_ttl_ms")
+    return raw if isinstance(raw, int) and raw > 0 else 0
+
+
+def _workflow_prefill_only_retention_mode(request: Request) -> str:
+    extra_args = _workflow_prefill_only_extra_args(request)
+    if extra_args is None:
+        return "observe"
+    raw = extra_args.get("workflow_prefix_prepare_retention_mode")
+    return raw if isinstance(raw, str) and raw else "observe"
 
 
 class Scheduler(SchedulerInterface):
@@ -1439,6 +1465,7 @@ class Scheduler(SchedulerInterface):
             new_token_ids = generated_token_ids
             pooler_output = pooler_outputs[req_index] if pooler_outputs else None
             kv_transfer_params = None
+            workflow_prefix_prepare_result = None
             status_before_stop = request.status
 
             # Check for stop and update request status.
@@ -1451,6 +1478,9 @@ class Scheduler(SchedulerInterface):
                 new_token_ids = []
                 request.stop_reason = "workflow_prefill_only"
                 request.status = RequestStatus.FINISHED_STOPPED
+                workflow_prefix_prepare_result = (
+                    self._workflow_try_lease_prepared_prefix(request)
+                )
                 stopped = True
             elif new_token_ids:
                 new_token_ids, stopped = self._update_request_with_output(
@@ -1472,6 +1502,11 @@ class Scheduler(SchedulerInterface):
                 finished = self._handle_stopped_request(request)
                 if finished:
                     kv_transfer_params = self._free_request(request)
+                    if workflow_prefix_prepare_result is not None:
+                        kv_transfer_params = {
+                            **(kv_transfer_params or {}),
+                            "workflow_prefix_prepare": workflow_prefix_prepare_result,
+                        }
 
                 if status_before_stop == RequestStatus.RUNNING:
                     stopped_running_reqs.add(request)
@@ -1708,6 +1743,37 @@ class Scheduler(SchedulerInterface):
             workflow_scheduler_group_source=selection.group_source,
             workflow_scheduler_token_lcp_len=selection.token_lcp_len,
             workflow_scheduler_token_lcp_hash=selection.token_lcp_hash,
+        )
+
+    def _workflow_try_lease_prepared_prefix(
+        self,
+        request: Request,
+    ) -> dict[str, int | str] | None:
+        action_id = _workflow_prefill_only_action_id(request)
+        if action_id is None:
+            return None
+        ttl_ms = _workflow_prefill_only_ttl_ms(request)
+        if _workflow_prefill_only_retention_mode(request) != "lease":
+            return {
+                "lease_status": "observe_only",
+                "lease_reason": "retention_mode_observe",
+                "lease_token_count": request.num_prompt_tokens,
+                "lease_full_block_count": 0,
+                "lease_ttl_ms": ttl_ms,
+            }
+        if ttl_ms <= 0:
+            return {
+                "lease_status": "lease_failed",
+                "lease_reason": "missing_ttl",
+                "lease_token_count": request.num_prompt_tokens,
+                "lease_full_block_count": 0,
+                "lease_ttl_ms": 0,
+            }
+        return self.kv_cache_manager.try_lease_workflow_prepared_prefix(
+            request,
+            action_id=action_id,
+            prefix_token_count=request.num_prompt_tokens,
+            ttl_ms=ttl_ms,
         )
 
     def _handle_stopped_request(self, request: Request) -> bool:

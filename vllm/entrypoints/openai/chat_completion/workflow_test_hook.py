@@ -60,6 +60,7 @@ class WorkflowTestHookRecord:
     lease_status: str | None = None
     lease_reason: str | None = None
     lease_token_count: int | None = None
+    lease_full_block_count: int | None = None
     lease_ttl_ms: int | None = None
     prefix_token_count: int | None = None
     prefix_token_hash: str | None = None
@@ -181,6 +182,7 @@ def record_workflow_action(
     lease_status: str | None = None,
     lease_reason: str | None = None,
     lease_token_count: int | None = None,
+    lease_full_block_count: int | None = None,
     lease_ttl_ms: int | None = None,
     prefix_token_count: int | None = None,
     prefix_token_hash: str | None = None,
@@ -246,6 +248,7 @@ def _record_event(
     lease_status: str | None = None,
     lease_reason: str | None = None,
     lease_token_count: int | None = None,
+    lease_full_block_count: int | None = None,
     lease_ttl_ms: int | None = None,
     prefix_token_count: int | None = None,
     prefix_token_hash: str | None = None,
@@ -316,6 +319,7 @@ def _record_event(
         lease_status=lease_status,
         lease_reason=lease_reason,
         lease_token_count=lease_token_count,
+        lease_full_block_count=lease_full_block_count,
         lease_ttl_ms=lease_ttl_ms,
         prefix_token_count=prefix_token_count,
         prefix_token_hash=prefix_token_hash,

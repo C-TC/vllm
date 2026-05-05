@@ -24,6 +24,9 @@ from vllm.entrypoints.openai.chat_completion.workflow_test_hook import (
     record_chat_request,
     record_scheduler_request,
 )
+from vllm.v1.core.block_pool import BlockPool
+from vllm.v1.core.kv_cache_manager import KVCacheManager
+from vllm.v1.core.kv_cache_utils import BlockHash, make_block_hash_with_group_id
 from vllm.v1.core.sched.scheduler import _workflow_prefill_only_ready_to_finish
 
 
@@ -53,6 +56,32 @@ class _FakeChatHandler:
 
 class _FakeChatHandlerWithoutPrewarm(_FakeChatHandler):
     submit_workflow_prefix_prewarm = None
+
+
+def _kv_manager_with_cached_prefix(
+    *,
+    block_count: int = 2,
+    hash_block_size: int = 2,
+) -> tuple[KVCacheManager, SimpleNamespace]:
+    manager = KVCacheManager.__new__(KVCacheManager)
+    manager.enable_caching = True
+    manager.block_pool = BlockPool(
+        num_gpu_blocks=8,
+        enable_caching=True,
+        hash_block_size=hash_block_size,
+    )
+    manager.num_kv_cache_groups = 1
+    manager._workflow_prepared_prefix_leases = {}
+    block_hashes = []
+    for index in range(block_count):
+        block_hash = BlockHash(bytes([index + 1]) * 32)
+        block = manager.block_pool.get_new_blocks(1)[0]
+        block.block_hash = make_block_hash_with_group_id(block_hash, 0)
+        manager.block_pool.cached_block_hash_to_block.insert(block.block_hash, block)
+        manager.block_pool.free_blocks([block])
+        block_hashes.append(block_hash)
+    request = SimpleNamespace(block_hashes=block_hashes)
+    return manager, request
 
 
 def _valid_prefix_prepare_action(
@@ -338,6 +367,103 @@ def test_workflow_actions_lease_mode_reports_unavailable_without_exposing_handle
     assert status["lease_status"] == "lease_unavailable"
     assert status["lease_reason"] == "no_safe_internal_cache_lease_api"
     assert "kv" not in json.dumps(status).lower()
+
+
+def test_workflow_actions_lease_mode_records_engine_core_lease_update(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("VLLM_ENABLE_WORKFLOW_COOPT_ACTIONS", "1")
+    monkeypatch.setenv("WORKFLOW_PREFIX_PREPARE_MIN_TOKENS", "1")
+    monkeypatch.setenv("WORKFLOW_PREFIX_PREPARE_MODE", "experimental_prewarm")
+    monkeypatch.setenv("WORKFLOW_PREFIX_PREPARE_RETENTION_MODE", "lease")
+    app = FastAPI()
+    handler = _FakeChatHandler()
+    app.state.openai_serving_chat = handler
+    api_router.attach_router(app)
+    client = TestClient(app)
+
+    response = client.post(
+        "/v1/workflow/coopt/actions",
+        json=_valid_prefix_prepare_action(key_suffix="engine-lease"),
+    )
+
+    assert response.status_code == 200
+    action_id = str(response.json()["action_id"])
+    mark_workflow_prefix_prewarm_result(
+        action_id=action_id,
+        prewarm_status="prewarm_completed",
+        lease_update={
+            "lease_status": "leased",
+            "lease_reason": "engine_core_cache_blocks_touched",
+            "lease_token_count": 5,
+            "lease_full_block_count": 1,
+            "lease_ttl_ms": 30000,
+        },
+    )
+
+    status_response = client.get(f"/v1/workflow/coopt/actions/{action_id}")
+
+    assert status_response.status_code == 200
+    status = status_response.json()
+    assert status["prewarm_status"] == "prewarm_completed"
+    assert status["lease_status"] == "leased"
+    assert status["lease_reason"] == "engine_core_cache_blocks_touched"
+    assert status["lease_full_block_count"] == 1
+    assert "block_id" not in json.dumps(status)
+    assert "kv" not in json.dumps(status).lower()
+
+
+def test_workflow_kv_manager_leases_and_releases_cached_prefix_blocks() -> None:
+    manager, request = _kv_manager_with_cached_prefix()
+    cached_block = manager.block_pool.get_cached_block(
+        request.block_hashes[0],
+        [0],
+    )[0]
+    assert cached_block.ref_cnt == 0
+
+    result = manager.try_lease_workflow_prepared_prefix(
+        request,
+        action_id="action-lease",
+        prefix_token_count=4,
+        ttl_ms=30000,
+    )
+
+    assert result == {
+        "lease_status": "leased",
+        "lease_reason": "engine_core_cache_blocks_touched",
+        "lease_token_count": 4,
+        "lease_full_block_count": 2,
+        "lease_ttl_ms": 30000,
+    }
+    assert cached_block.ref_cnt == 1
+    assert "action-lease" in manager._workflow_prepared_prefix_leases
+
+    release = manager.release_workflow_prepared_prefix_lease("action-lease")
+
+    assert release is not None
+    assert release["lease_status"] == "lease_released"
+    assert cached_block.ref_cnt == 0
+    assert "action-lease" not in manager._workflow_prepared_prefix_leases
+
+
+def test_workflow_kv_manager_lease_reports_redacted_miss_reason() -> None:
+    manager, request = _kv_manager_with_cached_prefix(block_count=1)
+
+    result = manager.try_lease_workflow_prepared_prefix(
+        request,
+        action_id="action-miss",
+        prefix_token_count=4,
+        ttl_ms=30000,
+    )
+
+    assert result == {
+        "lease_status": "lease_unavailable",
+        "lease_reason": "cache_blocks_missing",
+        "lease_token_count": 4,
+        "lease_full_block_count": 2,
+        "lease_ttl_ms": 30000,
+    }
+    assert "block_id" not in json.dumps(result)
 
 
 def test_workflow_actions_experimental_prewarm_reports_unavailable_without_hook(

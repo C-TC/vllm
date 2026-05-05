@@ -146,7 +146,15 @@ class WorkflowActionRegistry:
     def get(self, action_id: str) -> dict[str, Any] | None:
         with self._lock:
             action = self._actions_by_id.get(action_id)
-            return dict(action) if action is not None else None
+            if action is None:
+                return None
+            response = dict(action)
+            if _optional_str(response.get("lease_status")) == "leased":
+                expires_at = response.get("expires_at_unix_ms")
+                if isinstance(expires_at, int) and expires_at < _now_unix_ms():
+                    response["lease_status"] = "lease_expired"
+                    response["lease_reason"] = "ttl_expired"
+            return response
 
     def _store_response(self, action_id: str, response: dict[str, Any]) -> None:
         with self._lock:
@@ -160,6 +168,7 @@ class WorkflowActionRegistry:
         action_id: str,
         prewarm_status: str,
         reject_reason: str | None = None,
+        lease_update: dict[str, Any] | None = None,
     ) -> dict[str, Any] | None:
         with self._lock:
             stored = self._actions_by_id.get(action_id)
@@ -178,6 +187,7 @@ class WorkflowActionRegistry:
                 prewarm_status=prewarm_status,
                 prefix_token_count=_optional_int(stored.get("prefix_token_count")),
                 ttl_ms=_optional_int(stored.get("ttl_ms")),
+                engine_lease_update=lease_update,
             )
             stored.update(lease_update)
             prepared = self._prepared_prefixes_by_action_id.get(action_id)
@@ -195,6 +205,9 @@ class WorkflowActionRegistry:
             lease_status=_optional_str(response.get("lease_status")),
             lease_reason=_optional_str(response.get("lease_reason")),
             lease_token_count=_optional_int(response.get("lease_token_count")),
+            lease_full_block_count=_optional_int(
+                response.get("lease_full_block_count")
+            ),
             lease_ttl_ms=_optional_int(response.get("lease_ttl_ms")),
             prefix_token_count=_optional_int(response.get("prefix_token_count")),
             prefix_token_hash=_optional_str(response.get("prefix_token_hash")),
@@ -255,6 +268,7 @@ class WorkflowActionRegistry:
                                 "lease_status",
                                 "lease_reason",
                                 "lease_token_count",
+                                "lease_full_block_count",
                                 "lease_ttl_ms",
                             )
                             if key in prepared
@@ -393,11 +407,13 @@ def mark_workflow_prefix_prewarm_result(
     action_id: str,
     prewarm_status: str,
     reject_reason: str | None = None,
+    lease_update: dict[str, Any] | None = None,
 ) -> dict[str, Any] | None:
     return _registry.mark_prewarm_result(
         action_id=action_id,
         prewarm_status=prewarm_status,
         reject_reason=reject_reason,
+        lease_update=lease_update,
     )
 
 
@@ -588,6 +604,7 @@ def _lifecycle_response(
         lease_status=_optional_str(response.get("lease_status")),
         lease_reason=_optional_str(response.get("lease_reason")),
         lease_token_count=_optional_int(response.get("lease_token_count")),
+        lease_full_block_count=_optional_int(response.get("lease_full_block_count")),
         lease_ttl_ms=_optional_int(response.get("lease_ttl_ms")),
         prefix_token_count=prefix_token_count,
         prefix_token_hash=prefix_token_hash,
@@ -704,6 +721,7 @@ def _initial_lease_fields(
             "lease_status": "observe_only",
             "lease_reason": "retention_mode_observe",
             "lease_token_count": prefix_token_count,
+            "lease_full_block_count": None,
             "lease_ttl_ms": ttl_ms,
         }
     if prewarm_status == "prewarm_completed":
@@ -717,12 +735,14 @@ def _initial_lease_fields(
             "lease_status": "pending_prewarm",
             "lease_reason": "waiting_for_prewarm_completion",
             "lease_token_count": prefix_token_count,
+            "lease_full_block_count": None,
             "lease_ttl_ms": ttl_ms,
         }
     return {
         "lease_status": "not_attempted",
         "lease_reason": "prewarm_not_completed",
         "lease_token_count": prefix_token_count,
+        "lease_full_block_count": None,
         "lease_ttl_ms": ttl_ms,
     }
 
@@ -732,6 +752,7 @@ def _lease_update_for_prewarm_result(
     prewarm_status: str,
     prefix_token_count: int | None,
     ttl_ms: int | None,
+    engine_lease_update: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     mode = _prefix_retention_mode()
     if mode == "observe":
@@ -739,21 +760,42 @@ def _lease_update_for_prewarm_result(
             "lease_status": "observe_only",
             "lease_reason": "retention_mode_observe",
             "lease_token_count": prefix_token_count,
+            "lease_full_block_count": None,
             "lease_ttl_ms": ttl_ms,
         }
     if prewarm_status == "prewarm_completed":
-        # vLLM's current prefix cache path is observable here, but this slice
-        # intentionally does not expose or pin internal KV/cache handles.
+        if isinstance(engine_lease_update, dict):
+            return {
+                "lease_status": _optional_str(
+                    engine_lease_update.get("lease_status")
+                )
+                or "lease_failed",
+                "lease_reason": _optional_str(
+                    engine_lease_update.get("lease_reason")
+                )
+                or "missing_engine_lease_reason",
+                "lease_token_count": _optional_int(
+                    engine_lease_update.get("lease_token_count")
+                )
+                or prefix_token_count,
+                "lease_full_block_count": _optional_int(
+                    engine_lease_update.get("lease_full_block_count")
+                ),
+                "lease_ttl_ms": _optional_int(engine_lease_update.get("lease_ttl_ms"))
+                or ttl_ms,
+            }
         return {
             "lease_status": "lease_unavailable",
             "lease_reason": "no_safe_internal_cache_lease_api",
             "lease_token_count": prefix_token_count,
+            "lease_full_block_count": None,
             "lease_ttl_ms": ttl_ms,
         }
     return {
         "lease_status": "not_attempted",
         "lease_reason": prewarm_status,
         "lease_token_count": prefix_token_count,
+        "lease_full_block_count": None,
         "lease_ttl_ms": ttl_ms,
     }
 
@@ -761,9 +803,15 @@ def _lease_update_for_prewarm_result(
 def _lease_match_status(candidate: dict[str, Any]) -> str:
     status = _optional_str(candidate.get("lease_status"))
     if status == "leased":
+        expires_at = candidate.get("expires_at_unix_ms")
+        if isinstance(expires_at, int) and expires_at < _now_unix_ms():
+            return "lease_expired"
         return "matched_with_active_lease"
     if status in {
         "lease_unavailable",
+        "lease_failed",
+        "lease_expired",
+        "lease_released",
         "observe_only",
         "pending_prewarm",
         "not_attempted",

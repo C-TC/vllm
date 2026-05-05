@@ -4,6 +4,7 @@
 import asyncio
 import hashlib
 import json
+import os
 import time
 from collections.abc import AsyncGenerator, AsyncIterator
 from collections.abc import Sequence as GenericSequence
@@ -329,6 +330,11 @@ class OpenAIServingChat(OpenAIServing):
                 "workflow_prefix_prepare_token_hash": token_verification.get(
                     "prefix_token_hash"
                 ),
+                "workflow_prefix_prepare_ttl_ms": action.get("ttl_ms"),
+                "workflow_prefix_prepare_retention_mode": os.getenv(
+                    "WORKFLOW_PREFIX_PREPARE_RETENTION_MODE",
+                    "observe",
+                ),
             },
             skip_clone=True,
         )
@@ -353,8 +359,15 @@ class OpenAIServingChat(OpenAIServing):
         result_generator: AsyncGenerator[RequestOutput, None],
     ) -> None:
         unexpected_decode = False
+        workflow_prefix_result = None
         try:
             async for result in result_generator:
+                if isinstance(result.kv_transfer_params, dict):
+                    candidate = result.kv_transfer_params.get(
+                        "workflow_prefix_prepare"
+                    )
+                    if isinstance(candidate, dict):
+                        workflow_prefix_result = candidate
                 for output in result.outputs:
                     token_ids = getattr(output, "token_ids", None)
                     text = getattr(output, "text", None)
@@ -370,6 +383,7 @@ class OpenAIServingChat(OpenAIServing):
             mark_workflow_prefix_prewarm_result(
                 action_id=action_id,
                 prewarm_status="prewarm_completed",
+                lease_update=workflow_prefix_result,
             )
         except Exception:  # noqa: BLE001
             mark_workflow_prefix_prewarm_result(

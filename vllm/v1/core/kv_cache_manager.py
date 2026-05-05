@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import itertools
+import os
+import time
 from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Literal, overload
@@ -16,6 +18,48 @@ from vllm.v1.metrics.stats import PrefixCacheStats
 from vllm.v1.request import Request
 
 logger = init_logger(__name__)
+
+_WORKFLOW_PREFIX_PREPARE_MAX_OUTSTANDING_ENV = (
+    "WORKFLOW_PREFIX_PREPARE_MAX_OUTSTANDING"
+)
+_DEFAULT_WORKFLOW_PREFIX_LEASE_MAX_OUTSTANDING = 128
+
+
+def _workflow_prefix_lease_max_outstanding() -> int:
+    raw = os.getenv(_WORKFLOW_PREFIX_PREPARE_MAX_OUTSTANDING_ENV)
+    if raw is None:
+        return _DEFAULT_WORKFLOW_PREFIX_LEASE_MAX_OUTSTANDING
+    try:
+        value = int(raw)
+    except ValueError:
+        return _DEFAULT_WORKFLOW_PREFIX_LEASE_MAX_OUTSTANDING
+    return max(1, value)
+
+
+@dataclass
+class _WorkflowPreparedPrefixLease:
+    action_id: str
+    blocks: tuple[KVCacheBlock, ...]
+    prefix_token_count: int
+    full_block_count: int
+    expires_at_monotonic_s: float
+
+
+def _workflow_lease_result(
+    lease_status: str,
+    lease_reason: str,
+    *,
+    prefix_token_count: int,
+    full_block_count: int,
+    ttl_ms: int,
+) -> dict[str, int | str]:
+    return {
+        "lease_status": lease_status,
+        "lease_reason": lease_reason,
+        "lease_token_count": prefix_token_count,
+        "lease_full_block_count": full_block_count,
+        "lease_ttl_ms": ttl_ms,
+    }
 
 
 @dataclass
@@ -142,6 +186,9 @@ class KVCacheManager:
         self.num_kv_cache_groups = len(kv_cache_config.kv_cache_groups)
         self.block_pool = self.coordinator.block_pool
         self.kv_cache_config = kv_cache_config
+        self._workflow_prepared_prefix_leases: dict[
+            str, _WorkflowPreparedPrefixLease
+        ] = {}
 
         # Pre-constructed KVCacheBlocks with no blocks, callers should use this
         # via create_kv_cache_blocks instead of creating new ones to avoid GC
@@ -456,6 +503,141 @@ class KVCacheManager:
             block_ids: Set of block IDs to evict from cache.
         """
         self.block_pool.evict_blocks(block_ids)
+
+    def try_lease_workflow_prepared_prefix(
+        self,
+        request: Request,
+        *,
+        action_id: str,
+        prefix_token_count: int,
+        ttl_ms: int,
+    ) -> dict[str, int | str]:
+        """Create an internal soft lease for full cached PreparedPrefix blocks.
+
+        The lease is engine-private. It only keeps cached full prefix blocks
+        resident by incrementing their ref counts; it never exposes block ids,
+        cache keys, or KV handles to the API layer. If any prerequisite is
+        missing, the caller receives a redacted non-fatal reason and normal
+        request execution remains unchanged.
+        """
+        self._release_expired_workflow_prepared_prefix_leases()
+        if not self.enable_caching:
+            return _workflow_lease_result(
+                "lease_unavailable",
+                "prefix_cache_disabled",
+                prefix_token_count=prefix_token_count,
+                full_block_count=0,
+                ttl_ms=ttl_ms,
+            )
+        if len(self._workflow_prepared_prefix_leases) >= (
+            _workflow_prefix_lease_max_outstanding()
+        ) and action_id not in self._workflow_prepared_prefix_leases:
+            return _workflow_lease_result(
+                "lease_failed",
+                "lease_capacity_exceeded",
+                prefix_token_count=prefix_token_count,
+                full_block_count=0,
+                ttl_ms=ttl_ms,
+            )
+
+        block_size = self.block_pool.hash_block_size
+        full_block_count = prefix_token_count // block_size
+        if full_block_count <= 0:
+            return _workflow_lease_result(
+                "lease_unavailable",
+                "no_full_blocks",
+                prefix_token_count=prefix_token_count,
+                full_block_count=0,
+                ttl_ms=ttl_ms,
+            )
+        if len(request.block_hashes) < full_block_count:
+            return _workflow_lease_result(
+                "lease_unavailable",
+                "cache_blocks_missing",
+                prefix_token_count=prefix_token_count,
+                full_block_count=full_block_count,
+                ttl_ms=ttl_ms,
+            )
+
+        kv_cache_group_ids = list(range(self.num_kv_cache_groups))
+        leased_blocks_by_id: dict[int, KVCacheBlock] = {}
+        for block_hash in itertools.islice(request.block_hashes, full_block_count):
+            cached_blocks = self.block_pool.get_cached_block(
+                block_hash, kv_cache_group_ids
+            )
+            if cached_blocks is None:
+                return _workflow_lease_result(
+                    "lease_unavailable",
+                    "cache_blocks_missing",
+                    prefix_token_count=prefix_token_count,
+                    full_block_count=full_block_count,
+                    ttl_ms=ttl_ms,
+                )
+            for block in cached_blocks:
+                if not block.is_null:
+                    leased_blocks_by_id[block.block_id] = block
+        if not leased_blocks_by_id:
+            return _workflow_lease_result(
+                "lease_unavailable",
+                "no_full_blocks",
+                prefix_token_count=prefix_token_count,
+                full_block_count=0,
+                ttl_ms=ttl_ms,
+            )
+
+        self.release_workflow_prepared_prefix_lease(action_id, status="superseded")
+        leased_blocks = tuple(leased_blocks_by_id.values())
+        self.block_pool.touch(leased_blocks)
+        self._workflow_prepared_prefix_leases[action_id] = (
+            _WorkflowPreparedPrefixLease(
+                action_id=action_id,
+                blocks=leased_blocks,
+                prefix_token_count=prefix_token_count,
+                full_block_count=full_block_count,
+                expires_at_monotonic_s=time.monotonic() + (ttl_ms / 1000),
+            )
+        )
+        return _workflow_lease_result(
+            "leased",
+            "engine_core_cache_blocks_touched",
+            prefix_token_count=prefix_token_count,
+            full_block_count=full_block_count,
+            ttl_ms=ttl_ms,
+        )
+
+    def release_workflow_prepared_prefix_lease(
+        self,
+        action_id: str,
+        *,
+        status: str = "lease_released",
+    ) -> dict[str, int | str] | None:
+        lease = self._workflow_prepared_prefix_leases.pop(action_id, None)
+        if lease is None:
+            return None
+        self.block_pool.free_blocks(lease.blocks)
+        return _workflow_lease_result(
+            status,
+            "lease_ref_count_released",
+            prefix_token_count=lease.prefix_token_count,
+            full_block_count=lease.full_block_count,
+            ttl_ms=max(
+                0,
+                int((lease.expires_at_monotonic_s - time.monotonic()) * 1000),
+            ),
+        )
+
+    def _release_expired_workflow_prepared_prefix_leases(self) -> None:
+        now = time.monotonic()
+        expired = [
+            action_id
+            for action_id, lease in self._workflow_prepared_prefix_leases.items()
+            if lease.expires_at_monotonic_s <= now
+        ]
+        for action_id in expired:
+            self.release_workflow_prepared_prefix_lease(
+                action_id,
+                status="lease_expired",
+            )
 
     def reset_prefix_cache(self) -> bool:
         """Reset prefix cache. This function may be used in RLHF
