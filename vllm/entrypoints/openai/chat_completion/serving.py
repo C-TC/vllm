@@ -40,6 +40,9 @@ from vllm.entrypoints.openai.chat_completion.stream_harmony import (
     TokenState,
     extract_harmony_streaming_delta,
 )
+from vllm.entrypoints.openai.chat_completion.workflow_actions import (
+    match_prepared_prefix_for_request,
+)
 from vllm.entrypoints.openai.chat_completion.workflow_test_hook import (
     record_chat_request,
 )
@@ -320,6 +323,11 @@ class OpenAIServingChat(OpenAIServing):
             sub_request_id = (
                 request_id if len(engine_inputs) == 1 else f"{request_id}_{i}"
             )
+            prepared_prefix_match = match_prepared_prefix_for_request(
+                vllm_xargs=request.vllm_xargs,
+                prompt_token_ids=prompt_token_ids,
+                model=request.model,
+            )
             record_chat_request(
                 source="api_server_tokenized",
                 path="/v1/chat/completions",
@@ -330,6 +338,7 @@ class OpenAIServingChat(OpenAIServing):
                 served_model_name=model_name,
                 tokenizer_id=_tokenizer_id(tokenizer),
                 chat_template_id=_chat_template_id(self.chat_template),
+                prepared_prefix_match=prepared_prefix_match,
             )
 
             max_tokens = get_max_tokens(

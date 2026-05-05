@@ -59,6 +59,11 @@ class WorkflowTestHookRecord:
     prewarm_attempted: bool | None = None
     prefix_token_count: int | None = None
     prefix_token_hash: str | None = None
+    prepared_prefix_match_status: str | None = None
+    prepared_prefix_action_id: str | None = None
+    prepared_prefix_token_count: int | None = None
+    prepared_prefix_token_hash: str | None = None
+    prepared_prefix_mismatch_reason: str | None = None
     dp_rank: int | None = None
     client_index: int | None = None
     pid: int | None = None
@@ -90,6 +95,7 @@ def record_chat_request(
     served_model_name: str | None = None,
     tokenizer_id: str | None = None,
     chat_template_id: str | None = None,
+    prepared_prefix_match: dict[str, Any] | None = None,
 ) -> None:
     _record_event(
         source=source,
@@ -103,6 +109,7 @@ def record_chat_request(
         served_model_name=served_model_name,
         tokenizer_id=tokenizer_id,
         chat_template_id=chat_template_id,
+        prepared_prefix_match=prepared_prefix_match,
     )
 
 
@@ -209,6 +216,7 @@ def _record_event(
     prewarm_attempted: bool | None = None,
     prefix_token_count: int | None = None,
     prefix_token_hash: str | None = None,
+    prepared_prefix_match: dict[str, Any] | None = None,
 ) -> None:
     if not workflow_test_hook_enabled():
         return
@@ -273,6 +281,26 @@ def _record_event(
         prewarm_attempted=prewarm_attempted,
         prefix_token_count=prefix_token_count,
         prefix_token_hash=prefix_token_hash,
+        prepared_prefix_match_status=_prepared_prefix_match_str(
+            prepared_prefix_match,
+            "prepared_prefix_match_status",
+        ),
+        prepared_prefix_action_id=_prepared_prefix_match_str(
+            prepared_prefix_match,
+            "prepared_prefix_action_id",
+        ),
+        prepared_prefix_token_count=_prepared_prefix_match_int(
+            prepared_prefix_match,
+            "prepared_prefix_token_count",
+        ),
+        prepared_prefix_token_hash=_prepared_prefix_match_str(
+            prepared_prefix_match,
+            "prepared_prefix_token_hash",
+        ),
+        prepared_prefix_mismatch_reason=_prepared_prefix_match_str(
+            prepared_prefix_match,
+            "prepared_prefix_mismatch_reason",
+        ),
         dp_rank=dp_rank,
         client_index=client_index,
         pid=os.getpid(),
@@ -300,6 +328,26 @@ def _hash_token_ids(token_ids: list[int] | None) -> str | None:
         return None
     payload = json.dumps(token_ids, separators=(",", ":")).encode("utf-8")
     return f"sha1:{hashlib.sha1(payload).hexdigest()}"
+
+
+def _prepared_prefix_match_str(
+    match: dict[str, Any] | None,
+    key: str,
+) -> str | None:
+    if not isinstance(match, dict):
+        return None
+    value = match.get(key)
+    return value if isinstance(value, str) and value else None
+
+
+def _prepared_prefix_match_int(
+    match: dict[str, Any] | None,
+    key: str,
+) -> int | None:
+    if not isinstance(match, dict):
+        return None
+    value = match.get(key)
+    return value if isinstance(value, int) else None
 
 
 def _append_record_to_file(record: WorkflowTestHookRecord) -> None:

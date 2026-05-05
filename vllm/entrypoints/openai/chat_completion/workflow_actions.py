@@ -31,9 +31,11 @@ _ENABLE_ENV = "VLLM_ENABLE_WORKFLOW_COOPT_ACTIONS"
 _MIN_TOKENS_ENV = "WORKFLOW_PREFIX_PREPARE_MIN_TOKENS"
 _TTL_MS_ENV = "WORKFLOW_PREFIX_PREPARE_TTL_MS"
 _MAX_OUTSTANDING_ENV = "WORKFLOW_PREFIX_PREPARE_MAX_OUTSTANDING"
+_PREPARE_MODE_ENV = "WORKFLOW_PREFIX_PREPARE_MODE"
 _DEFAULT_MIN_TOKENS = 32
 _DEFAULT_TTL_MS = 30000
 _DEFAULT_MAX_OUTSTANDING = 128
+_DEFAULT_PREPARE_MODE = "tokenize_only"
 
 router = APIRouter()
 
@@ -42,6 +44,9 @@ class WorkflowActionRegistry:
     def __init__(self) -> None:
         self._lock = Lock()
         self._actions_by_id: OrderedDict[str, dict[str, Any]] = OrderedDict()
+        self._prepared_prefixes_by_action_id: OrderedDict[str, dict[str, Any]] = (
+            OrderedDict()
+        )
         self._generation_by_key: dict[str, int] = {}
 
     async def submit(
@@ -77,8 +82,7 @@ class WorkflowActionRegistry:
                 "lifecycle_status": "created",
             }
             self._actions_by_id.move_to_end(action_id)
-            while len(self._actions_by_id) > _max_outstanding():
-                self._actions_by_id.popitem(last=False)
+            self._evict_locked()
 
         token_verification = await _verify_prefix_tokens(action, chat_handler)
         if token_verification.get("ok") is not True:
@@ -112,12 +116,23 @@ class WorkflowActionRegistry:
             self._store_response(action_id, response)
             return response
 
+        self._store_prepared_prefix(
+            action,
+            token_verification,
+            prefix_token_count=prefix_token_count,
+            prefix_token_hash=prefix_token_hash,
+        )
+        prewarm_status = (
+            "tokenize_only"
+            if _prefix_prepare_mode() == "tokenize_only"
+            else "prefill_only_unavailable"
+        )
         response = _lifecycle_response(
             action,
             accepted=True,
             lifecycle_status="accepted",
             reject_reason=None,
-            prewarm_status="prewarm_not_implemented",
+            prewarm_status=prewarm_status,
             prefix_token_count=prefix_token_count,
             prefix_token_hash=prefix_token_hash,
             token_verification=token_verification,
@@ -136,12 +151,169 @@ class WorkflowActionRegistry:
             if stored is not None:
                 stored.update(response)
 
+    def _store_prepared_prefix(
+        self,
+        action: dict[str, Any],
+        token_verification: dict[str, Any],
+        *,
+        prefix_token_count: int | None,
+        prefix_token_hash: str | None,
+    ) -> None:
+        token_ids = token_verification.get("_prefix_token_ids")
+        if not isinstance(token_ids, list) or not all(
+            isinstance(token_id, int) for token_id in token_ids
+        ):
+            return
+        action_id = str(action["action_id"])
+        prepared = {
+            "action_id": action_id,
+            "virtual_request_id": str(action.get("virtual_request_id") or ""),
+            "workflow_instance_id": _optional_str(action.get("workflow_instance_id")),
+            "site_id": _optional_str(action.get("site_id")),
+            "model": _optional_str(action.get("model")),
+            "render_domain_id": _optional_str(action.get("render_domain_id")),
+            "token_domain_id": _optional_str(action.get("token_domain_id")),
+            "generation": int(action.get("generation") or 0),
+            "created_monotonic_s": time.monotonic(),
+            "expires_at_unix_ms": _expires_at_unix_ms(action),
+            "prefix_token_count": prefix_token_count,
+            "prefix_token_hash": prefix_token_hash,
+            "_prefix_token_ids": tuple(token_ids),
+        }
+        with self._lock:
+            self._prepared_prefixes_by_action_id[action_id] = prepared
+            self._prepared_prefixes_by_action_id.move_to_end(action_id)
+            stored = self._actions_by_id.get(action_id)
+            if stored is not None:
+                stored.update(
+                    {
+                        "prepared_prefix_registered": True,
+                        "prepared_prefix_match_status": "pending_request",
+                    }
+                )
+            self._evict_locked()
+
+    def match_prepared_prefix(
+        self,
+        *,
+        vllm_xargs: dict[str, Any] | None,
+        prompt_token_ids: list[int] | None,
+        model: str | None = None,
+    ) -> dict[str, Any] | None:
+        if not workflow_coopt_actions_enabled():
+            return None
+        if not isinstance(vllm_xargs, dict):
+            return None
+        if prompt_token_ids is None:
+            return {
+                "prepared_prefix_match_status": "unavailable",
+                "prepared_prefix_mismatch_reason": "prompt_token_ids_unavailable",
+            }
+        workflow_instance_id = _optional_str(vllm_xargs.get("workflow_instance_id"))
+        site_id = _optional_str(vllm_xargs.get("site_id"))
+        if workflow_instance_id is None or site_id is None:
+            return {
+                "prepared_prefix_match_status": "unavailable",
+                "prepared_prefix_mismatch_reason": "missing_workflow_site_identity",
+            }
+        now_ms = _now_unix_ms()
+        best_match: dict[str, Any] | None = None
+        best_mismatch: dict[str, Any] | None = None
+        with self._lock:
+            candidates = tuple(self._prepared_prefixes_by_action_id.values())
+        for candidate in candidates:
+            if candidate.get("workflow_instance_id") != workflow_instance_id:
+                continue
+            if candidate.get("site_id") != site_id:
+                continue
+            expires_at = candidate.get("expires_at_unix_ms")
+            if isinstance(expires_at, int) and expires_at < now_ms:
+                best_mismatch = {
+                    "prepared_prefix_match_status": "mismatch",
+                    "prepared_prefix_action_id": candidate.get("action_id"),
+                    "prepared_prefix_mismatch_reason": "prepared_prefix_expired",
+                }
+                continue
+            candidate_model = candidate.get("model")
+            if isinstance(candidate_model, str) and model and candidate_model != model:
+                best_mismatch = {
+                    "prepared_prefix_match_status": "mismatch",
+                    "prepared_prefix_action_id": candidate.get("action_id"),
+                    "prepared_prefix_mismatch_reason": "model_mismatch",
+                }
+                continue
+            token_ids = candidate.get("_prefix_token_ids")
+            if not isinstance(token_ids, tuple) or not all(
+                isinstance(token_id, int) for token_id in token_ids
+            ):
+                continue
+            prefix_len = len(token_ids)
+            candidate_match = {
+                "prepared_prefix_action_id": candidate.get("action_id"),
+                "prepared_prefix_token_count": candidate.get("prefix_token_count"),
+                "prepared_prefix_token_hash": candidate.get("prefix_token_hash"),
+            }
+            if tuple(prompt_token_ids[:prefix_len]) == token_ids:
+                if (
+                    best_match is None
+                    or int(candidate.get("prefix_token_count") or 0)
+                    > int(best_match.get("prepared_prefix_token_count") or 0)
+                ):
+                    best_match = {
+                        **candidate_match,
+                        "prepared_prefix_match_status": "matched",
+                    }
+                continue
+            best_mismatch = {
+                **candidate_match,
+                "prepared_prefix_match_status": "mismatch",
+                "prepared_prefix_mismatch_reason": "token_prefix_mismatch",
+            }
+        if best_match is not None:
+            self._mark_prepared_prefix_observed(best_match)
+            return best_match
+        if best_mismatch is not None:
+            return best_mismatch
+        return {
+            "prepared_prefix_match_status": "missing",
+            "prepared_prefix_mismatch_reason": "no_prepared_prefix_for_site",
+        }
+
+    def _mark_prepared_prefix_observed(self, match: dict[str, Any]) -> None:
+        action_id = _optional_str(match.get("prepared_prefix_action_id"))
+        if action_id is None:
+            return
+        with self._lock:
+            stored = self._actions_by_id.get(action_id)
+            if stored is not None:
+                stored["prepared_prefix_match_status"] = "matched"
+
+    def _evict_locked(self) -> None:
+        while len(self._actions_by_id) > _max_outstanding():
+            action_id, _stored = self._actions_by_id.popitem(last=False)
+            self._prepared_prefixes_by_action_id.pop(action_id, None)
+        while len(self._prepared_prefixes_by_action_id) > _max_outstanding():
+            self._prepared_prefixes_by_action_id.popitem(last=False)
+
 
 _registry = WorkflowActionRegistry()
 
 
 def workflow_coopt_actions_enabled() -> bool:
     return os.getenv(_ENABLE_ENV, "") == "1"
+
+
+def match_prepared_prefix_for_request(
+    *,
+    vllm_xargs: dict[str, Any] | None,
+    prompt_token_ids: list[int] | None,
+    model: str | None = None,
+) -> dict[str, Any] | None:
+    return _registry.match_prepared_prefix(
+        vllm_xargs=vllm_xargs,
+        prompt_token_ids=prompt_token_ids,
+        model=model,
+    )
 
 
 @router.post("/v1/workflow/coopt/actions")
@@ -291,6 +463,8 @@ def _lifecycle_response(
             "not_attempted",
             "ignored:prefix_too_short",
             "prewarm_not_implemented",
+            "tokenize_only",
+            "prefill_only_unavailable",
         },
         "engine_token_source": token_verification.get("engine_token_source"),
         "prefix_token_count": prefix_token_count,
@@ -301,6 +475,14 @@ def _lifecycle_response(
         "served_model_name": token_verification.get("served_model_name"),
         "tokenizer_id": token_verification.get("tokenizer_id"),
         "chat_template_id": token_verification.get("chat_template_id"),
+        "prepared_prefix_registered": (
+            lifecycle_status == "accepted" and prefix_token_hash is not None
+        ),
+        "prepared_prefix_match_status": (
+            "pending_request"
+            if lifecycle_status == "accepted" and prefix_token_hash is not None
+            else None
+        ),
     }
     action_id = _optional_str(response.get("action_id"))
     action_kind = _optional_str(response.get("action_kind"))
@@ -361,11 +543,22 @@ async def _verify_prefix_tokens(
             "reject_reason": "prefix_tokenization_failed",
         }
     verified = dict(result)
+    verified["_prefix_token_ids"] = list(token_ids)
     verified["engine_token_source"] = "engine_authoritative"
     verified["prefix_token_count"] = len(token_ids)
     verified["prefix_token_hash"] = _hash_token_ids(token_ids)
     verified.pop("prefix_token_ids", None)
     return verified
+
+
+def _expires_at_unix_ms(action: dict[str, Any]) -> int:
+    expires_at_unix_ms = action.get("expires_at_unix_ms")
+    if isinstance(expires_at_unix_ms, int):
+        return expires_at_unix_ms
+    ttl_ms = action.get("ttl_ms", _default_ttl_ms())
+    if not isinstance(ttl_ms, int) or ttl_ms <= 0:
+        ttl_ms = _default_ttl_ms()
+    return _now_unix_ms() + ttl_ms
 
 
 def _hash_prefix_messages(messages: Any) -> str | None:
@@ -407,6 +600,16 @@ def _default_ttl_ms() -> int:
 
 def _max_outstanding() -> int:
     return _env_int(_MAX_OUTSTANDING_ENV, _DEFAULT_MAX_OUTSTANDING)
+
+
+def _prefix_prepare_mode() -> str:
+    mode = os.getenv(_PREPARE_MODE_ENV, _DEFAULT_PREPARE_MODE)
+    if mode == "tokenize_only":
+        return mode
+    if mode == "experimental_prewarm":
+        # The safe prefill-only path is intentionally not wired yet.
+        return mode
+    return _DEFAULT_PREPARE_MODE
 
 
 def _env_int(name: str, default: int) -> int:

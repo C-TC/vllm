@@ -12,6 +12,7 @@ from fastapi.testclient import TestClient
 
 from vllm.entrypoints.openai.chat_completion import api_router
 from vllm.entrypoints.openai.chat_completion.workflow_actions import (
+    match_prepared_prefix_for_request,
     workflow_coopt_actions_enabled,
 )
 from vllm.entrypoints.openai.chat_completion.workflow_test_hook import _records
@@ -80,6 +81,7 @@ def test_workflow_actions_accept_prefix_prepare_without_logging_raw_prompt(
     monkeypatch.setenv("WORKFLOW_TEST_HOOK", "1")
     monkeypatch.setenv("WORKFLOW_TEST_HOOK_FILE", str(tmp_path / "hook.jsonl"))
     app = FastAPI()
+    app.state.openai_serving_chat = _FakeChatHandler()
     api_router.attach_router(app)
     client = TestClient(app)
 
@@ -92,12 +94,14 @@ def test_workflow_actions_accept_prefix_prepare_without_logging_raw_prompt(
     payload = response.json()
     assert payload["accepted"] is True
     assert payload["lifecycle_status"] == "accepted"
-    assert payload["prewarm_status"] == "prewarm_not_implemented"
+    assert payload["prewarm_status"] == "tokenize_only"
     assert payload["prewarm_attempted"] is False
     assert payload["engine_token_source"] == "engine_authoritative"
     assert payload["prefix_token_count"] == 5
     assert payload["prefix_token_hash"].startswith("sha1:")
     assert payload["prefix_message_hash"].startswith("sha1:")
+    assert payload["prepared_prefix_registered"] is True
+    assert payload["prepared_prefix_match_status"] == "pending_request"
     assert payload["tokenizer_id"] == "fake-tokenizer"
     assert "messages_prefix" not in payload
     assert _records
@@ -119,7 +123,70 @@ def test_workflow_actions_accept_prefix_prepare_without_logging_raw_prompt(
     status_payload = status_response.json()
     assert status_payload["lifecycle_status"] == "accepted"
     assert status_payload["prefix_token_count"] == 5
+    assert status_payload["prepared_prefix_match_status"] == "pending_request"
     assert "messages_prefix" not in status_payload
+
+
+def test_workflow_actions_match_prepared_prefix_by_workflow_site(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("VLLM_ENABLE_WORKFLOW_COOPT_ACTIONS", "1")
+    monkeypatch.setenv("WORKFLOW_PREFIX_PREPARE_MIN_TOKENS", "1")
+    app = FastAPI()
+    app.state.openai_serving_chat = _FakeChatHandler()
+    api_router.attach_router(app)
+    client = TestClient(app)
+    action = _valid_prefix_prepare_action(key_suffix="match")
+    action["workflow_instance_id"] = "wf-inst"
+
+    response = client.post("/v1/workflow/coopt/actions", json=action)
+
+    assert response.status_code == 200
+    match = match_prepared_prefix_for_request(
+        vllm_xargs={
+            "workflow_instance_id": "wf-inst",
+            "site_id": "main:writer",
+        },
+        prompt_token_ids=[101, 202, 303, 404, 505, 606],
+        model="test-model",
+    )
+    assert match is not None
+    assert match["prepared_prefix_match_status"] == "matched"
+    assert match["prepared_prefix_action_id"] == action["action_id"]
+    assert match["prepared_prefix_token_count"] == 5
+    assert match["prepared_prefix_token_hash"].startswith("sha1:")
+
+    status_response = client.get(
+        f"/v1/workflow/coopt/actions/{action['action_id']}"
+    )
+    assert status_response.status_code == 200
+    assert status_response.json()["prepared_prefix_match_status"] == "matched"
+
+
+def test_workflow_actions_report_prepared_prefix_mismatch(monkeypatch) -> None:
+    monkeypatch.setenv("VLLM_ENABLE_WORKFLOW_COOPT_ACTIONS", "1")
+    monkeypatch.setenv("WORKFLOW_PREFIX_PREPARE_MIN_TOKENS", "1")
+    app = FastAPI()
+    app.state.openai_serving_chat = _FakeChatHandler()
+    api_router.attach_router(app)
+    client = TestClient(app)
+    action = _valid_prefix_prepare_action(key_suffix="mismatch")
+    action["workflow_instance_id"] = "wf-inst"
+
+    response = client.post("/v1/workflow/coopt/actions", json=action)
+
+    assert response.status_code == 200
+    match = match_prepared_prefix_for_request(
+        vllm_xargs={
+            "workflow_instance_id": "wf-inst",
+            "site_id": "main:writer",
+        },
+        prompt_token_ids=[999, 202, 303, 404, 505],
+        model="test-model",
+    )
+    assert match is not None
+    assert match["prepared_prefix_match_status"] == "mismatch"
+    assert match["prepared_prefix_mismatch_reason"] == "token_prefix_mismatch"
 
 
 def test_workflow_actions_reject_invalid_and_old_generation(monkeypatch) -> None:
