@@ -39,13 +39,19 @@ ALLOWED_WORKFLOW_SIDEBAND_FIELDS = (
 
 FORBIDDEN_WORKFLOW_SIDEBAND_FIELDS = (
     "backend_cache_key",
+    "coopt_action_queue",
+    "engine_prompt_token_count",
+    "full_prompt_tokens",
     "prefix_class_id",
     "prefix_fingerprint",
+    "prompt_token_ids_hash",
     "priority_class",
     "raw_atom_label",
+    "runner_token_measurement",
     "serve_plan_atom",
     "stable_prefix_handle",
     "stable_prefix_handle_id",
+    "stable_prefix_tokens",
 )
 
 _VALID_RELEASE_HINTS = {"must", "may", "no", "unsupported"}

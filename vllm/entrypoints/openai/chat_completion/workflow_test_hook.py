@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 from collections import deque
@@ -21,6 +22,7 @@ _MAX_RECORDS = 256
 _WORKFLOW_TEST_HOOK_ENV = "WORKFLOW_TEST_HOOK"
 _WORKFLOW_TEST_HOOK_FILE_ENV = "WORKFLOW_TEST_HOOK_FILE"
 _DEFAULT_HOOK_FILE = "/tmp/vllm_workflow_test_hook.jsonl"
+_TOKEN_PREFIX_FINGERPRINT_LEN = 16
 
 
 @dataclass(slots=True, frozen=True)
@@ -33,6 +35,15 @@ class WorkflowTestHookRecord:
     workflow_sideband_present_fields: tuple[str, ...] | None = None
     workflow_sideband_missing_required_fields: tuple[str, ...] | None = None
     workflow_sideband_issues: list[dict[str, str]] | None = None
+    engine_token_source: str | None = None
+    model: str | None = None
+    served_model_name: str | None = None
+    tokenizer_id: str | None = None
+    chat_template_id: str | None = None
+    engine_prompt_token_count: int | None = None
+    prompt_token_ids_hash: str | None = None
+    prompt_token_ids_prefix_hash: str | None = None
+    prompt_token_ids_prefix_len: int | None = None
     dp_rank: int | None = None
     client_index: int | None = None
     pid: int | None = None
@@ -57,12 +68,26 @@ def record_chat_request(
     path: str,
     request_id: str | None,
     vllm_xargs: dict[str, Any] | None,
+    source: str = "api_server",
+    prompt_token_ids: list[int] | None = None,
+    engine_prompt_token_count: int | None = None,
+    model: str | None = None,
+    served_model_name: str | None = None,
+    tokenizer_id: str | None = None,
+    chat_template_id: str | None = None,
 ) -> None:
     _record_event(
-        source="api_server",
+        source=source,
         path=path,
         request_id=request_id,
         vllm_xargs=vllm_xargs,
+        prompt_token_ids=prompt_token_ids,
+        engine_prompt_token_count=engine_prompt_token_count,
+        engine_token_source=source,
+        model=model,
+        served_model_name=served_model_name,
+        tokenizer_id=tokenizer_id,
+        chat_template_id=chat_template_id,
     )
 
 
@@ -72,6 +97,8 @@ def record_scheduler_request(
     vllm_xargs: dict[str, Any] | None,
     dp_rank: int | None,
     client_index: int | None,
+    prompt_token_ids: list[int] | None = None,
+    engine_prompt_token_count: int | None = None,
 ) -> None:
     _record_event(
         source="scheduler",
@@ -80,6 +107,9 @@ def record_scheduler_request(
         vllm_xargs=vllm_xargs,
         dp_rank=dp_rank,
         client_index=client_index,
+        prompt_token_ids=prompt_token_ids,
+        engine_prompt_token_count=engine_prompt_token_count,
+        engine_token_source="scheduler",
     )
 
 
@@ -91,6 +121,13 @@ def _record_event(
     vllm_xargs: dict[str, Any] | None,
     dp_rank: int | None = None,
     client_index: int | None = None,
+    prompt_token_ids: list[int] | None = None,
+    engine_prompt_token_count: int | None = None,
+    engine_token_source: str | None = None,
+    model: str | None = None,
+    served_model_name: str | None = None,
+    tokenizer_id: str | None = None,
+    chat_template_id: str | None = None,
 ) -> None:
     if not workflow_test_hook_enabled():
         return
@@ -120,6 +157,26 @@ def _record_event(
             if sideband_validation is not None
             else None
         ),
+        engine_token_source=engine_token_source,
+        model=model,
+        served_model_name=served_model_name,
+        tokenizer_id=tokenizer_id,
+        chat_template_id=chat_template_id,
+        engine_prompt_token_count=_prompt_token_count(
+            prompt_token_ids,
+            engine_prompt_token_count,
+        ),
+        prompt_token_ids_hash=_hash_token_ids(prompt_token_ids),
+        prompt_token_ids_prefix_hash=_hash_token_ids(
+            prompt_token_ids[:_TOKEN_PREFIX_FINGERPRINT_LEN]
+            if prompt_token_ids is not None
+            else None
+        ),
+        prompt_token_ids_prefix_len=(
+            min(len(prompt_token_ids), _TOKEN_PREFIX_FINGERPRINT_LEN)
+            if prompt_token_ids is not None
+            else None
+        ),
         dp_rank=dp_rank,
         client_index=client_index,
         pid=os.getpid(),
@@ -131,6 +188,22 @@ def _record_event(
     except OSError:
         # The hook is observability-only and must never affect request serving.
         return
+
+
+def _prompt_token_count(
+    prompt_token_ids: list[int] | None,
+    explicit_count: int | None,
+) -> int | None:
+    if prompt_token_ids is not None:
+        return len(prompt_token_ids)
+    return explicit_count
+
+
+def _hash_token_ids(token_ids: list[int] | None) -> str | None:
+    if token_ids is None:
+        return None
+    payload = json.dumps(token_ids, separators=(",", ":")).encode("utf-8")
+    return f"sha1:{hashlib.sha1(payload).hexdigest()}"
 
 
 def _append_record_to_file(record: WorkflowTestHookRecord) -> None:

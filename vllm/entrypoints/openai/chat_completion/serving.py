@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import asyncio
+import hashlib
 import json
 import time
 from collections.abc import AsyncGenerator, AsyncIterator
@@ -38,6 +39,9 @@ from vllm.entrypoints.openai.chat_completion.protocol import (
 from vllm.entrypoints.openai.chat_completion.stream_harmony import (
     TokenState,
     extract_harmony_streaming_delta,
+)
+from vllm.entrypoints.openai.chat_completion.workflow_test_hook import (
+    record_chat_request,
 )
 from vllm.entrypoints.openai.engine.protocol import (
     DeltaFunctionCall,
@@ -82,6 +86,21 @@ if TYPE_CHECKING:
     from vllm.entrypoints.serve.render.serving import OpenAIServingRender
 
 logger = init_logger(__name__)
+
+
+def _tokenizer_id(tokenizer: TokenizerLike) -> str | None:
+    for attr in ("name_or_path", "name", "tokenizer_id"):
+        value = getattr(tokenizer, attr, None)
+        if isinstance(value, str) and value:
+            return value
+    return type(tokenizer).__name__
+
+
+def _chat_template_id(chat_template: str | None) -> str | None:
+    if not chat_template:
+        return None
+    digest = hashlib.sha1(chat_template.encode("utf-8")).hexdigest()
+    return f"sha1:{digest}"
 
 
 class OpenAIServingChat(OpenAIServing):
@@ -258,6 +277,17 @@ class OpenAIServingChat(OpenAIServing):
             # have unique request ids.
             sub_request_id = (
                 request_id if len(engine_inputs) == 1 else f"{request_id}_{i}"
+            )
+            record_chat_request(
+                source="api_server_tokenized",
+                path="/v1/chat/completions",
+                request_id=sub_request_id,
+                vllm_xargs=request.vllm_xargs,
+                prompt_token_ids=prompt_token_ids,
+                model=request.model,
+                served_model_name=model_name,
+                tokenizer_id=_tokenizer_id(tokenizer),
+                chat_template_id=_chat_template_id(self.chat_template),
             )
 
             max_tokens = get_max_tokens(

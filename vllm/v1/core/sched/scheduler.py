@@ -26,6 +26,9 @@ from vllm.distributed.kv_transfer.kv_connector.v1 import (
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorMetadata
 from vllm.distributed.kv_transfer.kv_connector.v1.metrics import KVConnectorStats
+from vllm.entrypoints.openai.chat_completion.workflow_test_hook import (
+    record_scheduler_request,
+)
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.routed_experts_capturer import (
     RoutedExpertsReader,
@@ -60,9 +63,6 @@ from vllm.v1.request import Request, RequestStatus, StreamingUpdate
 from vllm.v1.spec_decode.metrics import SpecDecodingStats
 from vllm.v1.structured_output import StructuredOutputManager
 from vllm.v1.utils import record_function_or_nullcontext
-from vllm.entrypoints.openai.chat_completion.workflow_test_hook import (
-    record_scheduler_request,
-)
 
 logger = init_logger(__name__)
 
@@ -1760,6 +1760,8 @@ class Scheduler(SchedulerInterface):
                 vllm_xargs=extra_args,
                 dp_rank=self.parallel_config.data_parallel_index,
                 client_index=request.client_index,
+                prompt_token_ids=request.prompt_token_ids,
+                engine_prompt_token_count=request.num_prompt_tokens,
             )
             if self.log_stats:
                 request.record_event(EngineCoreEventType.QUEUED)

@@ -59,8 +59,11 @@ def test_workflow_sideband_validation_rejects_runtime_private_fields() -> None:
             "private_release_hint": "may",
             "effective_release_hint": "may",
             "release_hint": "may",
+            "engine_prompt_token_count": 12,
+            "runner_token_measurement": {"source": "runner_advisory"},
             "stable_prefix_handle_id": "stable_prefix:abc",
             "prefix_fingerprint": "abc",
+            "prompt_token_ids_hash": "sha1:abc",
         }
     )
 
@@ -69,6 +72,9 @@ def test_workflow_sideband_validation_rejects_runtime_private_fields() -> None:
     fields = {issue.field for issue in validation.issues}
     assert "stable_prefix_handle_id" in fields
     assert "prefix_fingerprint" in fields
+    assert "engine_prompt_token_count" in fields
+    assert "runner_token_measurement" in fields
+    assert "prompt_token_ids_hash" in fields
 
 
 def test_workflow_sideband_validation_distinguishes_absent_sideband() -> None:
