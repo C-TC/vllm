@@ -159,6 +159,7 @@ def test_workflow_actions_accept_prefix_prepare_without_logging_raw_prompt(
     assert payload["prefix_message_hash"].startswith("sha1:")
     assert payload["prepared_prefix_registered"] is True
     assert payload["prepared_prefix_match_status"] == "pending_request"
+    assert payload["prepared_prefix_object_status"] == "registered"
     assert payload["tokenizer_id"] == "fake-tokenizer"
     assert "messages_prefix" not in payload
     assert _records
@@ -182,6 +183,7 @@ def test_workflow_actions_accept_prefix_prepare_without_logging_raw_prompt(
     assert status_payload["lifecycle_status"] == "accepted"
     assert status_payload["prefix_token_count"] == 5
     assert status_payload["prepared_prefix_match_status"] == "pending_request"
+    assert status_payload["prepared_prefix_object_status"] == "registered"
     assert "messages_prefix" not in status_payload
 
 
@@ -220,7 +222,9 @@ def test_workflow_actions_match_prepared_prefix_by_workflow_site(
         f"/v1/workflow/coopt/actions/{action['action_id']}"
     )
     assert status_response.status_code == 200
-    assert status_response.json()["prepared_prefix_match_status"] == "matched"
+    status = status_response.json()
+    assert status["prepared_prefix_match_status"] == "matched"
+    assert status["prepared_prefix_object_status"] == "matched"
 
 
 def test_workflow_actions_report_prepared_prefix_mismatch(monkeypatch) -> None:
@@ -271,6 +275,7 @@ def test_workflow_actions_superseded_prefix_no_longer_matches(monkeypatch) -> No
     ).json()
     assert first_status["lifecycle_status"] == "superseded"
     assert first_status["prepared_prefix_match_status"] == "superseded"
+    assert first_status["prepared_prefix_object_status"] == "superseded"
     assert first_status["lease_cleanup_reason"] == "superseded_registry_only"
     match = match_prepared_prefix_for_request(
         vllm_xargs={
@@ -403,6 +408,7 @@ def test_workflow_actions_lease_mode_reports_unavailable_without_exposing_handle
     status = status_response.json()
     assert status["prewarm_status"] == "prewarm_completed"
     assert status["lease_status"] == "lease_unavailable"
+    assert status["prepared_prefix_object_status"] == "lease_unavailable"
     assert status["lease_reason"] == "no_safe_internal_cache_lease_api"
     assert "kv" not in json.dumps(status).lower()
 
@@ -445,6 +451,7 @@ def test_workflow_actions_lease_mode_records_engine_core_lease_update(
     status = status_response.json()
     assert status["prewarm_status"] == "prewarm_completed"
     assert status["lease_status"] == "leased"
+    assert status["prepared_prefix_object_status"] == "leased"
     assert status["lease_reason"] == "engine_core_cache_blocks_touched"
     assert status["lease_full_block_count"] == 1
     assert "block_id" not in json.dumps(status)
@@ -496,6 +503,7 @@ def test_workflow_actions_records_lease_consumed_update(
     assert status_response.status_code == 200
     status = status_response.json()
     assert status["lease_status"] == "lease_consumed"
+    assert status["prepared_prefix_object_status"] == "lease_consumed"
     assert status["lease_reason"] == "lease_ref_count_released"
     assert "block_id" not in json.dumps(status)
     assert "kv" not in json.dumps(status).lower()

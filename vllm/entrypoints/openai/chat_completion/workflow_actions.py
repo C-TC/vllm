@@ -18,6 +18,7 @@ import json
 import os
 import time
 from collections import OrderedDict
+from dataclasses import dataclass
 from threading import Lock
 from typing import Any
 
@@ -43,13 +44,285 @@ _DEFAULT_RETENTION_MODE = "observe"
 router = APIRouter()
 
 
+@dataclass
+class PreparedPrefix:
+    """Engine-internal PreparedPrefix state.
+
+    Raw token ids are kept only for in-memory prefix matching. The redacted
+    status view is the only surface returned through the action API or hooks.
+    """
+
+    action_id: str
+    action_kind: str
+    generation: int
+    registry_key: str
+    virtual_request_id: str
+    workflow_instance_id: str | None
+    site_id: str | None
+    model: str | None
+    render_domain_id: str | None
+    token_domain_id: str | None
+    created_monotonic_s: float
+    expires_at_unix_ms: int
+    ttl_ms: int
+    prefix_message_hash: str | None
+    prefix_token_count: int | None
+    prefix_token_hash: str | None
+    prefix_token_ids: tuple[int, ...]
+    engine_token_source: str | None
+    served_model_name: str | None
+    tokenizer_id: str | None
+    chat_template_id: str | None
+    lifecycle_status: str = "accepted"
+    reject_reason: str | None = None
+    prewarm_status: str = "tokenize_only"
+    prewarm_attempted: bool = False
+    prepared_prefix_match_status: str = "pending_request"
+    lease_status: str = "not_attempted"
+    lease_reason: str = "prewarm_not_completed"
+    lease_token_count: int | None = None
+    lease_full_block_count: int | None = None
+    lease_ttl_ms: int | None = None
+    lease_cleanup_reason: str | None = None
+    lease_cleanup_count: int | None = None
+
+    @classmethod
+    def from_verified_action(
+        cls,
+        action: dict[str, Any],
+        token_verification: dict[str, Any],
+        *,
+        prewarm_status: str,
+        prefix_token_count: int | None,
+        prefix_token_hash: str | None,
+    ) -> PreparedPrefix | None:
+        token_ids = token_verification.get("_prefix_token_ids")
+        if not isinstance(token_ids, list) or not all(
+            isinstance(token_id, int) for token_id in token_ids
+        ):
+            return None
+        ttl_ms = _action_ttl_ms(action)
+        lease_fields = _initial_lease_fields(
+            prewarm_status=prewarm_status,
+            prefix_token_count=prefix_token_count,
+            ttl_ms=ttl_ms,
+        )
+        return cls(
+            action_id=str(action["action_id"]),
+            action_kind=str(action["action_kind"]),
+            generation=int(action.get("generation") or 0),
+            registry_key=str(action.get("virtual_request_id") or ""),
+            virtual_request_id=str(action.get("virtual_request_id") or ""),
+            workflow_instance_id=_optional_str(action.get("workflow_instance_id")),
+            site_id=_optional_str(action.get("site_id")),
+            model=_optional_str(token_verification.get("model"))
+            or _optional_str(action.get("model")),
+            render_domain_id=_optional_str(action.get("render_domain_id")),
+            token_domain_id=_optional_str(action.get("token_domain_id")),
+            created_monotonic_s=time.monotonic(),
+            expires_at_unix_ms=_expires_at_unix_ms(action),
+            ttl_ms=ttl_ms,
+            prefix_message_hash=_hash_prefix_messages(action.get("messages_prefix")),
+            prefix_token_count=prefix_token_count,
+            prefix_token_hash=prefix_token_hash,
+            prefix_token_ids=tuple(token_ids),
+            engine_token_source=_optional_str(
+                token_verification.get("engine_token_source")
+            ),
+            served_model_name=_optional_str(token_verification.get("served_model_name")),
+            tokenizer_id=_optional_str(token_verification.get("tokenizer_id")),
+            chat_template_id=_optional_str(token_verification.get("chat_template_id")),
+            prewarm_status=prewarm_status,
+            prewarm_attempted=_prewarm_attempted(prewarm_status),
+            lease_status=_optional_str(lease_fields.get("lease_status"))
+            or "not_attempted",
+            lease_reason=_optional_str(lease_fields.get("lease_reason"))
+            or "prewarm_not_completed",
+            lease_token_count=_optional_int(lease_fields.get("lease_token_count")),
+            lease_full_block_count=_optional_int(
+                lease_fields.get("lease_full_block_count")
+            ),
+            lease_ttl_ms=_optional_int(lease_fields.get("lease_ttl_ms")),
+        )
+
+    def redacted_status(self) -> dict[str, Any]:
+        lease_status = self.lease_status
+        lease_reason = self.lease_reason
+        object_status = self.object_status()
+        if lease_status == "leased" and self.expires_at_unix_ms < _now_unix_ms():
+            lease_status = "lease_expired"
+            lease_reason = "ttl_expired"
+            object_status = "lease_expired"
+        return {
+            "action_id": self.action_id,
+            "action_kind": self.action_kind,
+            "generation": self.generation,
+            "ttl_ms": self.ttl_ms,
+            "accepted": True,
+            "lifecycle_status": self.lifecycle_status,
+            "reject_reason": self.reject_reason,
+            "prewarm_status": self.prewarm_status,
+            "prewarm_attempted": self.prewarm_attempted,
+            "engine_token_source": self.engine_token_source,
+            "prefix_token_count": self.prefix_token_count,
+            "prefix_token_hash": self.prefix_token_hash,
+            "prefix_message_hash": self.prefix_message_hash,
+            "prefix_hash_present": self.prefix_token_hash is not None,
+            "model": self.model,
+            "served_model_name": self.served_model_name,
+            "tokenizer_id": self.tokenizer_id,
+            "chat_template_id": self.chat_template_id,
+            "prepared_prefix_registered": True,
+            "prepared_prefix_match_status": self.prepared_prefix_match_status,
+            "prepared_prefix_object_status": object_status,
+            "lease_status": lease_status,
+            "lease_reason": lease_reason,
+            "lease_cleanup_reason": self.lease_cleanup_reason,
+            "lease_cleanup_count": self.lease_cleanup_count,
+            "lease_token_count": self.lease_token_count,
+            "lease_full_block_count": self.lease_full_block_count,
+            "lease_ttl_ms": self.lease_ttl_ms,
+        }
+
+    def object_status(self) -> str:
+        if self.lifecycle_status == "superseded":
+            return "superseded"
+        if self.lease_status in {
+            "lease_consumed",
+            "lease_expired",
+            "lease_released",
+            "lease_failed",
+            "lease_unavailable",
+        }:
+            return self.lease_status
+        if self.prepared_prefix_match_status == "matched":
+            return "matched"
+        if self.lease_status == "leased":
+            return "leased"
+        if self.prewarm_status == "prewarm_completed":
+            return "prewarm_completed"
+        if self.prewarm_status == "prewarm_submitted":
+            return "prewarm_submitted"
+        return "registered"
+
+    def apply_prewarm_result(
+        self,
+        *,
+        prewarm_status: str,
+        reject_reason: str | None = None,
+        lease_update: dict[str, Any] | None = None,
+    ) -> None:
+        self.prewarm_status = prewarm_status
+        self.prewarm_attempted = _prewarm_attempted(prewarm_status)
+        if reject_reason is not None:
+            self.reject_reason = reject_reason
+        self.apply_lease_update(
+            _lease_update_for_prewarm_result(
+                prewarm_status=prewarm_status,
+                prefix_token_count=self.prefix_token_count,
+                ttl_ms=self.ttl_ms,
+                engine_lease_update=lease_update,
+            )
+        )
+
+    def apply_engine_lease_update(self, lease_update: dict[str, Any]) -> None:
+        self.apply_lease_update(
+            _lease_update_from_engine(
+                lease_update,
+                prefix_token_count=self.prefix_token_count,
+                ttl_ms=self.ttl_ms,
+            )
+        )
+
+    def apply_lease_update(self, lease_update: dict[str, Any]) -> None:
+        self.lease_status = (
+            _optional_str(lease_update.get("lease_status")) or self.lease_status
+        )
+        self.lease_reason = (
+            _optional_str(lease_update.get("lease_reason")) or self.lease_reason
+        )
+        self.lease_cleanup_reason = _optional_str(
+            lease_update.get("lease_cleanup_reason")
+        )
+        self.lease_cleanup_count = _optional_int(
+            lease_update.get("lease_cleanup_count")
+        )
+        self.lease_token_count = (
+            _optional_int(lease_update.get("lease_token_count"))
+            if "lease_token_count" in lease_update
+            else self.lease_token_count
+        )
+        self.lease_full_block_count = (
+            _optional_int(lease_update.get("lease_full_block_count"))
+            if "lease_full_block_count" in lease_update
+            else self.lease_full_block_count
+        )
+        self.lease_ttl_ms = (
+            _optional_int(lease_update.get("lease_ttl_ms"))
+            if "lease_ttl_ms" in lease_update
+            else self.lease_ttl_ms
+        )
+        if self.lease_status in {
+            "lease_consumed",
+            "lease_expired",
+            "lease_released",
+        }:
+            self.prepared_prefix_match_status = self.lease_status
+
+    def mark_matched(self) -> None:
+        self.prepared_prefix_match_status = "matched"
+
+    def mark_superseded(self) -> None:
+        self.lifecycle_status = "superseded"
+        self.prepared_prefix_match_status = "superseded"
+        self.lease_cleanup_reason = "superseded_registry_only"
+
+    def is_matchable(self) -> bool:
+        if self.lifecycle_status == "superseded":
+            return False
+        return self.prepared_prefix_match_status not in {
+            "superseded",
+            "lease_consumed",
+            "lease_expired",
+            "lease_released",
+        }
+
+    def match_view(self) -> dict[str, Any]:
+        return {
+            "prepared_prefix_action_id": self.action_id,
+            "prepared_prefix_token_count": self.prefix_token_count,
+            "prepared_prefix_token_hash": self.prefix_token_hash,
+            "prepared_prefix_lease_status": self.lease_status,
+            "prepared_prefix_lease_match_status": self.lease_match_status(),
+        }
+
+    def lease_match_status(self) -> str:
+        status = self.lease_status
+        if status == "leased":
+            if self.expires_at_unix_ms < _now_unix_ms():
+                return "lease_expired"
+            return "matched_with_active_lease"
+        if status in {
+            "lease_unavailable",
+            "lease_failed",
+            "lease_expired",
+            "lease_released",
+            "lease_consumed",
+            "observe_only",
+            "pending_prewarm",
+            "not_attempted",
+        }:
+            return status
+        return "unknown"
+
+
 class WorkflowActionRegistry:
     def __init__(self) -> None:
         self._lock = Lock()
         self._actions_by_id: OrderedDict[str, dict[str, Any]] = OrderedDict()
-        self._prepared_prefixes_by_action_id: OrderedDict[str, dict[str, Any]] = (
-            OrderedDict()
-        )
+        self._prepared_prefixes_by_action_id: OrderedDict[
+            str, PreparedPrefix
+        ] = OrderedDict()
         self._generation_by_key: dict[str, int] = {}
 
     async def submit(
@@ -121,42 +394,42 @@ class WorkflowActionRegistry:
             self._store_response(action_id, response)
             return response
 
-        self._store_prepared_prefix(
-            action,
-            token_verification,
-            prefix_token_count=prefix_token_count,
-            prefix_token_hash=prefix_token_hash,
-        )
         prewarm_status = await _maybe_submit_prefix_prewarm(
             action,
             token_verification,
             chat_handler,
         )
-        response = _lifecycle_response(
+        prepared_prefix = PreparedPrefix.from_verified_action(
             action,
-            accepted=True,
-            lifecycle_status="accepted",
-            reject_reason=None,
+            token_verification,
             prewarm_status=prewarm_status,
             prefix_token_count=prefix_token_count,
             prefix_token_hash=prefix_token_hash,
-            token_verification=token_verification,
         )
+        if prepared_prefix is None:
+            response = _lifecycle_response(
+                action,
+                accepted=False,
+                lifecycle_status="rejected",
+                reject_reason="prefix_tokenization_failed",
+                prewarm_status="not_attempted",
+                token_verification=token_verification,
+            )
+        else:
+            response = self._register_prepared_prefix(prepared_prefix)
+            _record_prepared_prefix_action(response)
         self._store_response(action_id, response)
         return response
 
     def get(self, action_id: str) -> dict[str, Any] | None:
         with self._lock:
+            prepared = self._prepared_prefixes_by_action_id.get(action_id)
+            if prepared is not None:
+                return prepared.redacted_status()
             action = self._actions_by_id.get(action_id)
             if action is None:
                 return None
-            response = dict(action)
-            if _optional_str(response.get("lease_status")) == "leased":
-                expires_at = response.get("expires_at_unix_ms")
-                if isinstance(expires_at, int) and expires_at < _now_unix_ms():
-                    response["lease_status"] = "lease_expired"
-                    response["lease_reason"] = "ttl_expired"
-            return response
+            return dict(action)
 
     def _store_response(self, action_id: str, response: dict[str, Any]) -> None:
         with self._lock:
@@ -176,49 +449,32 @@ class WorkflowActionRegistry:
             stored = self._actions_by_id.get(action_id)
             if stored is None:
                 return None
-            stored["prewarm_status"] = prewarm_status
-            stored["prewarm_attempted"] = prewarm_status not in {
-                "not_attempted",
-                "ignored:prefix_too_short",
-                "tokenize_only",
-                "prefill_only_unavailable",
-            }
-            if reject_reason is not None:
-                stored["reject_reason"] = reject_reason
-            lease_update = _lease_update_for_prewarm_result(
-                prewarm_status=prewarm_status,
-                prefix_token_count=_optional_int(stored.get("prefix_token_count")),
-                ttl_ms=_optional_int(stored.get("ttl_ms")),
-                engine_lease_update=lease_update,
-            )
-            stored.update(lease_update)
             prepared = self._prepared_prefixes_by_action_id.get(action_id)
             if prepared is not None:
-                prepared.update(lease_update)
-            response = dict(stored)
-        record_workflow_action(
-            action_id=_optional_str(response.get("action_id")),
-            action_kind=_optional_str(response.get("action_kind")),
-            lifecycle_status=_optional_str(response.get("lifecycle_status"))
-            or "accepted",
-            reject_reason=_optional_str(response.get("reject_reason")),
-            prewarm_status=prewarm_status,
-            prewarm_attempted=bool(response.get("prewarm_attempted")),
-            lease_status=_optional_str(response.get("lease_status")),
-            lease_reason=_optional_str(response.get("lease_reason")),
-            lease_token_count=_optional_int(response.get("lease_token_count")),
-            lease_full_block_count=_optional_int(
-                response.get("lease_full_block_count")
-            ),
-            lease_ttl_ms=_optional_int(response.get("lease_ttl_ms")),
-            prefix_token_count=_optional_int(response.get("prefix_token_count")),
-            prefix_token_hash=_optional_str(response.get("prefix_token_hash")),
-            engine_token_source=_optional_str(response.get("engine_token_source")),
-            model=_optional_str(response.get("model")),
-            served_model_name=_optional_str(response.get("served_model_name")),
-            tokenizer_id=_optional_str(response.get("tokenizer_id")),
-            chat_template_id=_optional_str(response.get("chat_template_id")),
-        )
+                prepared.apply_prewarm_result(
+                    prewarm_status=prewarm_status,
+                    reject_reason=reject_reason,
+                    lease_update=lease_update,
+                )
+                response = prepared.redacted_status()
+            else:
+                stored["prewarm_status"] = prewarm_status
+                stored["prewarm_attempted"] = _prewarm_attempted(prewarm_status)
+                if reject_reason is not None:
+                    stored["reject_reason"] = reject_reason
+                stored.update(
+                    _lease_update_for_prewarm_result(
+                        prewarm_status=prewarm_status,
+                        prefix_token_count=_optional_int(
+                            stored.get("prefix_token_count")
+                        ),
+                        ttl_ms=_optional_int(stored.get("ttl_ms")),
+                        engine_lease_update=lease_update,
+                    )
+                )
+                response = dict(stored)
+            stored.update(response)
+        _record_prepared_prefix_action(response)
         return response
 
     def mark_lease_result(
@@ -231,104 +487,38 @@ class WorkflowActionRegistry:
             stored = self._actions_by_id.get(action_id)
             if stored is None:
                 return None
-            lease_update = _lease_update_from_engine(
-                lease_update,
-                prefix_token_count=_optional_int(stored.get("prefix_token_count")),
-                ttl_ms=_optional_int(stored.get("ttl_ms")),
-            )
-            stored.update(lease_update)
             prepared = self._prepared_prefixes_by_action_id.get(action_id)
             if prepared is not None:
-                prepared.update(lease_update)
-            if _optional_str(lease_update.get("lease_status")) in {
-                "lease_consumed",
-                "lease_expired",
-                "lease_released",
-            }:
-                self._prepared_prefixes_by_action_id.pop(action_id, None)
-            response = dict(stored)
-        record_workflow_action(
-            action_id=_optional_str(response.get("action_id")),
-            action_kind=_optional_str(response.get("action_kind")),
-            lifecycle_status=_optional_str(response.get("lifecycle_status"))
-            or "accepted",
-            reject_reason=_optional_str(response.get("reject_reason")),
-            prewarm_status=_optional_str(response.get("prewarm_status")),
-            prewarm_attempted=bool(response.get("prewarm_attempted")),
-            lease_status=_optional_str(response.get("lease_status")),
-            lease_reason=_optional_str(response.get("lease_reason")),
-            lease_token_count=_optional_int(response.get("lease_token_count")),
-            lease_full_block_count=_optional_int(
-                response.get("lease_full_block_count")
-            ),
-            lease_ttl_ms=_optional_int(response.get("lease_ttl_ms")),
-            prefix_token_count=_optional_int(response.get("prefix_token_count")),
-            prefix_token_hash=_optional_str(response.get("prefix_token_hash")),
-            engine_token_source=_optional_str(response.get("engine_token_source")),
-            model=_optional_str(response.get("model")),
-            served_model_name=_optional_str(response.get("served_model_name")),
-            tokenizer_id=_optional_str(response.get("tokenizer_id")),
-            chat_template_id=_optional_str(response.get("chat_template_id")),
-        )
+                prepared.apply_engine_lease_update(lease_update)
+                response = prepared.redacted_status()
+            else:
+                stored.update(
+                    _lease_update_from_engine(
+                        lease_update,
+                        prefix_token_count=_optional_int(
+                            stored.get("prefix_token_count")
+                        ),
+                        ttl_ms=_optional_int(stored.get("ttl_ms")),
+                    )
+                )
+                response = dict(stored)
+            stored.update(response)
+        _record_prepared_prefix_action(response)
         return response
 
-    def _store_prepared_prefix(
+    def _register_prepared_prefix(
         self,
-        action: dict[str, Any],
-        token_verification: dict[str, Any],
-        *,
-        prefix_token_count: int | None,
-        prefix_token_hash: str | None,
-    ) -> None:
-        token_ids = token_verification.get("_prefix_token_ids")
-        if not isinstance(token_ids, list) or not all(
-            isinstance(token_id, int) for token_id in token_ids
-        ):
-            return
-        action_id = str(action["action_id"])
-        prepared = {
-            "action_id": action_id,
-            "virtual_request_id": str(action.get("virtual_request_id") or ""),
-            "workflow_instance_id": _optional_str(action.get("workflow_instance_id")),
-            "site_id": _optional_str(action.get("site_id")),
-            "model": _optional_str(action.get("model")),
-            "render_domain_id": _optional_str(action.get("render_domain_id")),
-            "token_domain_id": _optional_str(action.get("token_domain_id")),
-            "generation": int(action.get("generation") or 0),
-            "created_monotonic_s": time.monotonic(),
-            "expires_at_unix_ms": _expires_at_unix_ms(action),
-            "prefix_token_count": prefix_token_count,
-            "prefix_token_hash": prefix_token_hash,
-            **_initial_lease_fields(
-                prewarm_status=None,
-                prefix_token_count=prefix_token_count,
-                ttl_ms=_action_ttl_ms(action),
-            ),
-            "_prefix_token_ids": tuple(token_ids),
-        }
+        prepared: PreparedPrefix,
+    ) -> dict[str, Any]:
         with self._lock:
-            self._prepared_prefixes_by_action_id[action_id] = prepared
-            self._prepared_prefixes_by_action_id.move_to_end(action_id)
-            stored = self._actions_by_id.get(action_id)
+            self._prepared_prefixes_by_action_id[prepared.action_id] = prepared
+            self._prepared_prefixes_by_action_id.move_to_end(prepared.action_id)
+            response = prepared.redacted_status()
+            stored = self._actions_by_id.get(prepared.action_id)
             if stored is not None:
-                stored.update(
-                    {
-                        "prepared_prefix_registered": True,
-                        "prepared_prefix_match_status": "pending_request",
-                        **{
-                            key: prepared[key]
-                            for key in (
-                                "lease_status",
-                                "lease_reason",
-                                "lease_token_count",
-                                "lease_full_block_count",
-                                "lease_ttl_ms",
-                            )
-                            if key in prepared
-                        },
-                    }
-                )
+                stored.update(response)
             self._evict_locked()
+            return response
 
     def _supersede_locked(self, registry_key: str) -> None:
         for action_id, stored in tuple(self._actions_by_id.items()):
@@ -337,7 +527,10 @@ class WorkflowActionRegistry:
             stored["lifecycle_status"] = "superseded"
             stored["prepared_prefix_match_status"] = "superseded"
             stored["lease_cleanup_reason"] = "superseded_registry_only"
-            self._prepared_prefixes_by_action_id.pop(action_id, None)
+            prepared = self._prepared_prefixes_by_action_id.get(action_id)
+            if prepared is not None:
+                prepared.mark_superseded()
+                stored.update(prepared.redacted_status())
 
     def match_prepared_prefix(
         self,
@@ -368,43 +561,32 @@ class WorkflowActionRegistry:
         with self._lock:
             candidates = tuple(self._prepared_prefixes_by_action_id.values())
         for candidate in candidates:
-            if candidate.get("workflow_instance_id") != workflow_instance_id:
+            if not candidate.is_matchable():
                 continue
-            if candidate.get("site_id") != site_id:
+            if candidate.workflow_instance_id != workflow_instance_id:
                 continue
-            expires_at = candidate.get("expires_at_unix_ms")
-            if isinstance(expires_at, int) and expires_at < now_ms:
+            if candidate.site_id != site_id:
+                continue
+            if candidate.expires_at_unix_ms < now_ms:
                 best_mismatch = {
                     "prepared_prefix_match_status": "mismatch",
-                    "prepared_prefix_action_id": candidate.get("action_id"),
+                    "prepared_prefix_action_id": candidate.action_id,
                     "prepared_prefix_mismatch_reason": "prepared_prefix_expired",
                 }
                 continue
-            candidate_model = candidate.get("model")
-            if isinstance(candidate_model, str) and model and candidate_model != model:
+            if candidate.model and model and candidate.model != model:
                 best_mismatch = {
                     "prepared_prefix_match_status": "mismatch",
-                    "prepared_prefix_action_id": candidate.get("action_id"),
+                    "prepared_prefix_action_id": candidate.action_id,
                     "prepared_prefix_mismatch_reason": "model_mismatch",
                 }
                 continue
-            token_ids = candidate.get("_prefix_token_ids")
-            if not isinstance(token_ids, tuple) or not all(
-                isinstance(token_id, int) for token_id in token_ids
-            ):
-                continue
-            prefix_len = len(token_ids)
-            candidate_match = {
-                "prepared_prefix_action_id": candidate.get("action_id"),
-                "prepared_prefix_token_count": candidate.get("prefix_token_count"),
-                "prepared_prefix_token_hash": candidate.get("prefix_token_hash"),
-                "prepared_prefix_lease_status": candidate.get("lease_status"),
-                "prepared_prefix_lease_match_status": _lease_match_status(candidate),
-            }
-            if tuple(prompt_token_ids[:prefix_len]) == token_ids:
+            prefix_len = len(candidate.prefix_token_ids)
+            candidate_match = candidate.match_view()
+            if tuple(prompt_token_ids[:prefix_len]) == candidate.prefix_token_ids:
                 if (
                     best_match is None
-                    or int(candidate.get("prefix_token_count") or 0)
+                    or int(candidate.prefix_token_count or 0)
                     > int(best_match.get("prepared_prefix_token_count") or 0)
                 ):
                     best_match = {
@@ -432,9 +614,12 @@ class WorkflowActionRegistry:
         if action_id is None:
             return
         with self._lock:
-            stored = self._actions_by_id.get(action_id)
-            if stored is not None:
-                stored["prepared_prefix_match_status"] = "matched"
+            prepared = self._prepared_prefixes_by_action_id.get(action_id)
+            if prepared is not None:
+                prepared.mark_matched()
+                stored = self._actions_by_id.get(action_id)
+                if stored is not None:
+                    stored.update(prepared.redacted_status())
 
     def _evict_locked(self) -> None:
         while len(self._actions_by_id) > _max_outstanding():
@@ -894,6 +1079,35 @@ def _lease_update_from_engine(
     }
 
 
+def _record_prepared_prefix_action(response: dict[str, Any]) -> None:
+    record_workflow_action(
+        action_id=_optional_str(response.get("action_id")),
+        action_kind=_optional_str(response.get("action_kind")),
+        lifecycle_status=_optional_str(response.get("lifecycle_status"))
+        or "accepted",
+        reject_reason=_optional_str(response.get("reject_reason")),
+        prewarm_status=_optional_str(response.get("prewarm_status")),
+        prewarm_attempted=bool(response.get("prewarm_attempted")),
+        lease_status=_optional_str(response.get("lease_status")),
+        lease_reason=_optional_str(response.get("lease_reason")),
+        lease_cleanup_reason=_optional_str(response.get("lease_cleanup_reason")),
+        lease_cleanup_count=_optional_int(response.get("lease_cleanup_count")),
+        lease_token_count=_optional_int(response.get("lease_token_count")),
+        lease_full_block_count=_optional_int(response.get("lease_full_block_count")),
+        lease_ttl_ms=_optional_int(response.get("lease_ttl_ms")),
+        prepared_prefix_object_status=_optional_str(
+            response.get("prepared_prefix_object_status")
+        ),
+        prefix_token_count=_optional_int(response.get("prefix_token_count")),
+        prefix_token_hash=_optional_str(response.get("prefix_token_hash")),
+        engine_token_source=_optional_str(response.get("engine_token_source")),
+        model=_optional_str(response.get("model")),
+        served_model_name=_optional_str(response.get("served_model_name")),
+        tokenizer_id=_optional_str(response.get("tokenizer_id")),
+        chat_template_id=_optional_str(response.get("chat_template_id")),
+    )
+
+
 def _lease_match_status(candidate: dict[str, Any]) -> str:
     status = _optional_str(candidate.get("lease_status"))
     if status == "leased":
@@ -937,6 +1151,16 @@ def _optional_int(value: Any) -> int | None:
 
 def _optional_str(value: Any) -> str | None:
     return value if isinstance(value, str) and value else None
+
+
+def _prewarm_attempted(prewarm_status: str) -> bool:
+    return prewarm_status not in {
+        "not_attempted",
+        "ignored:prefix_too_short",
+        "prewarm_not_implemented",
+        "tokenize_only",
+        "prefill_only_unavailable",
+    }
 
 
 def _now_unix_ms() -> int:
