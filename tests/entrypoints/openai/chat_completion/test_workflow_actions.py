@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 
 pytest.importorskip("torch")
@@ -12,16 +14,22 @@ from fastapi.testclient import TestClient
 
 from vllm.entrypoints.openai.chat_completion import api_router
 from vllm.entrypoints.openai.chat_completion.workflow_actions import (
+    mark_workflow_prefix_prewarm_result,
     match_prepared_prefix_for_request,
     workflow_coopt_actions_enabled,
 )
 from vllm.entrypoints.openai.chat_completion.workflow_test_hook import (
     _records,
     record_chat_request,
+    record_scheduler_request,
 )
+from vllm.v1.core.sched.scheduler import _workflow_prefill_only_ready_to_finish
 
 
 class _FakeChatHandler:
+    def __init__(self) -> None:
+        self.prewarm_submissions: list[tuple[dict[str, object], dict[str, object]]] = []
+
     async def verify_workflow_prefix_prepare(self, action: dict[str, object]):
         assert action["model"] == "test-model"
         return {
@@ -32,6 +40,18 @@ class _FakeChatHandler:
             "tokenizer_id": "fake-tokenizer",
             "chat_template_id": "sha1:fake-template",
         }
+
+    async def submit_workflow_prefix_prewarm(
+        self,
+        action: dict[str, object],
+        token_verification: dict[str, object],
+    ):
+        self.prewarm_submissions.append((action, token_verification))
+        return {"prewarm_status": "prewarm_submitted"}
+
+
+class _FakeChatHandlerWithoutPrewarm(_FakeChatHandler):
+    submit_workflow_prefix_prewarm = None
 
 
 def _valid_prefix_prepare_action(
@@ -237,14 +257,15 @@ def test_workflow_actions_can_ignore_short_advisory_prefix(monkeypatch) -> None:
     assert payload["prefix_token_count"] == 5
 
 
-def test_workflow_actions_experimental_prewarm_reports_unavailable(
+def test_workflow_actions_experimental_prewarm_submits_hidden_prewarm(
     monkeypatch,
 ) -> None:
     monkeypatch.setenv("VLLM_ENABLE_WORKFLOW_COOPT_ACTIONS", "1")
     monkeypatch.setenv("WORKFLOW_PREFIX_PREPARE_MIN_TOKENS", "1")
     monkeypatch.setenv("WORKFLOW_PREFIX_PREPARE_MODE", "experimental_prewarm")
     app = FastAPI()
-    app.state.openai_serving_chat = _FakeChatHandler()
+    handler = _FakeChatHandler()
+    app.state.openai_serving_chat = handler
     api_router.attach_router(app)
     client = TestClient(app)
 
@@ -257,8 +278,97 @@ def test_workflow_actions_experimental_prewarm_reports_unavailable(
     payload = response.json()
     assert payload["accepted"] is True
     assert payload["lifecycle_status"] == "accepted"
+    assert payload["prewarm_status"] == "prewarm_submitted"
+    assert payload["prewarm_attempted"] is True
+    assert len(handler.prewarm_submissions) == 1
+    _action, token_verification = handler.prewarm_submissions[0]
+    assert "_prefix_token_ids" in token_verification
+
+    mark_workflow_prefix_prewarm_result(
+        action_id=str(payload["action_id"]),
+        prewarm_status="prewarm_completed",
+    )
+    status_response = client.get(
+        f"/v1/workflow/coopt/actions/{payload['action_id']}"
+    )
+    assert status_response.status_code == 200
+    assert status_response.json()["prewarm_status"] == "prewarm_completed"
+
+
+def test_workflow_actions_experimental_prewarm_reports_unavailable_without_hook(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("VLLM_ENABLE_WORKFLOW_COOPT_ACTIONS", "1")
+    monkeypatch.setenv("WORKFLOW_PREFIX_PREPARE_MIN_TOKENS", "1")
+    monkeypatch.setenv("WORKFLOW_PREFIX_PREPARE_MODE", "experimental_prewarm")
+    app = FastAPI()
+    app.state.openai_serving_chat = _FakeChatHandlerWithoutPrewarm()
+    api_router.attach_router(app)
+    client = TestClient(app)
+
+    response = client.post(
+        "/v1/workflow/coopt/actions",
+        json=_valid_prefix_prepare_action(key_suffix="experimental-unavailable"),
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["accepted"] is True
+    assert payload["lifecycle_status"] == "accepted"
     assert payload["prewarm_status"] == "prefill_only_unavailable"
     assert payload["prewarm_attempted"] is False
+
+
+def test_workflow_prefill_only_ready_to_finish_uses_internal_extra_args() -> None:
+    request = SimpleNamespace(
+        sampling_params=SimpleNamespace(
+            extra_args={
+                "workflow_prefill_only": True,
+                "workflow_prefix_prepare_action_id": "action-1",
+            }
+        ),
+        num_computed_tokens=5,
+        num_prompt_tokens=5,
+    )
+    assert _workflow_prefill_only_ready_to_finish(request) is True
+
+    request.num_computed_tokens = 4
+    assert _workflow_prefill_only_ready_to_finish(request) is False
+
+    request.num_computed_tokens = 5
+    request.sampling_params.extra_args["workflow_prefill_only"] = False
+    assert _workflow_prefill_only_ready_to_finish(request) is False
+
+
+def test_workflow_hook_treats_prefill_only_extra_args_as_internal(
+    monkeypatch,
+) -> None:
+    _records.clear()
+    monkeypatch.setenv("WORKFLOW_TEST_HOOK", "1")
+
+    record_scheduler_request(
+        request_id="workflow-prefix-prewarm-action-1",
+        vllm_xargs={
+            "workflow_prefill_only": True,
+            "workflow_prefix_prepare_action_id": "action-1",
+            "workflow_prefix_prepare_token_count": 5,
+            "workflow_prefix_prepare_token_hash": "sha1:prefix",
+        },
+        dp_rank=0,
+        client_index=0,
+        prompt_token_ids=[1, 2, 3, 4, 5],
+        engine_prompt_token_count=5,
+    )
+
+    assert _records
+    record = _records[-1]
+    assert record.source == "scheduler"
+    assert record.vllm_xargs is None
+    assert record.workflow_sideband_valid is None
+    assert record.action_id == "action-1"
+    assert record.action_kind == "prefix_prepare"
+    assert record.engine_prompt_token_count == 5
+    assert record.prompt_token_ids_hash is not None
 
 
 def test_workflow_hook_records_prepared_prefix_cache_observation(

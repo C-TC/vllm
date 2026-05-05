@@ -6,8 +6,9 @@
 This module is intentionally observability-first. It accepts action metadata
 plus an in-memory prefix payload for `prefix_prepare`, validates it, asks the
 engine chat stack to render/tokenize the prefix, and records redacted lifecycle
-telemetry. It does not expose raw prompt content in responses or hook records,
-and it does not mutate KV/APC internals yet.
+telemetry. In `experimental_prewarm` mode it may ask the engine to submit a
+hidden internal prefill-only request. It does not expose raw prompt content in
+responses or hook records, and it never exposes KV handles.
 """
 
 from __future__ import annotations
@@ -122,10 +123,10 @@ class WorkflowActionRegistry:
             prefix_token_count=prefix_token_count,
             prefix_token_hash=prefix_token_hash,
         )
-        prewarm_status = (
-            "tokenize_only"
-            if _prefix_prepare_mode() == "tokenize_only"
-            else "prefill_only_unavailable"
+        prewarm_status = await _maybe_submit_prefix_prewarm(
+            action,
+            token_verification,
+            chat_handler,
         )
         response = _lifecycle_response(
             action,
@@ -150,6 +151,45 @@ class WorkflowActionRegistry:
             stored = self._actions_by_id.get(action_id)
             if stored is not None:
                 stored.update(response)
+
+    def mark_prewarm_result(
+        self,
+        *,
+        action_id: str,
+        prewarm_status: str,
+        reject_reason: str | None = None,
+    ) -> dict[str, Any] | None:
+        with self._lock:
+            stored = self._actions_by_id.get(action_id)
+            if stored is None:
+                return None
+            stored["prewarm_status"] = prewarm_status
+            stored["prewarm_attempted"] = prewarm_status not in {
+                "not_attempted",
+                "ignored:prefix_too_short",
+                "tokenize_only",
+                "prefill_only_unavailable",
+            }
+            if reject_reason is not None:
+                stored["reject_reason"] = reject_reason
+            response = dict(stored)
+        record_workflow_action(
+            action_id=_optional_str(response.get("action_id")),
+            action_kind=_optional_str(response.get("action_kind")),
+            lifecycle_status=_optional_str(response.get("lifecycle_status"))
+            or "accepted",
+            reject_reason=_optional_str(response.get("reject_reason")),
+            prewarm_status=prewarm_status,
+            prewarm_attempted=bool(response.get("prewarm_attempted")),
+            prefix_token_count=_optional_int(response.get("prefix_token_count")),
+            prefix_token_hash=_optional_str(response.get("prefix_token_hash")),
+            engine_token_source=_optional_str(response.get("engine_token_source")),
+            model=_optional_str(response.get("model")),
+            served_model_name=_optional_str(response.get("served_model_name")),
+            tokenizer_id=_optional_str(response.get("tokenizer_id")),
+            chat_template_id=_optional_str(response.get("chat_template_id")),
+        )
+        return response
 
     def _store_prepared_prefix(
         self,
@@ -313,6 +353,19 @@ def match_prepared_prefix_for_request(
         vllm_xargs=vllm_xargs,
         prompt_token_ids=prompt_token_ids,
         model=model,
+    )
+
+
+def mark_workflow_prefix_prewarm_result(
+    *,
+    action_id: str,
+    prewarm_status: str,
+    reject_reason: str | None = None,
+) -> dict[str, Any] | None:
+    return _registry.mark_prewarm_result(
+        action_id=action_id,
+        prewarm_status=prewarm_status,
+        reject_reason=reject_reason,
     )
 
 
@@ -551,6 +604,36 @@ async def _verify_prefix_tokens(
     return verified
 
 
+async def _maybe_submit_prefix_prewarm(
+    action: dict[str, Any],
+    token_verification: dict[str, Any],
+    chat_handler: Any | None,
+) -> str:
+    mode = _prefix_prepare_mode()
+    if mode == "tokenize_only":
+        return "tokenize_only"
+    if mode != "experimental_prewarm":
+        return "tokenize_only"
+    submit_prewarm = (
+        getattr(chat_handler, "submit_workflow_prefix_prewarm", None)
+        if chat_handler is not None
+        else None
+    )
+    if not callable(submit_prewarm):
+        return "prefill_only_unavailable"
+    try:
+        result = await submit_prewarm(
+            action,
+            token_verification,
+        )
+    except Exception:  # noqa: BLE001
+        return "prewarm_failed:submit_exception"
+    if not isinstance(result, dict):
+        return "prewarm_failed:invalid_submit_response"
+    prewarm_status = result.get("prewarm_status")
+    return prewarm_status if isinstance(prewarm_status, str) else "prewarm_submitted"
+
+
 def _expires_at_unix_ms(action: dict[str, Any]) -> int:
     expires_at_unix_ms = action.get("expires_at_unix_ms")
     if isinstance(expires_at_unix_ms, int):
@@ -607,7 +690,6 @@ def _prefix_prepare_mode() -> str:
     if mode == "tokenize_only":
         return mode
     if mode == "experimental_prewarm":
-        # The safe prefill-only path is intentionally not wired yet.
         return mode
     return _DEFAULT_PREPARE_MODE
 

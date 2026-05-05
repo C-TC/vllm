@@ -41,6 +41,7 @@ from vllm.entrypoints.openai.chat_completion.stream_harmony import (
     extract_harmony_streaming_delta,
 )
 from vllm.entrypoints.openai.chat_completion.workflow_actions import (
+    mark_workflow_prefix_prewarm_result,
     match_prepared_prefix_for_request,
 )
 from vllm.entrypoints.openai.chat_completion.workflow_test_hook import (
@@ -70,14 +71,14 @@ from vllm.entrypoints.openai.parser.harmony_utils import (
 )
 from vllm.entrypoints.openai.utils import maybe_filter_parallel_tool_calls
 from vllm.entrypoints.utils import get_max_tokens, should_include_usage
-from vllm.inputs import EngineInput
+from vllm.inputs import EngineInput, tokens_input
 from vllm.logger import init_logger
 from vllm.logprobs import Logprob
 from vllm.outputs import CompletionOutput, RequestOutput
 from vllm.parser import ParserManager
 from vllm.reasoning import ReasoningParser
 from vllm.renderers import ChatParams
-from vllm.sampling_params import BeamSearchParams, SamplingParams
+from vllm.sampling_params import BeamSearchParams, RequestOutputKind, SamplingParams
 from vllm.tokenizers import TokenizerLike
 from vllm.tool_parsers import ToolParser
 from vllm.tool_parsers.mistral_tool_parser import MistralToolCall
@@ -293,6 +294,89 @@ class OpenAIServingChat(OpenAIServing):
             "tokenizer_id": _tokenizer_id(tokenizer),
             "chat_template_id": _chat_template_id(self.chat_template),
         }
+
+    async def submit_workflow_prefix_prewarm(
+        self,
+        action: dict[str, Any],
+        token_verification: dict[str, Any],
+    ) -> dict[str, str]:
+        """Submit a hidden internal prefill-only request for a prepared prefix.
+
+        The action endpoint remains separate from chat completions. The hidden
+        request uses engine-tokenized prefix ids and internal-only extra_args;
+        it is consumed by a background task and never returned to the user.
+        """
+        token_ids = token_verification.get("_prefix_token_ids")
+        action_id = action.get("action_id")
+        if not isinstance(action_id, str) or not action_id:
+            return {"prewarm_status": "prewarm_failed:missing_action_id"}
+        if not isinstance(token_ids, list) or not all(
+            isinstance(token_id, int) for token_id in token_ids
+        ):
+            return {"prewarm_status": "prewarm_failed:missing_token_ids"}
+        if self.engine_client.errored:
+            return {"prewarm_status": "prewarm_failed:engine_error"}
+
+        request_id = f"workflow-prefix-prewarm-{action_id}"
+        sampling_params = SamplingParams.from_optional(
+            temperature=0.0,
+            max_tokens=1,
+            output_kind=RequestOutputKind.FINAL_ONLY,
+            extra_args={
+                "workflow_prefill_only": True,
+                "workflow_prefix_prepare_action_id": action_id,
+                "workflow_prefix_prepare_token_count": len(token_ids),
+                "workflow_prefix_prepare_token_hash": token_verification.get(
+                    "prefix_token_hash"
+                ),
+            },
+            skip_clone=True,
+        )
+        generator = self.engine_client.generate(
+            tokens_input(list(token_ids)),
+            sampling_params,
+            request_id,
+            priority=0,
+        )
+        asyncio.create_task(
+            self._consume_workflow_prefix_prewarm(
+                action_id=action_id,
+                result_generator=generator,
+            )
+        )
+        return {"prewarm_status": "prewarm_submitted"}
+
+    async def _consume_workflow_prefix_prewarm(
+        self,
+        *,
+        action_id: str,
+        result_generator: AsyncGenerator[RequestOutput, None],
+    ) -> None:
+        unexpected_decode = False
+        try:
+            async for result in result_generator:
+                for output in result.outputs:
+                    token_ids = getattr(output, "token_ids", None)
+                    text = getattr(output, "text", None)
+                    if token_ids or text:
+                        unexpected_decode = True
+            if unexpected_decode:
+                mark_workflow_prefix_prewarm_result(
+                    action_id=action_id,
+                    prewarm_status="prewarm_failed:unexpected_decode_token",
+                    reject_reason="unexpected_decode_token",
+                )
+                return
+            mark_workflow_prefix_prewarm_result(
+                action_id=action_id,
+                prewarm_status="prewarm_completed",
+            )
+        except Exception:  # noqa: BLE001
+            mark_workflow_prefix_prewarm_result(
+                action_id=action_id,
+                prewarm_status="prewarm_failed:engine_error",
+                reject_reason="engine_error",
+            )
 
     async def create_chat_completion(
         self,

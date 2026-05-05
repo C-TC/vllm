@@ -135,11 +135,16 @@ def record_scheduler_request(
     workflow_scheduler_token_lcp_len: int | None = None,
     workflow_scheduler_token_lcp_hash: str | None = None,
 ) -> None:
+    internal_prefill_only_action_id = _internal_prefill_only_action_id(vllm_xargs)
     _record_event(
         source="scheduler",
         path=None,
         request_id=request_id,
-        vllm_xargs=vllm_xargs,
+        # Internal PreparedPrefix prewarm requests use extra_args only as an
+        # engine-private control plane. They are not ordinary workflow sideband,
+        # so the hook should not validate those fields against the public
+        # per-request contract.
+        vllm_xargs=None if internal_prefill_only_action_id is not None else vllm_xargs,
         dp_rank=dp_rank,
         client_index=client_index,
         prompt_token_ids=prompt_token_ids,
@@ -152,6 +157,10 @@ def record_scheduler_request(
         workflow_scheduler_group_source=workflow_scheduler_group_source,
         workflow_scheduler_token_lcp_len=workflow_scheduler_token_lcp_len,
         workflow_scheduler_token_lcp_hash=workflow_scheduler_token_lcp_hash,
+        action_id=internal_prefill_only_action_id,
+        action_kind="prefix_prepare"
+        if internal_prefill_only_action_id is not None
+        else None,
     )
 
 
@@ -344,6 +353,15 @@ def _prompt_token_count(
     if prompt_token_ids is not None:
         return len(prompt_token_ids)
     return explicit_count
+
+
+def _internal_prefill_only_action_id(vllm_xargs: dict[str, Any] | None) -> str | None:
+    if not isinstance(vllm_xargs, dict):
+        return None
+    if vllm_xargs.get("workflow_prefill_only") is not True:
+        return None
+    action_id = vllm_xargs.get("workflow_prefix_prepare_action_id")
+    return action_id if isinstance(action_id, str) and action_id else None
 
 
 def _hash_token_ids(token_ids: list[int] | None) -> str | None:

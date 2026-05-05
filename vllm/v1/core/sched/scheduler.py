@@ -73,6 +73,24 @@ from vllm.v1.utils import record_function_or_nullcontext
 logger = init_logger(__name__)
 
 
+def _workflow_prefill_only_action_id(request: Request) -> str | None:
+    sampling_params = request.sampling_params
+    extra_args = sampling_params.extra_args if sampling_params is not None else None
+    if not isinstance(extra_args, dict):
+        return None
+    if extra_args.get("workflow_prefill_only") is not True:
+        return None
+    action_id = extra_args.get("workflow_prefix_prepare_action_id")
+    return action_id if isinstance(action_id, str) and action_id else None
+
+
+def _workflow_prefill_only_ready_to_finish(request: Request) -> bool:
+    return (
+        _workflow_prefill_only_action_id(request) is not None
+        and request.num_computed_tokens >= request.num_prompt_tokens
+    )
+
+
 class Scheduler(SchedulerInterface):
     def __init__(
         self,
@@ -1424,7 +1442,17 @@ class Scheduler(SchedulerInterface):
             status_before_stop = request.status
 
             # Check for stop and update request status.
-            if new_token_ids:
+            if _workflow_prefill_only_ready_to_finish(request):
+                # Hidden PreparedPrefix prewarm requests should populate the
+                # prefix cache/APC through the normal prefill path, then finish
+                # before user-visible decode. vLLM may sample a token at the
+                # prompt boundary in the same engine step; discard it here so
+                # the internal request has no completion payload.
+                new_token_ids = []
+                request.stop_reason = "workflow_prefill_only"
+                request.status = RequestStatus.FINISHED_STOPPED
+                stopped = True
+            elif new_token_ids:
                 new_token_ids, stopped = self._update_request_with_output(
                     request, new_token_ids
                 )
