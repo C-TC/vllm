@@ -15,7 +15,10 @@ from vllm.entrypoints.openai.chat_completion.workflow_actions import (
     match_prepared_prefix_for_request,
     workflow_coopt_actions_enabled,
 )
-from vllm.entrypoints.openai.chat_completion.workflow_test_hook import _records
+from vllm.entrypoints.openai.chat_completion.workflow_test_hook import (
+    _records,
+    record_chat_request,
+)
 
 
 class _FakeChatHandler:
@@ -232,6 +235,71 @@ def test_workflow_actions_can_ignore_short_advisory_prefix(monkeypatch) -> None:
     assert payload["lifecycle_status"] == "ignored"
     assert payload["prewarm_status"] == "ignored:prefix_too_short"
     assert payload["prefix_token_count"] == 5
+
+
+def test_workflow_actions_experimental_prewarm_reports_unavailable(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("VLLM_ENABLE_WORKFLOW_COOPT_ACTIONS", "1")
+    monkeypatch.setenv("WORKFLOW_PREFIX_PREPARE_MIN_TOKENS", "1")
+    monkeypatch.setenv("WORKFLOW_PREFIX_PREPARE_MODE", "experimental_prewarm")
+    app = FastAPI()
+    app.state.openai_serving_chat = _FakeChatHandler()
+    api_router.attach_router(app)
+    client = TestClient(app)
+
+    response = client.post(
+        "/v1/workflow/coopt/actions",
+        json=_valid_prefix_prepare_action(key_suffix="experimental"),
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["accepted"] is True
+    assert payload["lifecycle_status"] == "accepted"
+    assert payload["prewarm_status"] == "prefill_only_unavailable"
+    assert payload["prewarm_attempted"] is False
+
+
+def test_workflow_hook_records_prepared_prefix_cache_observation(
+    monkeypatch,
+) -> None:
+    _records.clear()
+    monkeypatch.setenv("WORKFLOW_TEST_HOOK", "1")
+
+    record_chat_request(
+        source="api_server_complete",
+        path="/v1/chat/completions",
+        request_id="chatcmpl-cache",
+        vllm_xargs={
+            "workflow_id": "wf",
+            "graph_id": "main",
+            "site_id": "main:writer",
+            "workflow_instance_id": "wf-inst",
+        },
+        prompt_token_ids=[1, 2, 3, 4, 5],
+        prepared_prefix_match={
+            "prepared_prefix_match_status": "matched",
+            "prepared_prefix_action_id": "action-1",
+            "prepared_prefix_token_count": 4,
+            "prepared_prefix_token_hash": "sha1:prefix",
+        },
+        prepared_prefix_cache={
+            "prepared_prefix_cache_status": "prefix_partially_cached",
+            "prepared_prefix_num_cached_tokens": 2,
+            "prepared_prefix_recomputed_tokens": 2,
+            "prepared_prefix_cached_at_least_prefix": False,
+        },
+    )
+
+    assert _records
+    record = _records[-1]
+    assert record.source == "api_server_complete"
+    assert record.prepared_prefix_match_status == "matched"
+    assert record.prepared_prefix_cache_status == "prefix_partially_cached"
+    assert record.prepared_prefix_num_cached_tokens == 2
+    assert record.prepared_prefix_recomputed_tokens == 2
+    assert record.prepared_prefix_cached_at_least_prefix is False
 
 
 def test_workflow_actions_reject_when_tokenizer_unavailable(monkeypatch) -> None:

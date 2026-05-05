@@ -64,6 +64,10 @@ class WorkflowTestHookRecord:
     prepared_prefix_token_count: int | None = None
     prepared_prefix_token_hash: str | None = None
     prepared_prefix_mismatch_reason: str | None = None
+    prepared_prefix_cache_status: str | None = None
+    prepared_prefix_num_cached_tokens: int | None = None
+    prepared_prefix_recomputed_tokens: int | None = None
+    prepared_prefix_cached_at_least_prefix: bool | None = None
     dp_rank: int | None = None
     client_index: int | None = None
     pid: int | None = None
@@ -96,6 +100,7 @@ def record_chat_request(
     tokenizer_id: str | None = None,
     chat_template_id: str | None = None,
     prepared_prefix_match: dict[str, Any] | None = None,
+    prepared_prefix_cache: dict[str, Any] | None = None,
 ) -> None:
     _record_event(
         source=source,
@@ -110,6 +115,7 @@ def record_chat_request(
         tokenizer_id=tokenizer_id,
         chat_template_id=chat_template_id,
         prepared_prefix_match=prepared_prefix_match,
+        prepared_prefix_cache=prepared_prefix_cache,
     )
 
 
@@ -217,6 +223,7 @@ def _record_event(
     prefix_token_count: int | None = None,
     prefix_token_hash: str | None = None,
     prepared_prefix_match: dict[str, Any] | None = None,
+    prepared_prefix_cache: dict[str, Any] | None = None,
 ) -> None:
     if not workflow_test_hook_enabled():
         return
@@ -301,6 +308,22 @@ def _record_event(
             prepared_prefix_match,
             "prepared_prefix_mismatch_reason",
         ),
+        prepared_prefix_cache_status=_prepared_prefix_cache_str(
+            prepared_prefix_cache,
+            "prepared_prefix_cache_status",
+        ),
+        prepared_prefix_num_cached_tokens=_prepared_prefix_cache_int(
+            prepared_prefix_cache,
+            "prepared_prefix_num_cached_tokens",
+        ),
+        prepared_prefix_recomputed_tokens=_prepared_prefix_cache_int(
+            prepared_prefix_cache,
+            "prepared_prefix_recomputed_tokens",
+        ),
+        prepared_prefix_cached_at_least_prefix=_prepared_prefix_cache_bool(
+            prepared_prefix_cache,
+            "prepared_prefix_cached_at_least_prefix",
+        ),
         dp_rank=dp_rank,
         client_index=client_index,
         pid=os.getpid(),
@@ -348,6 +371,36 @@ def _prepared_prefix_match_int(
         return None
     value = match.get(key)
     return value if isinstance(value, int) else None
+
+
+def _prepared_prefix_cache_str(
+    cache: dict[str, Any] | None,
+    key: str,
+) -> str | None:
+    if not isinstance(cache, dict):
+        return None
+    value = cache.get(key)
+    return value if isinstance(value, str) and value else None
+
+
+def _prepared_prefix_cache_int(
+    cache: dict[str, Any] | None,
+    key: str,
+) -> int | None:
+    if not isinstance(cache, dict):
+        return None
+    value = cache.get(key)
+    return value if isinstance(value, int) else None
+
+
+def _prepared_prefix_cache_bool(
+    cache: dict[str, Any] | None,
+    key: str,
+) -> bool | None:
+    if not isinstance(cache, dict):
+        return None
+    value = cache.get(key)
+    return value if isinstance(value, bool) else None
 
 
 def _append_record_to_file(record: WorkflowTestHookRecord) -> None:

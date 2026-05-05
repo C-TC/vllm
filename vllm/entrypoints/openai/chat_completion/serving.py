@@ -106,6 +106,35 @@ def _chat_template_id(chat_template: str | None) -> str | None:
     return f"sha1:{digest}"
 
 
+def _prepared_prefix_cache_observation(
+    prepared_prefix_match: dict[str, object] | None,
+    num_cached_tokens: int | None,
+) -> dict[str, object] | None:
+    if not isinstance(prepared_prefix_match, dict):
+        return None
+    if prepared_prefix_match.get("prepared_prefix_match_status") != "matched":
+        return None
+    prefix_token_count = prepared_prefix_match.get("prepared_prefix_token_count")
+    if not isinstance(prefix_token_count, int):
+        return {"prepared_prefix_cache_status": "prefix_size_unavailable"}
+    if not isinstance(num_cached_tokens, int):
+        return {"prepared_prefix_cache_status": "cache_metric_unavailable"}
+    recomputed_tokens = max(prefix_token_count - num_cached_tokens, 0)
+    if num_cached_tokens >= prefix_token_count:
+        cache_status = "prefix_fully_cached"
+    elif num_cached_tokens > 0:
+        cache_status = "prefix_partially_cached"
+    else:
+        cache_status = "prefix_not_cached"
+    return {
+        "prepared_prefix_cache_status": cache_status,
+        "prepared_prefix_num_cached_tokens": num_cached_tokens,
+        "prepared_prefix_recomputed_tokens": recomputed_tokens,
+        "prepared_prefix_cached_at_least_prefix": num_cached_tokens
+        >= prefix_token_count,
+    }
+
+
 class OpenAIServingChat(OpenAIServing):
     def __init__(
         self,
@@ -315,6 +344,7 @@ class OpenAIServingChat(OpenAIServing):
         # Schedule the request and get the result generator.
         max_model_len = self.model_config.max_model_len
         generators: list[AsyncGenerator[RequestOutput, None]] = []
+        prepared_prefix_match_for_response: dict[str, object] | None = None
         for i, engine_input in enumerate(engine_inputs):
             prompt_token_ids = self._extract_prompt_components(engine_input).token_ids
 
@@ -328,6 +358,7 @@ class OpenAIServingChat(OpenAIServing):
                 prompt_token_ids=prompt_token_ids,
                 model=request.model,
             )
+            prepared_prefix_match_for_response = prepared_prefix_match
             record_chat_request(
                 source="api_server_tokenized",
                 path="/v1/chat/completions",
@@ -419,6 +450,7 @@ class OpenAIServingChat(OpenAIServing):
                 tokenizer,
                 request_metadata,
                 reasoning_parser,
+                prepared_prefix_match_for_response,
             )
 
         return await self.chat_completion_full_generator(
@@ -430,6 +462,7 @@ class OpenAIServingChat(OpenAIServing):
             tokenizer,
             request_metadata,
             reasoning_parser,
+            prepared_prefix_match_for_response,
         )
 
     def get_chat_request_role(self, request: ChatCompletionRequest) -> str:
@@ -586,6 +619,7 @@ class OpenAIServingChat(OpenAIServing):
         tokenizer: TokenizerLike,
         request_metadata: RequestResponseMetadata,
         reasoning_parser: ReasoningParser | None = None,
+        prepared_prefix_match: dict[str, object] | None = None,
     ) -> AsyncGenerator[str, None]:
         created_time = int(time.time())
         chunk_object_type: Final = "chat.completion.chunk"
@@ -1317,6 +1351,22 @@ class OpenAIServingChat(OpenAIServing):
                 completion_tokens=num_completion_tokens,
                 total_tokens=num_prompt_tokens + num_completion_tokens,
             )
+            record_chat_request(
+                source="api_server_complete",
+                path="/v1/chat/completions",
+                request_id=request_id,
+                vllm_xargs=request.vllm_xargs,
+                engine_prompt_token_count=num_prompt_tokens,
+                model=request.model,
+                served_model_name=model_name,
+                tokenizer_id=_tokenizer_id(tokenizer),
+                chat_template_id=_chat_template_id(self.chat_template),
+                prepared_prefix_match=prepared_prefix_match,
+                prepared_prefix_cache=_prepared_prefix_cache_observation(
+                    prepared_prefix_match,
+                    num_cached_tokens,
+                ),
+            )
 
             # Log complete streaming response if output logging is enabled
             if self.enable_log_outputs and self.request_logger:
@@ -1355,6 +1405,7 @@ class OpenAIServingChat(OpenAIServing):
         tokenizer: TokenizerLike,
         request_metadata: RequestResponseMetadata,
         reasoning_parser: ReasoningParser | None = None,
+        prepared_prefix_match: dict[str, object] | None = None,
     ) -> ErrorResponse | ChatCompletionResponse:
         from vllm.tokenizers.mistral import MistralTokenizer
 
@@ -1685,6 +1736,23 @@ class OpenAIServingChat(OpenAIServing):
             )
 
         request_metadata.final_usage_info = usage
+        record_chat_request(
+            source="api_server_complete",
+            path="/v1/chat/completions",
+            request_id=request_id,
+            vllm_xargs=request.vllm_xargs,
+            prompt_token_ids=final_res.prompt_token_ids,
+            engine_prompt_token_count=num_prompt_tokens,
+            model=request.model,
+            served_model_name=model_name,
+            tokenizer_id=_tokenizer_id(tokenizer),
+            chat_template_id=_chat_template_id(self.chat_template),
+            prepared_prefix_match=prepared_prefix_match,
+            prepared_prefix_cache=_prepared_prefix_cache_observation(
+                prepared_prefix_match,
+                final_res.num_cached_tokens,
+            ),
+        )
 
         response = ChatCompletionResponse(
             id=request_id,
