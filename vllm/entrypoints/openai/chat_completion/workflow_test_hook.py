@@ -51,6 +51,14 @@ class WorkflowTestHookRecord:
     workflow_scheduler_group_source: str | None = None
     workflow_scheduler_token_lcp_len: int | None = None
     workflow_scheduler_token_lcp_hash: str | None = None
+    action_id: str | None = None
+    action_kind: str | None = None
+    lifecycle_status: str | None = None
+    reject_reason: str | None = None
+    prewarm_status: str | None = None
+    prewarm_attempted: bool | None = None
+    prefix_token_count: int | None = None
+    prefix_token_hash: str | None = None
     dp_rank: int | None = None
     client_index: int | None = None
     pid: int | None = None
@@ -134,6 +142,33 @@ def record_scheduler_request(
     )
 
 
+def record_workflow_action(
+    *,
+    action_id: str | None,
+    action_kind: str | None,
+    lifecycle_status: str,
+    reject_reason: str | None = None,
+    prewarm_status: str | None = None,
+    prewarm_attempted: bool | None = None,
+    prefix_token_count: int | None = None,
+    prefix_token_hash: str | None = None,
+) -> None:
+    _record_event(
+        source="workflow_action",
+        path="/v1/workflow/coopt/actions",
+        request_id=None,
+        vllm_xargs=None,
+        action_id=action_id,
+        action_kind=action_kind,
+        lifecycle_status=lifecycle_status,
+        reject_reason=reject_reason,
+        prewarm_status=prewarm_status,
+        prewarm_attempted=prewarm_attempted,
+        prefix_token_count=prefix_token_count,
+        prefix_token_hash=prefix_token_hash,
+    )
+
+
 def _record_event(
     *,
     source: str,
@@ -156,6 +191,14 @@ def _record_event(
     workflow_scheduler_group_source: str | None = None,
     workflow_scheduler_token_lcp_len: int | None = None,
     workflow_scheduler_token_lcp_hash: str | None = None,
+    action_id: str | None = None,
+    action_kind: str | None = None,
+    lifecycle_status: str | None = None,
+    reject_reason: str | None = None,
+    prewarm_status: str | None = None,
+    prewarm_attempted: bool | None = None,
+    prefix_token_count: int | None = None,
+    prefix_token_hash: str | None = None,
 ) -> None:
     if not workflow_test_hook_enabled():
         return
@@ -212,6 +255,14 @@ def _record_event(
         workflow_scheduler_group_source=workflow_scheduler_group_source,
         workflow_scheduler_token_lcp_len=workflow_scheduler_token_lcp_len,
         workflow_scheduler_token_lcp_hash=workflow_scheduler_token_lcp_hash,
+        action_id=action_id,
+        action_kind=action_kind,
+        lifecycle_status=lifecycle_status,
+        reject_reason=reject_reason,
+        prewarm_status=prewarm_status,
+        prewarm_attempted=prewarm_attempted,
+        prefix_token_count=prefix_token_count,
+        prefix_token_hash=prefix_token_hash,
         dp_rank=dp_rank,
         client_index=client_index,
         pid=os.getpid(),

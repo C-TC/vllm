@@ -14,6 +14,12 @@ from vllm.entrypoints.openai.chat_completion.protocol import (
     ChatCompletionResponse,
 )
 from vllm.entrypoints.openai.chat_completion.serving import OpenAIServingChat
+from vllm.entrypoints.openai.chat_completion.workflow_actions import (
+    router as workflow_actions_router,
+)
+from vllm.entrypoints.openai.chat_completion.workflow_actions import (
+    workflow_coopt_actions_enabled,
+)
 from vllm.entrypoints.openai.chat_completion.workflow_test_hook import (
     record_chat_request,
     workflow_test_hook_enabled,
@@ -118,3 +124,5 @@ def attach_router(app: FastAPI):
     app.include_router(router)
     if workflow_test_hook_enabled():
         app.include_router(workflow_test_hook_router)
+    if workflow_coopt_actions_enabled():
+        app.include_router(workflow_actions_router)
