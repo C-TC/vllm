@@ -33,10 +33,12 @@ _MIN_TOKENS_ENV = "WORKFLOW_PREFIX_PREPARE_MIN_TOKENS"
 _TTL_MS_ENV = "WORKFLOW_PREFIX_PREPARE_TTL_MS"
 _MAX_OUTSTANDING_ENV = "WORKFLOW_PREFIX_PREPARE_MAX_OUTSTANDING"
 _PREPARE_MODE_ENV = "WORKFLOW_PREFIX_PREPARE_MODE"
+_RETENTION_MODE_ENV = "WORKFLOW_PREFIX_PREPARE_RETENTION_MODE"
 _DEFAULT_MIN_TOKENS = 32
 _DEFAULT_TTL_MS = 30000
 _DEFAULT_MAX_OUTSTANDING = 128
 _DEFAULT_PREPARE_MODE = "tokenize_only"
+_DEFAULT_RETENTION_MODE = "observe"
 
 router = APIRouter()
 
@@ -172,6 +174,15 @@ class WorkflowActionRegistry:
             }
             if reject_reason is not None:
                 stored["reject_reason"] = reject_reason
+            lease_update = _lease_update_for_prewarm_result(
+                prewarm_status=prewarm_status,
+                prefix_token_count=_optional_int(stored.get("prefix_token_count")),
+                ttl_ms=_optional_int(stored.get("ttl_ms")),
+            )
+            stored.update(lease_update)
+            prepared = self._prepared_prefixes_by_action_id.get(action_id)
+            if prepared is not None:
+                prepared.update(lease_update)
             response = dict(stored)
         record_workflow_action(
             action_id=_optional_str(response.get("action_id")),
@@ -181,6 +192,10 @@ class WorkflowActionRegistry:
             reject_reason=_optional_str(response.get("reject_reason")),
             prewarm_status=prewarm_status,
             prewarm_attempted=bool(response.get("prewarm_attempted")),
+            lease_status=_optional_str(response.get("lease_status")),
+            lease_reason=_optional_str(response.get("lease_reason")),
+            lease_token_count=_optional_int(response.get("lease_token_count")),
+            lease_ttl_ms=_optional_int(response.get("lease_ttl_ms")),
             prefix_token_count=_optional_int(response.get("prefix_token_count")),
             prefix_token_hash=_optional_str(response.get("prefix_token_hash")),
             engine_token_source=_optional_str(response.get("engine_token_source")),
@@ -218,6 +233,11 @@ class WorkflowActionRegistry:
             "expires_at_unix_ms": _expires_at_unix_ms(action),
             "prefix_token_count": prefix_token_count,
             "prefix_token_hash": prefix_token_hash,
+            **_initial_lease_fields(
+                prewarm_status=None,
+                prefix_token_count=prefix_token_count,
+                ttl_ms=_action_ttl_ms(action),
+            ),
             "_prefix_token_ids": tuple(token_ids),
         }
         with self._lock:
@@ -229,6 +249,16 @@ class WorkflowActionRegistry:
                     {
                         "prepared_prefix_registered": True,
                         "prepared_prefix_match_status": "pending_request",
+                        **{
+                            key: prepared[key]
+                            for key in (
+                                "lease_status",
+                                "lease_reason",
+                                "lease_token_count",
+                                "lease_ttl_ms",
+                            )
+                            if key in prepared
+                        },
                     }
                 )
             self._evict_locked()
@@ -292,6 +322,8 @@ class WorkflowActionRegistry:
                 "prepared_prefix_action_id": candidate.get("action_id"),
                 "prepared_prefix_token_count": candidate.get("prefix_token_count"),
                 "prepared_prefix_token_hash": candidate.get("prefix_token_hash"),
+                "prepared_prefix_lease_status": candidate.get("lease_status"),
+                "prepared_prefix_lease_match_status": _lease_match_status(candidate),
             }
             if tuple(prompt_token_ids[:prefix_len]) == token_ids:
                 if (
@@ -504,9 +536,15 @@ def _lifecycle_response(
 ) -> dict[str, Any]:
     prefix_message_hash = _hash_prefix_messages(action.get("messages_prefix"))
     token_verification = token_verification or {}
+    lease_fields = _initial_lease_fields(
+        prewarm_status=prewarm_status,
+        prefix_token_count=prefix_token_count,
+        ttl_ms=_action_ttl_ms(action),
+    )
     response = {
         "action_id": action.get("action_id"),
         "action_kind": action.get("action_kind"),
+        "ttl_ms": _action_ttl_ms(action),
         "accepted": accepted,
         "lifecycle_status": lifecycle_status,
         "reject_reason": reject_reason,
@@ -536,6 +574,7 @@ def _lifecycle_response(
             if lifecycle_status == "accepted" and prefix_token_hash is not None
             else None
         ),
+        **lease_fields,
     }
     action_id = _optional_str(response.get("action_id"))
     action_kind = _optional_str(response.get("action_kind"))
@@ -546,6 +585,10 @@ def _lifecycle_response(
         reject_reason=reject_reason,
         prewarm_status=prewarm_status,
         prewarm_attempted=bool(response["prewarm_attempted"]),
+        lease_status=_optional_str(response.get("lease_status")),
+        lease_reason=_optional_str(response.get("lease_reason")),
+        lease_token_count=_optional_int(response.get("lease_token_count")),
+        lease_ttl_ms=_optional_int(response.get("lease_ttl_ms")),
         prefix_token_count=prefix_token_count,
         prefix_token_hash=prefix_token_hash,
         engine_token_source=_optional_str(response.get("engine_token_source")),
@@ -644,6 +687,91 @@ def _expires_at_unix_ms(action: dict[str, Any]) -> int:
     return _now_unix_ms() + ttl_ms
 
 
+def _action_ttl_ms(action: dict[str, Any]) -> int:
+    ttl_ms = action.get("ttl_ms", _default_ttl_ms())
+    return ttl_ms if isinstance(ttl_ms, int) and ttl_ms > 0 else _default_ttl_ms()
+
+
+def _initial_lease_fields(
+    *,
+    prewarm_status: str | None,
+    prefix_token_count: int | None,
+    ttl_ms: int | None,
+) -> dict[str, Any]:
+    mode = _prefix_retention_mode()
+    if mode == "observe":
+        return {
+            "lease_status": "observe_only",
+            "lease_reason": "retention_mode_observe",
+            "lease_token_count": prefix_token_count,
+            "lease_ttl_ms": ttl_ms,
+        }
+    if prewarm_status == "prewarm_completed":
+        return _lease_update_for_prewarm_result(
+            prewarm_status=prewarm_status,
+            prefix_token_count=prefix_token_count,
+            ttl_ms=ttl_ms,
+        )
+    if prewarm_status == "prewarm_submitted":
+        return {
+            "lease_status": "pending_prewarm",
+            "lease_reason": "waiting_for_prewarm_completion",
+            "lease_token_count": prefix_token_count,
+            "lease_ttl_ms": ttl_ms,
+        }
+    return {
+        "lease_status": "not_attempted",
+        "lease_reason": "prewarm_not_completed",
+        "lease_token_count": prefix_token_count,
+        "lease_ttl_ms": ttl_ms,
+    }
+
+
+def _lease_update_for_prewarm_result(
+    *,
+    prewarm_status: str,
+    prefix_token_count: int | None,
+    ttl_ms: int | None,
+) -> dict[str, Any]:
+    mode = _prefix_retention_mode()
+    if mode == "observe":
+        return {
+            "lease_status": "observe_only",
+            "lease_reason": "retention_mode_observe",
+            "lease_token_count": prefix_token_count,
+            "lease_ttl_ms": ttl_ms,
+        }
+    if prewarm_status == "prewarm_completed":
+        # vLLM's current prefix cache path is observable here, but this slice
+        # intentionally does not expose or pin internal KV/cache handles.
+        return {
+            "lease_status": "lease_unavailable",
+            "lease_reason": "no_safe_internal_cache_lease_api",
+            "lease_token_count": prefix_token_count,
+            "lease_ttl_ms": ttl_ms,
+        }
+    return {
+        "lease_status": "not_attempted",
+        "lease_reason": prewarm_status,
+        "lease_token_count": prefix_token_count,
+        "lease_ttl_ms": ttl_ms,
+    }
+
+
+def _lease_match_status(candidate: dict[str, Any]) -> str:
+    status = _optional_str(candidate.get("lease_status"))
+    if status == "leased":
+        return "matched_with_active_lease"
+    if status in {
+        "lease_unavailable",
+        "observe_only",
+        "pending_prewarm",
+        "not_attempted",
+    }:
+        return status
+    return "unknown"
+
+
 def _hash_prefix_messages(messages: Any) -> str | None:
     if not isinstance(messages, list):
         return None
@@ -692,6 +820,15 @@ def _prefix_prepare_mode() -> str:
     if mode == "experimental_prewarm":
         return mode
     return _DEFAULT_PREPARE_MODE
+
+
+def _prefix_retention_mode() -> str:
+    mode = os.getenv(_RETENTION_MODE_ENV, _DEFAULT_RETENTION_MODE)
+    if mode == "observe":
+        return mode
+    if mode == "lease":
+        return mode
+    return _DEFAULT_RETENTION_MODE
 
 
 def _env_int(name: str, default: int) -> int:

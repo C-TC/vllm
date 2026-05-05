@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from types import SimpleNamespace
 
 import pytest
@@ -119,6 +120,8 @@ def test_workflow_actions_accept_prefix_prepare_without_logging_raw_prompt(
     assert payload["lifecycle_status"] == "accepted"
     assert payload["prewarm_status"] == "tokenize_only"
     assert payload["prewarm_attempted"] is False
+    assert payload["lease_status"] == "observe_only"
+    assert payload["lease_reason"] == "retention_mode_observe"
     assert payload["engine_token_source"] == "engine_authoritative"
     assert payload["prefix_token_count"] == 5
     assert payload["prefix_token_hash"].startswith("sha1:")
@@ -132,6 +135,7 @@ def test_workflow_actions_accept_prefix_prepare_without_logging_raw_prompt(
     assert record.source == "workflow_action"
     assert record.lifecycle_status == "accepted"
     assert record.engine_token_source == "engine_authoritative"
+    assert record.lease_status == "observe_only"
     assert record.prefix_token_count == 5
     assert record.prefix_token_hash is not None
     hook_text = (tmp_path / "hook.jsonl").read_text(encoding="utf-8")
@@ -178,6 +182,8 @@ def test_workflow_actions_match_prepared_prefix_by_workflow_site(
     assert match["prepared_prefix_action_id"] == action["action_id"]
     assert match["prepared_prefix_token_count"] == 5
     assert match["prepared_prefix_token_hash"].startswith("sha1:")
+    assert match["prepared_prefix_lease_status"] == "observe_only"
+    assert match["prepared_prefix_lease_match_status"] == "observe_only"
 
     status_response = client.get(
         f"/v1/workflow/coopt/actions/{action['action_id']}"
@@ -295,6 +301,45 @@ def test_workflow_actions_experimental_prewarm_submits_hidden_prewarm(
     assert status_response.json()["prewarm_status"] == "prewarm_completed"
 
 
+def test_workflow_actions_lease_mode_reports_unavailable_without_exposing_handles(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("VLLM_ENABLE_WORKFLOW_COOPT_ACTIONS", "1")
+    monkeypatch.setenv("WORKFLOW_PREFIX_PREPARE_MIN_TOKENS", "1")
+    monkeypatch.setenv("WORKFLOW_PREFIX_PREPARE_MODE", "experimental_prewarm")
+    monkeypatch.setenv("WORKFLOW_PREFIX_PREPARE_RETENTION_MODE", "lease")
+    app = FastAPI()
+    handler = _FakeChatHandler()
+    app.state.openai_serving_chat = handler
+    api_router.attach_router(app)
+    client = TestClient(app)
+
+    response = client.post(
+        "/v1/workflow/coopt/actions",
+        json=_valid_prefix_prepare_action(key_suffix="lease"),
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["prewarm_status"] == "prewarm_submitted"
+    assert payload["lease_status"] == "pending_prewarm"
+    assert payload["lease_reason"] == "waiting_for_prewarm_completion"
+
+    mark_workflow_prefix_prewarm_result(
+        action_id=str(payload["action_id"]),
+        prewarm_status="prewarm_completed",
+    )
+    status_response = client.get(
+        f"/v1/workflow/coopt/actions/{payload['action_id']}"
+    )
+    assert status_response.status_code == 200
+    status = status_response.json()
+    assert status["prewarm_status"] == "prewarm_completed"
+    assert status["lease_status"] == "lease_unavailable"
+    assert status["lease_reason"] == "no_safe_internal_cache_lease_api"
+    assert "kv" not in json.dumps(status).lower()
+
+
 def test_workflow_actions_experimental_prewarm_reports_unavailable_without_hook(
     monkeypatch,
 ) -> None:
@@ -393,6 +438,8 @@ def test_workflow_hook_records_prepared_prefix_cache_observation(
             "prepared_prefix_action_id": "action-1",
             "prepared_prefix_token_count": 4,
             "prepared_prefix_token_hash": "sha1:prefix",
+            "prepared_prefix_lease_status": "lease_unavailable",
+            "prepared_prefix_lease_match_status": "lease_unavailable",
         },
         prepared_prefix_cache={
             "prepared_prefix_cache_status": "prefix_partially_cached",
@@ -406,6 +453,8 @@ def test_workflow_hook_records_prepared_prefix_cache_observation(
     record = _records[-1]
     assert record.source == "api_server_complete"
     assert record.prepared_prefix_match_status == "matched"
+    assert record.prepared_prefix_lease_status == "lease_unavailable"
+    assert record.prepared_prefix_lease_match_status == "lease_unavailable"
     assert record.prepared_prefix_cache_status == "prefix_partially_cached"
     assert record.prepared_prefix_num_cached_tokens == 2
     assert record.prepared_prefix_recomputed_tokens == 2

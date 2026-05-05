@@ -57,6 +57,10 @@ class WorkflowTestHookRecord:
     reject_reason: str | None = None
     prewarm_status: str | None = None
     prewarm_attempted: bool | None = None
+    lease_status: str | None = None
+    lease_reason: str | None = None
+    lease_token_count: int | None = None
+    lease_ttl_ms: int | None = None
     prefix_token_count: int | None = None
     prefix_token_hash: str | None = None
     prepared_prefix_match_status: str | None = None
@@ -64,6 +68,8 @@ class WorkflowTestHookRecord:
     prepared_prefix_token_count: int | None = None
     prepared_prefix_token_hash: str | None = None
     prepared_prefix_mismatch_reason: str | None = None
+    prepared_prefix_lease_status: str | None = None
+    prepared_prefix_lease_match_status: str | None = None
     prepared_prefix_cache_status: str | None = None
     prepared_prefix_num_cached_tokens: int | None = None
     prepared_prefix_recomputed_tokens: int | None = None
@@ -172,6 +178,10 @@ def record_workflow_action(
     reject_reason: str | None = None,
     prewarm_status: str | None = None,
     prewarm_attempted: bool | None = None,
+    lease_status: str | None = None,
+    lease_reason: str | None = None,
+    lease_token_count: int | None = None,
+    lease_ttl_ms: int | None = None,
     prefix_token_count: int | None = None,
     prefix_token_hash: str | None = None,
     engine_token_source: str | None = None,
@@ -196,6 +206,10 @@ def record_workflow_action(
         reject_reason=reject_reason,
         prewarm_status=prewarm_status,
         prewarm_attempted=prewarm_attempted,
+        lease_status=lease_status,
+        lease_reason=lease_reason,
+        lease_token_count=lease_token_count,
+        lease_ttl_ms=lease_ttl_ms,
         prefix_token_count=prefix_token_count,
         prefix_token_hash=prefix_token_hash,
     )
@@ -229,6 +243,10 @@ def _record_event(
     reject_reason: str | None = None,
     prewarm_status: str | None = None,
     prewarm_attempted: bool | None = None,
+    lease_status: str | None = None,
+    lease_reason: str | None = None,
+    lease_token_count: int | None = None,
+    lease_ttl_ms: int | None = None,
     prefix_token_count: int | None = None,
     prefix_token_hash: str | None = None,
     prepared_prefix_match: dict[str, Any] | None = None,
@@ -295,6 +313,10 @@ def _record_event(
         reject_reason=reject_reason,
         prewarm_status=prewarm_status,
         prewarm_attempted=prewarm_attempted,
+        lease_status=lease_status,
+        lease_reason=lease_reason,
+        lease_token_count=lease_token_count,
+        lease_ttl_ms=lease_ttl_ms,
         prefix_token_count=prefix_token_count,
         prefix_token_hash=prefix_token_hash,
         prepared_prefix_match_status=_prepared_prefix_match_str(
@@ -316,6 +338,14 @@ def _record_event(
         prepared_prefix_mismatch_reason=_prepared_prefix_match_str(
             prepared_prefix_match,
             "prepared_prefix_mismatch_reason",
+        ),
+        prepared_prefix_lease_status=_prepared_prefix_match_str(
+            prepared_prefix_match,
+            "prepared_prefix_lease_status",
+        ),
+        prepared_prefix_lease_match_status=_prepared_prefix_match_str(
+            prepared_prefix_match,
+            "prepared_prefix_lease_match_status",
         ),
         prepared_prefix_cache_status=_prepared_prefix_cache_str(
             prepared_prefix_cache,
