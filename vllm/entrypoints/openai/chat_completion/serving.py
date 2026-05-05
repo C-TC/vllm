@@ -220,6 +220,48 @@ class OpenAIServingChat(OpenAIServing):
 
         return await self.openai_serving_render.render_chat(request)
 
+    async def verify_workflow_prefix_prepare(
+        self,
+        action: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Render/tokenize a workflow prefix_prepare action with engine truth.
+
+        This is observability-only: it reuses the normal chat rendering path to
+        validate the prefix payload and returns redacted token metadata to the
+        workflow action registry. It does not submit anything to the scheduler.
+        """
+        messages_prefix = action.get("messages_prefix")
+        model = action.get("model")
+        if not isinstance(messages_prefix, list) or not isinstance(model, str):
+            return {"ok": False, "reject_reason": "missing_prefix_payload"}
+        tokenizer = self.renderer.tokenizer
+        if tokenizer is None:
+            return {"ok": False, "reject_reason": "tokenizer_unavailable"}
+        request = ChatCompletionRequest(
+            messages=messages_prefix,
+            model=model,
+            add_generation_prompt=False,
+            max_tokens=1,
+            request_id=str(action.get("action_id") or "workflow-prefix-prepare"),
+        )
+        result = await self.render_chat_request(request)
+        if isinstance(result, ErrorResponse):
+            return {"ok": False, "reject_reason": "prefix_tokenization_failed"}
+        _conversation, engine_inputs = result
+        if len(engine_inputs) != 1:
+            return {"ok": False, "reject_reason": "prefix_tokenization_failed"}
+        prefix_token_ids = self._extract_prompt_components(engine_inputs[0]).token_ids
+        if prefix_token_ids is None:
+            return {"ok": False, "reject_reason": "prefix_tokenization_failed"}
+        return {
+            "ok": True,
+            "prefix_token_ids": list(prefix_token_ids),
+            "model": model,
+            "served_model_name": self.models.model_name(None),
+            "tokenizer_id": _tokenizer_id(tokenizer),
+            "chat_template_id": _chat_template_id(self.chat_template),
+        }
+
     async def create_chat_completion(
         self,
         request: ChatCompletionRequest,
