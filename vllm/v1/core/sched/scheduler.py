@@ -58,7 +58,10 @@ from vllm.v1.core.sched.workflow_grouping import (
     WorkflowGroupSelection,
     select_workflow_group_request,
     workflow_group_aware_max_burst,
+    workflow_group_aware_max_group_delay_ms,
+    workflow_group_aware_max_queue_scan,
     workflow_group_aware_scheduling_enabled,
+    workflow_group_aware_ungrouped_min_share,
 )
 from vllm.v1.engine import EngineCoreEventType, EngineCoreOutput, EngineCoreOutputs
 from vllm.v1.kv_cache_interface import AttentionSpec, KVCacheConfig
@@ -1703,6 +1706,9 @@ class Scheduler(SchedulerInterface):
             last_group_key=self._workflow_scheduler_last_group_key,
             group_burst=self._workflow_scheduler_group_burst,
             max_burst=workflow_group_aware_max_burst(),
+            max_queue_scan=workflow_group_aware_max_queue_scan(),
+            max_group_delay_ms=workflow_group_aware_max_group_delay_ms(),
+            ungrouped_min_share=workflow_group_aware_ungrouped_min_share(),
             block_size=self.block_size,
         )
         if selection is None:
@@ -1755,6 +1761,11 @@ class Scheduler(SchedulerInterface):
             workflow_scheduler_group_source=selection.group_source,
             workflow_scheduler_token_lcp_len=selection.token_lcp_len,
             workflow_scheduler_token_lcp_hash=selection.token_lcp_hash,
+            workflow_scheduler_scan_count=selection.scan_count,
+            workflow_scheduler_candidate_group_size=selection.candidate_group_size,
+            workflow_scheduler_fairness_guard_reason=selection.fairness_guard_reason,
+            workflow_scheduler_queue_head_delay_ms=selection.queue_head_delay_ms,
+            workflow_scheduler_queue_head_delay_bucket=selection.queue_head_delay_bucket,
         )
 
     def _workflow_try_lease_prepared_prefix(

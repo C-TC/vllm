@@ -24,6 +24,8 @@ OPTIONAL_WORKFLOW_SIDEBAND_FIELDS = (
     "spawn_index",
     "spawn_size",
     "shared_prefix_class_id",
+    "shared_prefill_group_id",
+    "shared_prefill_group_size",
     "stable_prefix_group_id",
     "stable_prefix_group_size",
     "cohort_group_id",
@@ -58,6 +60,7 @@ _VALID_RELEASE_HINTS = {"must", "may", "no", "unsupported"}
 _INTEGER_STRING_FIELDS = {
     "spawn_index",
     "spawn_size",
+    "shared_prefill_group_size",
     "stable_prefix_group_size",
     "cohort_group_size",
     "pressure_score",

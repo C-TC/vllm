@@ -6,13 +6,25 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import time
 from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import Any
 
 WORKFLOW_GROUP_AWARE_SCHEDULING_ENV = "WORKFLOW_GROUP_AWARE_SCHEDULING"
 WORKFLOW_GROUP_AWARE_MAX_BURST_ENV = "WORKFLOW_GROUP_AWARE_MAX_BURST"
+WORKFLOW_GROUP_AWARE_MAX_QUEUE_SCAN_ENV = "WORKFLOW_GROUP_AWARE_MAX_QUEUE_SCAN"
+WORKFLOW_GROUP_AWARE_MAX_GROUP_DELAY_MS_ENV = (
+    "WORKFLOW_GROUP_AWARE_MAX_GROUP_DELAY_MS"
+)
+WORKFLOW_GROUP_AWARE_UNGROUPED_MIN_SHARE_ENV = (
+    "WORKFLOW_GROUP_AWARE_UNGROUPED_MIN_SHARE"
+)
 DEFAULT_WORKFLOW_GROUP_AWARE_MAX_BURST = 4
+DEFAULT_WORKFLOW_GROUP_AWARE_MAX_QUEUE_SCAN = 64
+DEFAULT_WORKFLOW_GROUP_AWARE_MAX_GROUP_DELAY_MS = 200.0
+DEFAULT_WORKFLOW_GROUP_AWARE_UNGROUPED_MIN_SHARE = 0.2
+_UNAVAILABLE_SINGLE_MODEL_ASSUMED = "unavailable_single_model_assumed"
 
 
 @dataclass(frozen=True, slots=True)
@@ -24,6 +36,11 @@ class WorkflowGroupSelection:
     group_source: str | None = None
     token_lcp_len: int | None = None
     token_lcp_hash: str | None = None
+    scan_count: int | None = None
+    candidate_group_size: int | None = None
+    fairness_guard_reason: str | None = None
+    queue_head_delay_ms: float | None = None
+    queue_head_delay_bucket: str | None = None
 
 
 def workflow_group_aware_scheduling_enabled() -> bool:
@@ -41,13 +58,50 @@ def workflow_group_aware_max_burst() -> int:
     return max(1, value)
 
 
+def workflow_group_aware_max_queue_scan() -> int:
+    raw_value = os.getenv(WORKFLOW_GROUP_AWARE_MAX_QUEUE_SCAN_ENV, "")
+    if not raw_value:
+        return DEFAULT_WORKFLOW_GROUP_AWARE_MAX_QUEUE_SCAN
+    try:
+        value = int(raw_value)
+    except ValueError:
+        return DEFAULT_WORKFLOW_GROUP_AWARE_MAX_QUEUE_SCAN
+    return max(1, value)
+
+
+def workflow_group_aware_max_group_delay_ms() -> float:
+    raw_value = os.getenv(WORKFLOW_GROUP_AWARE_MAX_GROUP_DELAY_MS_ENV, "")
+    if not raw_value:
+        return DEFAULT_WORKFLOW_GROUP_AWARE_MAX_GROUP_DELAY_MS
+    try:
+        value = float(raw_value)
+    except ValueError:
+        return DEFAULT_WORKFLOW_GROUP_AWARE_MAX_GROUP_DELAY_MS
+    return max(0.0, value)
+
+
+def workflow_group_aware_ungrouped_min_share() -> float:
+    raw_value = os.getenv(WORKFLOW_GROUP_AWARE_UNGROUPED_MIN_SHARE_ENV, "")
+    if not raw_value:
+        return DEFAULT_WORKFLOW_GROUP_AWARE_UNGROUPED_MIN_SHARE
+    try:
+        value = float(raw_value)
+    except ValueError:
+        return DEFAULT_WORKFLOW_GROUP_AWARE_UNGROUPED_MIN_SHARE
+    return min(1.0, max(0.0, value))
+
+
 def select_workflow_group_request(
     requests: Iterable[Any],
     *,
     last_group_key: str | None,
     group_burst: int,
     max_burst: int | None = None,
+    max_queue_scan: int | None = None,
+    max_group_delay_ms: float | None = None,
+    ungrouped_min_share: float | None = None,
     block_size: int = 16,
+    now_s: float | None = None,
 ) -> WorkflowGroupSelection | None:
     """Select a waiting request by redacted workflow grouping evidence.
 
@@ -56,23 +110,91 @@ def select_workflow_group_request(
     redacted block-aligned LCP key; metadata grouping remains the fallback.
     """
 
-    ordered_requests = tuple(requests)
-    if not ordered_requests:
+    all_requests = tuple(requests)
+    if not all_requests:
         return None
 
     max_burst = workflow_group_aware_max_burst() if max_burst is None else max_burst
+    max_queue_scan = (
+        workflow_group_aware_max_queue_scan()
+        if max_queue_scan is None
+        else max(1, max_queue_scan)
+    )
+    max_group_delay_ms = (
+        workflow_group_aware_max_group_delay_ms()
+        if max_group_delay_ms is None
+        else max(0.0, max_group_delay_ms)
+    )
+    ungrouped_min_share = (
+        workflow_group_aware_ungrouped_min_share()
+        if ungrouped_min_share is None
+        else min(1.0, max(0.0, ungrouped_min_share))
+    )
+    scan_count = min(len(all_requests), max_queue_scan)
+    ordered_requests = all_requests[:scan_count]
+    queue_head_delay_ms = _queue_head_delay_ms(
+        all_requests[0],
+        now_s=time.time() if now_s is None else now_s,
+    )
+    queue_head_delay_bucket = _queue_head_delay_bucket(queue_head_delay_ms)
+
     candidate = _best_group_candidate(ordered_requests, block_size=block_size)
     if candidate is None:
         return WorkflowGroupSelection(
-            request=ordered_requests[0],
+            request=all_requests[0],
             selected_rank=0,
             group_key=None,
             reason="stock_fallback_no_group",
             group_source=None,
+            scan_count=scan_count,
+            queue_head_delay_ms=queue_head_delay_ms,
+            queue_head_delay_bucket=queue_head_delay_bucket,
         )
 
     selected_rank = candidate.selected_rank
     group_key = candidate.group_key
+    if (
+        selected_rank != 0
+        and queue_head_delay_ms is not None
+        and queue_head_delay_ms >= max_group_delay_ms
+    ):
+        fallback_keys = workflow_group_keys_for_request(all_requests[0])
+        fallback_group_key = fallback_keys[0][1] if fallback_keys else None
+        return WorkflowGroupSelection(
+            request=all_requests[0],
+            selected_rank=0,
+            group_key=fallback_group_key,
+            reason="fairness_max_group_delay",
+            group_source=_group_source_for_key(fallback_group_key),
+            scan_count=scan_count,
+            candidate_group_size=candidate.group_size,
+            fairness_guard_reason="max_group_delay_ms",
+            queue_head_delay_ms=queue_head_delay_ms,
+            queue_head_delay_bucket=queue_head_delay_bucket,
+        )
+
+    if (
+        selected_rank != 0
+        and _is_ungrouped_request(all_requests[0])
+        and _ungrouped_guard_due(
+            last_group_key=last_group_key,
+            group_burst=group_burst,
+            ungrouped_min_share=ungrouped_min_share,
+        )
+    ):
+        return WorkflowGroupSelection(
+            request=all_requests[0],
+            selected_rank=0,
+            group_key=None,
+            reason="fairness_ungrouped_min_share",
+            group_source=None,
+            scan_count=scan_count,
+            candidate_group_size=candidate.group_size,
+            fairness_guard_reason="ungrouped_min_share",
+            queue_head_delay_ms=queue_head_delay_ms,
+            queue_head_delay_bucket=queue_head_delay_bucket,
+        )
+
     if (
         last_group_key is not None
         and group_key == last_group_key
@@ -90,6 +212,11 @@ def select_workflow_group_request(
                 group_key=fairness_group_key,
                 reason="fairness_burst_cap",
                 group_source=_group_source_for_key(fairness_group_key),
+                scan_count=scan_count,
+                candidate_group_size=candidate.group_size,
+                fairness_guard_reason="max_burst",
+                queue_head_delay_ms=queue_head_delay_ms,
+                queue_head_delay_bucket=queue_head_delay_bucket,
             )
 
     return WorkflowGroupSelection(
@@ -100,6 +227,10 @@ def select_workflow_group_request(
         group_source=candidate.group_source,
         token_lcp_len=candidate.token_lcp_len,
         token_lcp_hash=candidate.token_lcp_hash,
+        scan_count=scan_count,
+        candidate_group_size=candidate.group_size,
+        queue_head_delay_ms=queue_head_delay_ms,
+        queue_head_delay_bucket=queue_head_delay_bucket,
     )
 
 
@@ -116,6 +247,7 @@ def workflow_group_keys_for_request(request: Any) -> tuple[tuple[str, str], ...]
 
     keys: list[tuple[str, str]] = []
     for field in (
+        "shared_prefill_group_id",
         "stable_prefix_group_id",
         "spawn_group_id",
         "cohort_group_id",
@@ -135,6 +267,7 @@ class _Candidate:
     group_source: str
     token_lcp_len: int | None = None
     token_lcp_hash: str | None = None
+    group_size: int | None = None
 
 
 def _best_group_candidate(
@@ -177,6 +310,7 @@ def _best_group_candidate(
                 group_key=group_key,
                 reason=reason,
                 group_source=reason,
+                group_size=len(ranks),
             )
 
     return None
@@ -187,14 +321,22 @@ def _best_token_lcp_candidate(
     *,
     block_size: int = 16,
 ) -> _Candidate | None:
-    best: tuple[int, int, str, str] | None = None
+    best: tuple[int, int, str, str, int] | None = None
     for left_rank, left_request in enumerate(requests):
         left_tokens = _request_prompt_token_ids(left_request)
         if left_tokens is None or not _request_xargs(left_request):
             continue
+        left_model_key = _request_model_key(left_request)
+        left_token_domain_key = _request_token_domain_key(left_request)
         for right_rank in range(left_rank + 1, len(requests)):
-            right_tokens = _request_prompt_token_ids(requests[right_rank])
-            if right_tokens is None or not _request_xargs(requests[right_rank]):
+            right_request = requests[right_rank]
+            right_tokens = _request_prompt_token_ids(right_request)
+            if right_tokens is None or not _request_xargs(right_request):
+                continue
+            if (
+                _request_model_key(right_request) != left_model_key
+                or _request_token_domain_key(right_request) != left_token_domain_key
+            ):
                 continue
             lcp_len = _common_prefix_len(left_tokens, right_tokens)
             aligned_lcp_len = (lcp_len // block_size) * block_size
@@ -203,8 +345,8 @@ def _best_token_lcp_candidate(
             lcp_hash = _hash_token_ids(left_tokens[:aligned_lcp_len])
             group_key = (
                 "token_verified_lcp:"
-                "model=unknown:"
-                "token_domain=unknown:"
+                f"model={left_model_key}:"
+                f"token_domain={left_token_domain_key}:"
                 f"len={aligned_lcp_len}:"
                 f"hash={lcp_hash}"
             )
@@ -212,6 +354,8 @@ def _best_token_lcp_candidate(
                 requests,
                 token_lcp_len=aligned_lcp_len,
                 token_lcp_hash=lcp_hash,
+                model_key=left_model_key,
+                token_domain_key=left_token_domain_key,
             )
             if len(group_ranks) < 2:
                 continue
@@ -223,11 +367,17 @@ def _best_token_lcp_candidate(
                 best[0],
                 -best[1],
             ):
-                best = (aligned_lcp_len, group_first_rank, lcp_hash, group_key)
+                best = (
+                    aligned_lcp_len,
+                    group_first_rank,
+                    lcp_hash,
+                    group_key,
+                    len(group_ranks),
+                )
 
     if best is None:
         return None
-    token_lcp_len, selected_rank, token_lcp_hash, group_key = best
+    token_lcp_len, selected_rank, token_lcp_hash, group_key, group_size = best
     return _Candidate(
         selected_rank=selected_rank,
         group_key=group_key,
@@ -235,6 +385,7 @@ def _best_token_lcp_candidate(
         group_source="token_verified_lcp",
         token_lcp_len=token_lcp_len,
         token_lcp_hash=token_lcp_hash,
+        group_size=group_size,
     )
 
 
@@ -267,6 +418,15 @@ def _candidate_group_key_for_request(
             candidate.token_lcp_hash
         ):
             return None
+        candidate_model_key = _model_key_from_group_key(candidate.group_key)
+        candidate_token_domain_key = _token_domain_key_from_group_key(
+            candidate.group_key
+        )
+        if (
+            _request_model_key(request) != candidate_model_key
+            or _request_token_domain_key(request) != candidate_token_domain_key
+        ):
+            return None
         return candidate.group_key
 
     for reason, group_key in workflow_group_keys_for_request(request):
@@ -288,10 +448,17 @@ def _token_lcp_group_ranks(
     *,
     token_lcp_len: int,
     token_lcp_hash: str,
+    model_key: str,
+    token_domain_key: str,
 ) -> list[int]:
     ranks: list[int] = []
     for rank, request in enumerate(requests):
         if not _request_xargs(request):
+            continue
+        if (
+            _request_model_key(request) != model_key
+            or _request_token_domain_key(request) != token_domain_key
+        ):
             continue
         token_ids = _request_prompt_token_ids(request)
         if token_ids is None or len(token_ids) < token_lcp_len:
@@ -299,6 +466,89 @@ def _token_lcp_group_ranks(
         if _hash_token_ids(token_ids[:token_lcp_len]) == token_lcp_hash:
             ranks.append(rank)
     return ranks
+
+
+def _model_key_from_group_key(group_key: str) -> str:
+    return _group_key_part(group_key, "model") or _UNAVAILABLE_SINGLE_MODEL_ASSUMED
+
+
+def _token_domain_key_from_group_key(group_key: str) -> str:
+    return (
+        _group_key_part(group_key, "token_domain")
+        or _UNAVAILABLE_SINGLE_MODEL_ASSUMED
+    )
+
+
+def _group_key_part(group_key: str, field: str) -> str | None:
+    prefix = f"{field}="
+    for part in group_key.split(":"):
+        if part.startswith(prefix):
+            return part[len(prefix) :]
+    return None
+
+
+def _request_model_key(request: Any) -> str:
+    xargs = _request_xargs(request) or {}
+    for field in ("model_execution_key", "served_model_name", "model"):
+        value = xargs.get(field)
+        if isinstance(value, str) and value:
+            return value
+    value = getattr(request, "model", None)
+    if isinstance(value, str) and value:
+        return value
+    return _UNAVAILABLE_SINGLE_MODEL_ASSUMED
+
+
+def _request_token_domain_key(request: Any) -> str:
+    xargs = _request_xargs(request) or {}
+    for field in (
+        "token_domain_id",
+        "engine_token_domain_fingerprint",
+        "tokenizer_id",
+        "chat_template_id",
+    ):
+        value = xargs.get(field)
+        if isinstance(value, str) and value:
+            return value
+    return _UNAVAILABLE_SINGLE_MODEL_ASSUMED
+
+
+def _is_ungrouped_request(request: Any) -> bool:
+    return not workflow_group_keys_for_request(request)
+
+
+def _ungrouped_guard_due(
+    *,
+    last_group_key: str | None,
+    group_burst: int,
+    ungrouped_min_share: float,
+) -> bool:
+    if last_group_key is None or ungrouped_min_share <= 0.0:
+        return False
+    grouped_before_ungrouped = max(
+        1,
+        int((1.0 - ungrouped_min_share) / ungrouped_min_share),
+    )
+    return group_burst >= grouped_before_ungrouped
+
+
+def _queue_head_delay_ms(request: Any, *, now_s: float) -> float | None:
+    arrival_time = getattr(request, "arrival_time", None)
+    if not isinstance(arrival_time, (int, float)):
+        return None
+    return max(0.0, (now_s - float(arrival_time)) * 1000.0)
+
+
+def _queue_head_delay_bucket(queue_head_delay_ms: float | None) -> str | None:
+    if queue_head_delay_ms is None:
+        return None
+    if queue_head_delay_ms < 50:
+        return "lt_50ms"
+    if queue_head_delay_ms < 200:
+        return "lt_200ms"
+    if queue_head_delay_ms < 1000:
+        return "lt_1000ms"
+    return "gte_1000ms"
 
 
 def _request_xargs(request: Any) -> dict[str, Any] | None:

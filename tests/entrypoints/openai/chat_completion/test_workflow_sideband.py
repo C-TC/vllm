@@ -28,6 +28,8 @@ def test_workflow_sideband_validation_accepts_current_contract() -> None:
             "spawn_index": "0",
             "spawn_size": "2",
             "shared_prefix_class_id": "shared_prefix:p1",
+            "shared_prefill_group_id": "shared-prefill:group-1",
+            "shared_prefill_group_size": "2",
             "stable_prefix_group_id": "group-1",
             "stable_prefix_group_size": "2",
             "cohort_group_id": "group-1:cohort:target-language",
@@ -43,6 +45,7 @@ def test_workflow_sideband_validation_accepts_current_contract() -> None:
     assert validation.issues == ()
     assert "workflow_id" in validation.present_fields
     assert "shared_prefix_class_id" in validation.present_fields
+    assert "shared_prefill_group_id" in validation.present_fields
     assert "stable_prefix_group_id" in validation.present_fields
     assert "cohort_group_id" in validation.present_fields
 

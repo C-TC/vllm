@@ -184,7 +184,8 @@ def test_workflow_test_hook_records_group_aware_scheduler_telemetry(
         prompt_token_ids=[10, 20, 30, 40],
         group_aware_scheduling_enabled=True,
         workflow_scheduler_group_key=(
-            "token_verified_lcp:model=unknown:token_domain=unknown:"
+            "token_verified_lcp:model=unavailable_single_model_assumed:"
+            "token_domain=unavailable_single_model_assumed:"
             "len=4:hash=sha1:lcp"
         ),
         workflow_scheduler_selected_rank=2,
@@ -192,6 +193,11 @@ def test_workflow_test_hook_records_group_aware_scheduler_telemetry(
         workflow_scheduler_group_source="token_verified_lcp",
         workflow_scheduler_token_lcp_len=4,
         workflow_scheduler_token_lcp_hash="sha1:lcp",
+        workflow_scheduler_scan_count=8,
+        workflow_scheduler_candidate_group_size=3,
+        workflow_scheduler_fairness_guard_reason="max_burst",
+        workflow_scheduler_queue_head_delay_ms=42.0,
+        workflow_scheduler_queue_head_delay_bucket="lt_50ms",
     )
 
     assert len(_records) == 1
@@ -199,7 +205,8 @@ def test_workflow_test_hook_records_group_aware_scheduler_telemetry(
     assert record.source == "scheduler"
     assert record.group_aware_scheduling_enabled is True
     assert record.workflow_scheduler_group_key == (
-        "token_verified_lcp:model=unknown:token_domain=unknown:"
+        "token_verified_lcp:model=unavailable_single_model_assumed:"
+        "token_domain=unavailable_single_model_assumed:"
         "len=4:hash=sha1:lcp"
     )
     assert record.workflow_scheduler_selected_rank == 2
@@ -207,9 +214,15 @@ def test_workflow_test_hook_records_group_aware_scheduler_telemetry(
     assert record.workflow_scheduler_group_source == "token_verified_lcp"
     assert record.workflow_scheduler_token_lcp_len == 4
     assert record.workflow_scheduler_token_lcp_hash == "sha1:lcp"
+    assert record.workflow_scheduler_scan_count == 8
+    assert record.workflow_scheduler_candidate_group_size == 3
+    assert record.workflow_scheduler_fairness_guard_reason == "max_burst"
+    assert record.workflow_scheduler_queue_head_delay_ms == 42.0
+    assert record.workflow_scheduler_queue_head_delay_bucket == "lt_50ms"
     file_text = hook_file.read_text(encoding="utf-8")
     assert "workflow_scheduler_group_key" in file_text
     assert "workflow_scheduler_token_lcp_len" in file_text
+    assert "workflow_scheduler_scan_count" in file_text
     assert "sha1:lcp" in file_text
     assert "[10, 20, 30, 40]" not in file_text
     assert '"prompt_token_ids"' not in file_text

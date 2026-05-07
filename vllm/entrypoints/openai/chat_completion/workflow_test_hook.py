@@ -51,6 +51,11 @@ class WorkflowTestHookRecord:
     workflow_scheduler_group_source: str | None = None
     workflow_scheduler_token_lcp_len: int | None = None
     workflow_scheduler_token_lcp_hash: str | None = None
+    workflow_scheduler_scan_count: int | None = None
+    workflow_scheduler_candidate_group_size: int | None = None
+    workflow_scheduler_fairness_guard_reason: str | None = None
+    workflow_scheduler_queue_head_delay_ms: float | None = None
+    workflow_scheduler_queue_head_delay_bucket: str | None = None
     action_id: str | None = None
     action_kind: str | None = None
     lifecycle_status: str | None = None
@@ -149,6 +154,11 @@ def record_scheduler_request(
     workflow_scheduler_group_source: str | None = None,
     workflow_scheduler_token_lcp_len: int | None = None,
     workflow_scheduler_token_lcp_hash: str | None = None,
+    workflow_scheduler_scan_count: int | None = None,
+    workflow_scheduler_candidate_group_size: int | None = None,
+    workflow_scheduler_fairness_guard_reason: str | None = None,
+    workflow_scheduler_queue_head_delay_ms: float | None = None,
+    workflow_scheduler_queue_head_delay_bucket: str | None = None,
 ) -> None:
     internal_prefill_only_action_id = _internal_prefill_only_action_id(vllm_xargs)
     public_vllm_xargs = _public_workflow_xargs(vllm_xargs)
@@ -175,6 +185,15 @@ def record_scheduler_request(
         workflow_scheduler_group_source=workflow_scheduler_group_source,
         workflow_scheduler_token_lcp_len=workflow_scheduler_token_lcp_len,
         workflow_scheduler_token_lcp_hash=workflow_scheduler_token_lcp_hash,
+        workflow_scheduler_scan_count=workflow_scheduler_scan_count,
+        workflow_scheduler_candidate_group_size=workflow_scheduler_candidate_group_size,
+        workflow_scheduler_fairness_guard_reason=(
+            workflow_scheduler_fairness_guard_reason
+        ),
+        workflow_scheduler_queue_head_delay_ms=workflow_scheduler_queue_head_delay_ms,
+        workflow_scheduler_queue_head_delay_bucket=(
+            workflow_scheduler_queue_head_delay_bucket
+        ),
         action_id=internal_prefill_only_action_id,
         action_kind="prefix_prepare"
         if internal_prefill_only_action_id is not None
@@ -267,6 +286,11 @@ def _record_event(
     workflow_scheduler_group_source: str | None = None,
     workflow_scheduler_token_lcp_len: int | None = None,
     workflow_scheduler_token_lcp_hash: str | None = None,
+    workflow_scheduler_scan_count: int | None = None,
+    workflow_scheduler_candidate_group_size: int | None = None,
+    workflow_scheduler_fairness_guard_reason: str | None = None,
+    workflow_scheduler_queue_head_delay_ms: float | None = None,
+    workflow_scheduler_queue_head_delay_bucket: str | None = None,
     action_id: str | None = None,
     action_kind: str | None = None,
     lifecycle_status: str | None = None,
@@ -346,6 +370,15 @@ def _record_event(
         workflow_scheduler_group_source=workflow_scheduler_group_source,
         workflow_scheduler_token_lcp_len=workflow_scheduler_token_lcp_len,
         workflow_scheduler_token_lcp_hash=workflow_scheduler_token_lcp_hash,
+        workflow_scheduler_scan_count=workflow_scheduler_scan_count,
+        workflow_scheduler_candidate_group_size=workflow_scheduler_candidate_group_size,
+        workflow_scheduler_fairness_guard_reason=(
+            workflow_scheduler_fairness_guard_reason
+        ),
+        workflow_scheduler_queue_head_delay_ms=workflow_scheduler_queue_head_delay_ms,
+        workflow_scheduler_queue_head_delay_bucket=(
+            workflow_scheduler_queue_head_delay_bucket
+        ),
         action_id=action_id,
         action_kind=action_kind,
         lifecycle_status=lifecycle_status,
