@@ -542,13 +542,13 @@ class KVCacheManager:
         prefix_token_count: int,
         ttl_ms: int,
     ) -> dict[str, int | str | bool]:
-        """Create an internal soft lease for full cached PreparedPrefix blocks.
+        """Observe cache availability for a PreparedPrefix without retaining it.
 
-        The lease is engine-private. It only keeps cached full prefix blocks
-        resident by incrementing their ref counts; it never exposes block ids,
-        cache keys, or KV handles to the API layer. If any prerequisite is
-        missing, the caller receives a redacted non-fatal reason and normal
-        request execution remains unchanged.
+        Earlier experimental builds attempted to retain cached blocks here.
+        That path is intentionally disabled until vLLM block ownership
+        invariants are audited: this helper may discover cached full blocks for
+        redacted telemetry, but it must not touch, pin, free, or otherwise own
+        blocks. Normal request execution remains unchanged.
         """
         self.release_expired_workflow_prepared_prefix_leases()
         if not self.enable_caching:
@@ -615,31 +615,17 @@ class KVCacheManager:
                 ttl_ms=ttl_ms,
             )
 
-        self.release_workflow_prepared_prefix_lease(action_id, status="superseded")
-        leased_blocks = tuple(leased_blocks_by_id.values())
-        self.block_pool.touch(leased_blocks)
-        self._workflow_prepared_prefix_leases[action_id] = _PreparedPrefixLeaseRef(
-            lease_id=_prepared_prefix_lease_id(action_id),
-            prefix_id=_prepared_prefix_id(action_id),
-            action_id=action_id,
-            blocks=leased_blocks,
-            prefix_token_count=prefix_token_count,
-            full_block_count=full_block_count,
-            ttl_ms=ttl_ms,
-            state="leased",
-            expires_at_monotonic_s=time.monotonic() + (ttl_ms / 1000),
-        )
         return _workflow_lease_result(
-            "leased",
-            "engine_core_cache_blocks_touched",
+            "lease_unavailable",
+            "no_safe_internal_cache_lease_api",
             prefix_token_count=prefix_token_count,
             full_block_count=full_block_count,
             ttl_ms=ttl_ms,
-            prepared_prefix_ref_status="leased",
-            lease_event_status="leased",
-            lease_event_reason="engine_core_cache_blocks_touched",
-            lease_id_present=True,
-            prefix_id_present=True,
+            prepared_prefix_ref_status="lease_unavailable",
+            lease_event_status="lease_unavailable",
+            lease_event_reason="no_safe_internal_cache_lease_api",
+            lease_id_present=False,
+            prefix_id_present=False,
         )
 
     def release_workflow_prepared_prefix_lease(
@@ -651,22 +637,20 @@ class KVCacheManager:
         lease = self._workflow_prepared_prefix_leases.pop(action_id, None)
         if lease is None:
             return None
-        lease.state = status
-        self.block_pool.free_blocks(lease.blocks)
         return _workflow_lease_result(
-            status,
-            "lease_ref_count_released",
+            "lease_unavailable",
+            "no_safe_internal_cache_lease_api",
             prefix_token_count=lease.prefix_token_count,
             full_block_count=lease.full_block_count,
             ttl_ms=max(
                 0,
                 int((lease.expires_at_monotonic_s - time.monotonic()) * 1000),
             ),
-            prepared_prefix_ref_status=status,
-            lease_event_status=status,
-            lease_event_reason="lease_ref_count_released",
-            lease_id_present=True,
-            prefix_id_present=True,
+            prepared_prefix_ref_status="lease_unavailable",
+            lease_event_status="lease_unavailable",
+            lease_event_reason="no_safe_internal_cache_lease_api",
+            lease_id_present=False,
+            prefix_id_present=False,
         )
 
     def release_expired_workflow_prepared_prefix_leases(

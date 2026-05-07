@@ -116,7 +116,7 @@ class PreparedPrefix:
             action_id=str(action["action_id"]),
             action_kind=str(action["action_kind"]),
             generation=int(action.get("generation") or 0),
-            registry_key=str(action.get("virtual_request_id") or ""),
+            registry_key=str(action.get("action_scope_key") or ""),
             virtual_request_id=str(action.get("virtual_request_id") or ""),
             workflow_instance_id=_optional_str(action.get("workflow_instance_id")),
             site_id=_optional_str(action.get("site_id")),
@@ -175,6 +175,7 @@ class PreparedPrefix:
         return {
             "action_id": self.action_id,
             "action_kind": self.action_kind,
+            "action_scope_key": self.registry_key,
             "generation": self.generation,
             "ttl_ms": self.ttl_ms,
             "accepted": True,
@@ -386,7 +387,9 @@ class WorkflowActionRegistry:
         action_id = str(action["action_id"])
         generation = int(action["generation"])
         idempotency_key = str(action["idempotency_key"])
-        registry_key = str(action.get("virtual_request_id") or idempotency_key)
+        registry_key = str(action.get("action_scope_key") or "")
+        if not registry_key:
+            registry_key = str(action.get("virtual_request_id") or idempotency_key)
         with self._lock:
             previous_generation = self._generation_by_key.get(registry_key)
             if previous_generation is not None and generation <= previous_generation:
@@ -779,6 +782,7 @@ def _validate_prefix_prepare(action: dict[str, Any]) -> dict[str, Any] | None:
         )
     required = (
         "action_id",
+        "action_scope_key",
         "idempotency_key",
         "generation",
         "virtual_request_id",
@@ -813,6 +817,15 @@ def _validate_prefix_prepare(action: dict[str, Any]) -> dict[str, Any] | None:
             accepted=False,
             lifecycle_status="rejected",
             reject_reason="missing_model",
+            prewarm_status="not_attempted",
+        )
+    action_scope_key = action.get("action_scope_key")
+    if not isinstance(action_scope_key, str) or not action_scope_key:
+        return _lifecycle_response(
+            action,
+            accepted=False,
+            lifecycle_status="rejected",
+            reject_reason="missing_action_scope_key",
             prewarm_status="not_attempted",
         )
     messages_prefix = action.get("messages_prefix")
@@ -866,6 +879,8 @@ def _lifecycle_response(
     response = {
         "action_id": action.get("action_id"),
         "action_kind": action.get("action_kind"),
+        "action_scope_key": action.get("action_scope_key"),
+        "generation": action.get("generation"),
         "ttl_ms": _action_ttl_ms(action),
         "accepted": accepted,
         "lifecycle_status": lifecycle_status,
@@ -1172,9 +1187,34 @@ def _lease_update_from_engine(
     prefix_token_count: int | None,
     ttl_ms: int | None,
 ) -> dict[str, Any]:
+    engine_status = _optional_str(engine_lease_update.get("lease_status"))
+    if engine_status in {
+        "leased",
+        "lease_consumed",
+        "lease_expired",
+        "lease_released",
+    }:
+        return {
+            "lease_status": "lease_unavailable",
+            "lease_reason": "no_safe_internal_cache_lease_api",
+            "lease_token_count": _optional_int(
+                engine_lease_update.get("lease_token_count")
+            )
+            or prefix_token_count,
+            "lease_full_block_count": _optional_int(
+                engine_lease_update.get("lease_full_block_count")
+            )
+            or 0,
+            "lease_ttl_ms": _optional_int(engine_lease_update.get("lease_ttl_ms"))
+            or ttl_ms,
+            "prepared_prefix_ref_status": "lease_unavailable",
+            "lease_event_status": "lease_unavailable",
+            "lease_event_reason": "no_safe_internal_cache_lease_api",
+            "lease_id_present": False,
+            "prefix_id_present": False,
+        }
     return {
-        "lease_status": _optional_str(engine_lease_update.get("lease_status"))
-        or "lease_failed",
+        "lease_status": engine_status or "lease_failed",
         "lease_reason": _optional_str(engine_lease_update.get("lease_reason"))
         or "missing_engine_lease_reason",
         "lease_token_count": _optional_int(engine_lease_update.get("lease_token_count"))
