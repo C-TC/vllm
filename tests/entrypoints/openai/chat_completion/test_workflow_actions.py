@@ -86,6 +86,13 @@ def _kv_manager_with_cached_prefix(
     return manager, request
 
 
+def _free_block_ids(manager: KVCacheManager) -> tuple[int, ...]:
+    return tuple(
+        block.block_id
+        for block in manager.block_pool.free_block_queue.get_all_free_blocks()
+    )
+
+
 def _valid_prefix_prepare_action(
     generation: int = 1,
     key_suffix: str = "demo",
@@ -584,13 +591,28 @@ def test_workflow_actions_records_lease_consumed_update(
     assert "kv" not in json.dumps(status).lower()
 
 
-def test_workflow_kv_manager_lease_mode_does_not_touch_or_free_cached_blocks() -> None:
+def test_workflow_kv_manager_lease_mode_does_not_touch_or_free_cached_blocks(
+    monkeypatch,
+) -> None:
     manager, request = _kv_manager_with_cached_prefix()
     cached_block = manager.block_pool.get_cached_block(
         request.block_hashes[0],
         [0],
     )[0]
     assert cached_block.ref_cnt == 0
+    free_before = _free_block_ids(manager)
+    calls = {"touch": 0, "free_blocks": 0}
+
+    def touch_spy(blocks):
+        calls["touch"] += 1
+        raise AssertionError("workflow lease path must not touch cached blocks")
+
+    def free_blocks_spy(blocks):
+        calls["free_blocks"] += 1
+        raise AssertionError("workflow lease path must not free cached blocks")
+
+    monkeypatch.setattr(manager.block_pool, "touch", touch_spy)
+    monkeypatch.setattr(manager.block_pool, "free_blocks", free_blocks_spy)
 
     result = manager.try_lease_workflow_prepared_prefix(
         request,
@@ -612,22 +634,41 @@ def test_workflow_kv_manager_lease_mode_does_not_touch_or_free_cached_blocks() -
         "prefix_id_present": False,
     }
     assert cached_block.ref_cnt == 0
+    assert _free_block_ids(manager) == free_before
+    assert calls == {"touch": 0, "free_blocks": 0}
     assert "action-lease" not in manager._workflow_prepared_prefix_leases
 
     release = manager.release_workflow_prepared_prefix_lease("action-lease")
 
     assert release is None
     assert cached_block.ref_cnt == 0
+    assert _free_block_ids(manager) == free_before
+    assert calls == {"touch": 0, "free_blocks": 0}
 
 
 def test_workflow_kv_manager_expired_lease_cleanup_noops_without_owned_blocks(
+    monkeypatch,
 ) -> None:
     manager, request = _kv_manager_with_cached_prefix()
     cached_block = manager.block_pool.get_cached_block(
         request.block_hashes[0],
         [0],
-        [0],
     )[0]
+    free_before = _free_block_ids(manager)
+    calls = {"touch": 0, "free_blocks": 0}
+
+    monkeypatch.setattr(
+        manager.block_pool,
+        "touch",
+        lambda blocks: calls.__setitem__("touch", calls["touch"] + 1),
+    )
+    monkeypatch.setattr(
+        manager.block_pool,
+        "free_blocks",
+        lambda blocks: calls.__setitem__(
+            "free_blocks", calls["free_blocks"] + 1
+        ),
+    )
 
     result = manager.try_lease_workflow_prepared_prefix(
         request,
@@ -643,6 +684,8 @@ def test_workflow_kv_manager_expired_lease_cleanup_noops_without_owned_blocks(
 
     assert released == ()
     assert cached_block.ref_cnt == 0
+    assert _free_block_ids(manager) == free_before
+    assert calls == {"touch": 0, "free_blocks": 0}
     assert "action-expire" not in manager._workflow_prepared_prefix_leases
 
 
@@ -669,6 +712,138 @@ def test_workflow_kv_manager_lease_reports_redacted_miss_reason() -> None:
         "prefix_id_present": False,
     }
     assert "block_id" not in json.dumps(result)
+    assert "lease:" not in json.dumps(result)
+    assert "workflow-prepared-prefix" not in json.dumps(result)
+
+
+def test_workflow_kv_manager_lease_disabled_paths_do_not_create_owned_refs(
+    monkeypatch,
+) -> None:
+    manager, request = _kv_manager_with_cached_prefix()
+    free_before = _free_block_ids(manager)
+    calls = {"touch": 0, "free_blocks": 0}
+    monkeypatch.setattr(
+        manager.block_pool,
+        "touch",
+        lambda blocks: calls.__setitem__("touch", calls["touch"] + 1),
+    )
+    monkeypatch.setattr(
+        manager.block_pool,
+        "free_blocks",
+        lambda blocks: calls.__setitem__(
+            "free_blocks", calls["free_blocks"] + 1
+        ),
+    )
+
+    manager.enable_caching = False
+    disabled = manager.try_lease_workflow_prepared_prefix(
+        request,
+        action_id="action-disabled-cache",
+        prefix_token_count=4,
+        ttl_ms=30000,
+    )
+    manager.enable_caching = True
+    no_full_blocks = manager.try_lease_workflow_prepared_prefix(
+        request,
+        action_id="action-no-full-block",
+        prefix_token_count=1,
+        ttl_ms=30000,
+    )
+    monkeypatch.setenv("WORKFLOW_PREFIX_PREPARE_MAX_OUTSTANDING", "1")
+    manager._workflow_prepared_prefix_leases["existing"] = SimpleNamespace(
+        expires_at_monotonic_s=time.monotonic() + 60,
+    )
+    capacity = manager.try_lease_workflow_prepared_prefix(
+        request,
+        action_id="action-capacity",
+        prefix_token_count=4,
+        ttl_ms=30000,
+    )
+
+    assert disabled["lease_reason"] == "prefix_cache_disabled"
+    assert no_full_blocks["lease_reason"] == "no_full_blocks"
+    assert capacity["lease_status"] == "lease_failed"
+    assert capacity["lease_reason"] == "lease_capacity_exceeded"
+    assert calls == {"touch": 0, "free_blocks": 0}
+    assert _free_block_ids(manager) == free_before
+    assert set(manager._workflow_prepared_prefix_leases) == {"existing"}
+
+
+def test_workflow_kv_manager_observe_only_does_not_break_cache_reset_or_reuse(
+) -> None:
+    manager, request = _kv_manager_with_cached_prefix()
+    cached_block = manager.block_pool.get_cached_block(request.block_hashes[0], [0])[0]
+    free_before = _free_block_ids(manager)
+
+    first = manager.try_lease_workflow_prepared_prefix(
+        request,
+        action_id="action-reuse-first",
+        prefix_token_count=4,
+        ttl_ms=30000,
+    )
+    second = manager.try_lease_workflow_prepared_prefix(
+        request,
+        action_id="action-reuse-second",
+        prefix_token_count=4,
+        ttl_ms=30000,
+    )
+
+    assert first["lease_reason"] == "no_safe_internal_cache_lease_api"
+    assert second["lease_reason"] == "no_safe_internal_cache_lease_api"
+    assert cached_block.ref_cnt == 0
+    assert _free_block_ids(manager) == free_before
+    assert manager.block_pool.get_cached_block(request.block_hashes[0], [0]) == [
+        cached_block
+    ]
+    assert manager.reset_prefix_cache() is True
+    assert manager.block_pool.get_cached_block(request.block_hashes[0], [0]) is None
+    assert cached_block.ref_cnt == 0
+    assert _free_block_ids(manager) == free_before
+
+
+def test_workflow_kv_manager_observe_only_does_not_release_active_request_refs(
+    monkeypatch,
+) -> None:
+    manager, request = _kv_manager_with_cached_prefix()
+    cached_block = manager.block_pool.get_cached_block(request.block_hashes[0], [0])[0]
+    manager.block_pool.touch([cached_block])
+    assert cached_block.ref_cnt == 1
+    assert cached_block.block_id not in _free_block_ids(manager)
+    free_after_request_touch = _free_block_ids(manager)
+    calls = {"touch": 0, "free_blocks": 0}
+
+    monkeypatch.setattr(
+        manager.block_pool,
+        "touch",
+        lambda blocks: calls.__setitem__("touch", calls["touch"] + 1),
+    )
+    monkeypatch.setattr(
+        manager.block_pool,
+        "free_blocks",
+        lambda blocks: calls.__setitem__(
+            "free_blocks", calls["free_blocks"] + 1
+        ),
+    )
+
+    result = manager.try_lease_workflow_prepared_prefix(
+        request,
+        action_id="action-active-request",
+        prefix_token_count=4,
+        ttl_ms=30000,
+    )
+    release = manager.release_workflow_prepared_prefix_lease(
+        "action-active-request"
+    )
+    expired = manager.release_expired_workflow_prepared_prefix_leases()
+
+    assert result["lease_status"] == "lease_unavailable"
+    assert result["lease_reason"] == "no_safe_internal_cache_lease_api"
+    assert release is None
+    assert expired == ()
+    assert cached_block.ref_cnt == 1
+    assert cached_block.block_id not in _free_block_ids(manager)
+    assert _free_block_ids(manager) == free_after_request_touch
+    assert calls == {"touch": 0, "free_blocks": 0}
 
 
 def test_workflow_actions_experimental_prewarm_reports_unavailable_without_hook(
