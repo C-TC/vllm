@@ -381,6 +381,8 @@ def test_workflow_actions_experimental_prewarm_submits_hidden_prewarm(
     assert payload["lifecycle_status"] == "accepted"
     assert payload["prewarm_status"] == "prewarm_submitted"
     assert payload["prewarm_attempted"] is True
+    assert isinstance(payload["accepted_at_unix_ms"], int)
+    assert isinstance(payload["prewarm_submitted_at_unix_ms"], int)
     assert len(handler.prewarm_submissions) == 1
     _action, token_verification = handler.prewarm_submissions[0]
     assert "_prefix_token_ids" in token_verification
@@ -393,7 +395,33 @@ def test_workflow_actions_experimental_prewarm_submits_hidden_prewarm(
         f"/v1/workflow/coopt/actions/{payload['action_id']}"
     )
     assert status_response.status_code == 200
-    assert status_response.json()["prewarm_status"] == "prewarm_completed"
+    status = status_response.json()
+    assert status["prewarm_status"] == "prewarm_completed"
+    assert isinstance(status["prewarm_finished_at_unix_ms"], int)
+
+
+def test_workflow_actions_prewarm_observe_alias_submits_hidden_prewarm(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("VLLM_ENABLE_WORKFLOW_COOPT_ACTIONS", "1")
+    monkeypatch.setenv("WORKFLOW_PREFIX_PREPARE_MIN_TOKENS", "1")
+    monkeypatch.setenv("WORKFLOW_PREFIX_PREPARE_MODE", "prewarm_observe")
+    app = FastAPI()
+    handler = _FakeChatHandler()
+    app.state.openai_serving_chat = handler
+    api_router.attach_router(app)
+    client = TestClient(app)
+
+    response = client.post(
+        "/v1/workflow/coopt/actions",
+        json=_valid_prefix_prepare_action(key_suffix="prewarm-observe"),
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["prewarm_status"] == "prewarm_submitted"
+    assert payload["prewarm_attempted"] is True
+    assert len(handler.prewarm_submissions) == 1
 
 
 def test_workflow_actions_lease_mode_reports_unavailable_without_exposing_handles(

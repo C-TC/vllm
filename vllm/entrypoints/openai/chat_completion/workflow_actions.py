@@ -39,6 +39,7 @@ _DEFAULT_MIN_TOKENS = 32
 _DEFAULT_TTL_MS = 30000
 _DEFAULT_MAX_OUTSTANDING = 128
 _DEFAULT_PREPARE_MODE = "tokenize_only"
+_PREWARM_PREPARE_MODES = {"experimental_prewarm", "prewarm_observe"}
 _DEFAULT_RETENTION_MODE = "observe"
 
 router = APIRouter()
@@ -63,6 +64,7 @@ class PreparedPrefix:
     render_domain_id: str | None
     token_domain_id: str | None
     created_monotonic_s: float
+    accepted_at_unix_ms: int
     expires_at_unix_ms: int
     ttl_ms: int
     prefix_message_hash: str | None
@@ -77,6 +79,8 @@ class PreparedPrefix:
     reject_reason: str | None = None
     prewarm_status: str = "tokenize_only"
     prewarm_attempted: bool = False
+    prewarm_submitted_at_unix_ms: int | None = None
+    prewarm_finished_at_unix_ms: int | None = None
     prepared_prefix_match_status: str = "pending_request"
     lease_status: str = "not_attempted"
     lease_reason: str = "prewarm_not_completed"
@@ -125,6 +129,7 @@ class PreparedPrefix:
             render_domain_id=_optional_str(action.get("render_domain_id")),
             token_domain_id=_optional_str(action.get("token_domain_id")),
             created_monotonic_s=time.monotonic(),
+            accepted_at_unix_ms=_now_unix_ms(),
             expires_at_unix_ms=_expires_at_unix_ms(action),
             ttl_ms=ttl_ms,
             prefix_message_hash=_hash_prefix_messages(action.get("messages_prefix")),
@@ -139,6 +144,16 @@ class PreparedPrefix:
             chat_template_id=_optional_str(token_verification.get("chat_template_id")),
             prewarm_status=prewarm_status,
             prewarm_attempted=_prewarm_attempted(prewarm_status),
+            prewarm_submitted_at_unix_ms=(
+                _now_unix_ms()
+                if prewarm_status == "prewarm_submitted"
+                else None
+            ),
+            prewarm_finished_at_unix_ms=(
+                _now_unix_ms()
+                if _is_terminal_prewarm_status(prewarm_status)
+                else None
+            ),
             lease_status=_optional_str(lease_fields.get("lease_status"))
             or "not_attempted",
             lease_reason=_optional_str(lease_fields.get("lease_reason"))
@@ -179,10 +194,13 @@ class PreparedPrefix:
             "generation": self.generation,
             "ttl_ms": self.ttl_ms,
             "accepted": True,
+            "accepted_at_unix_ms": self.accepted_at_unix_ms,
             "lifecycle_status": self.lifecycle_status,
             "reject_reason": self.reject_reason,
             "prewarm_status": self.prewarm_status,
             "prewarm_attempted": self.prewarm_attempted,
+            "prewarm_submitted_at_unix_ms": self.prewarm_submitted_at_unix_ms,
+            "prewarm_finished_at_unix_ms": self.prewarm_finished_at_unix_ms,
             "engine_token_source": self.engine_token_source,
             "prefix_token_count": self.prefix_token_count,
             "prefix_token_hash": self.prefix_token_hash,
@@ -239,6 +257,12 @@ class PreparedPrefix:
     ) -> None:
         self.prewarm_status = prewarm_status
         self.prewarm_attempted = _prewarm_attempted(prewarm_status)
+        if prewarm_status == "prewarm_submitted":
+            self.prewarm_submitted_at_unix_ms = _now_unix_ms()
+        elif _is_terminal_prewarm_status(prewarm_status):
+            if self.prewarm_submitted_at_unix_ms is None:
+                self.prewarm_submitted_at_unix_ms = self.accepted_at_unix_ms
+            self.prewarm_finished_at_unix_ms = _now_unix_ms()
         if reject_reason is not None:
             self.reject_reason = reject_reason
         self.apply_lease_update(
@@ -511,6 +535,11 @@ class WorkflowActionRegistry:
             else:
                 stored["prewarm_status"] = prewarm_status
                 stored["prewarm_attempted"] = _prewarm_attempted(prewarm_status)
+                if prewarm_status == "prewarm_submitted":
+                    stored["prewarm_submitted_at_unix_ms"] = _now_unix_ms()
+                elif _is_terminal_prewarm_status(prewarm_status):
+                    stored.setdefault("prewarm_submitted_at_unix_ms", _now_unix_ms())
+                    stored["prewarm_finished_at_unix_ms"] = _now_unix_ms()
                 if reject_reason is not None:
                     stored["reject_reason"] = reject_reason
                 stored.update(
@@ -883,6 +912,7 @@ def _lifecycle_response(
         "generation": action.get("generation"),
         "ttl_ms": _action_ttl_ms(action),
         "accepted": accepted,
+        "accepted_at_unix_ms": _now_unix_ms() if accepted else None,
         "lifecycle_status": lifecycle_status,
         "reject_reason": reject_reason,
         "prewarm_status": prewarm_status,
@@ -909,6 +939,14 @@ def _lifecycle_response(
         "prepared_prefix_match_status": (
             "pending_request"
             if lifecycle_status == "accepted" and prefix_token_hash is not None
+            else None
+        ),
+        "prewarm_submitted_at_unix_ms": (
+            _now_unix_ms() if prewarm_status == "prewarm_submitted" else None
+        ),
+        "prewarm_finished_at_unix_ms": (
+            _now_unix_ms()
+            if _is_terminal_prewarm_status(prewarm_status)
             else None
         ),
         **lease_fields,
@@ -1000,7 +1038,7 @@ async def _maybe_submit_prefix_prewarm(
     mode = _prefix_prepare_mode()
     if mode == "tokenize_only":
         return "tokenize_only"
-    if mode != "experimental_prewarm":
+    if mode not in _PREWARM_PREPARE_MODES:
         return "tokenize_only"
     submit_prewarm = (
         getattr(chat_handler, "submit_workflow_prefix_prewarm", None)
@@ -1343,6 +1381,12 @@ def _prewarm_attempted(prewarm_status: str) -> bool:
     }
 
 
+def _is_terminal_prewarm_status(prewarm_status: str) -> bool:
+    if prewarm_status == "prewarm_submitted":
+        return False
+    return _prewarm_attempted(prewarm_status)
+
+
 def _now_unix_ms() -> int:
     return int(time.time() * 1000)
 
@@ -1363,7 +1407,7 @@ def _prefix_prepare_mode() -> str:
     mode = os.getenv(_PREPARE_MODE_ENV, _DEFAULT_PREPARE_MODE)
     if mode == "tokenize_only":
         return mode
-    if mode == "experimental_prewarm":
+    if mode in _PREWARM_PREPARE_MODES:
         return mode
     return _DEFAULT_PREPARE_MODE
 
