@@ -20,6 +20,7 @@ WORKFLOW_GROUP_AWARE_MAX_GROUP_DELAY_MS_ENV = (
 WORKFLOW_GROUP_AWARE_UNGROUPED_MIN_SHARE_ENV = (
     "WORKFLOW_GROUP_AWARE_UNGROUPED_MIN_SHARE"
 )
+WORKFLOW_JOIN_TAIL_SCHEDULING_ENV = "WORKFLOW_JOIN_TAIL_SCHEDULING"
 DEFAULT_WORKFLOW_GROUP_AWARE_MAX_BURST = 4
 DEFAULT_WORKFLOW_GROUP_AWARE_MAX_QUEUE_SCAN = 64
 DEFAULT_WORKFLOW_GROUP_AWARE_MAX_GROUP_DELAY_MS = 200.0
@@ -41,10 +42,21 @@ class WorkflowGroupSelection:
     fairness_guard_reason: str | None = None
     queue_head_delay_ms: float | None = None
     queue_head_delay_bucket: str | None = None
+    join_tail_scheduling_enabled: bool | None = None
+    workflow_join_tail_selected: bool | None = None
+    workflow_join_tail_reason: str | None = None
+    workflow_join_tail_scan_count: int | None = None
+    workflow_join_tail_candidate_count: int | None = None
+    workflow_join_tail_remaining_values: tuple[int, ...] | None = None
+    workflow_join_tail_fairness_guard_reason: str | None = None
 
 
 def workflow_group_aware_scheduling_enabled() -> bool:
     return os.getenv(WORKFLOW_GROUP_AWARE_SCHEDULING_ENV, "") == "1"
+
+
+def workflow_join_tail_scheduling_enabled() -> bool:
+    return os.getenv(WORKFLOW_JOIN_TAIL_SCHEDULING_ENV, "") == "1"
 
 
 def workflow_group_aware_max_burst() -> int:
@@ -234,6 +246,156 @@ def select_workflow_group_request(
     )
 
 
+def select_workflow_join_tail_request(
+    requests: Iterable[Any],
+    *,
+    last_group_key: str | None,
+    group_burst: int,
+    max_burst: int | None = None,
+    max_queue_scan: int | None = None,
+    max_group_delay_ms: float | None = None,
+    block_size: int = 16,
+    now_s: float | None = None,
+) -> WorkflowGroupSelection | None:
+    """Select a waiting request by workflow join-tail criticality evidence.
+
+    This is intentionally separate from token-LCP grouping so that experiments
+    can isolate workflow-criticality scheduling from prefix-locality scheduling.
+    """
+
+    del block_size
+    all_requests = tuple(requests)
+    if not all_requests:
+        return None
+
+    max_burst = workflow_group_aware_max_burst() if max_burst is None else max_burst
+    max_queue_scan = (
+        workflow_group_aware_max_queue_scan()
+        if max_queue_scan is None
+        else max(1, max_queue_scan)
+    )
+    max_group_delay_ms = (
+        workflow_group_aware_max_group_delay_ms()
+        if max_group_delay_ms is None
+        else max(0.0, max_group_delay_ms)
+    )
+    scan_count = min(len(all_requests), max_queue_scan)
+    ordered_requests = all_requests[:scan_count]
+    queue_head_delay_ms = _queue_head_delay_ms(
+        all_requests[0],
+        now_s=time.time() if now_s is None else now_s,
+    )
+    queue_head_delay_bucket = _queue_head_delay_bucket(queue_head_delay_ms)
+    candidates = _join_tail_candidates(ordered_requests)
+    remaining_values = tuple(
+        sorted(
+            {
+                value
+                for candidate in candidates
+                if isinstance((value := candidate.remaining_count), int)
+            }
+        )
+    )
+    if not candidates:
+        return WorkflowGroupSelection(
+            request=all_requests[0],
+            selected_rank=0,
+            group_key=None,
+            reason="stock_fallback_no_join_tail",
+            group_source=None,
+            scan_count=scan_count,
+            queue_head_delay_ms=queue_head_delay_ms,
+            queue_head_delay_bucket=queue_head_delay_bucket,
+            join_tail_scheduling_enabled=True,
+            workflow_join_tail_selected=False,
+            workflow_join_tail_reason="stock_fallback_no_join_tail",
+            workflow_join_tail_scan_count=scan_count,
+            workflow_join_tail_candidate_count=0,
+            workflow_join_tail_remaining_values=remaining_values,
+        )
+
+    candidate = min(
+        candidates,
+        key=lambda item: (
+            0 if item.request_would_release_join else 1,
+            item.remaining_count if item.remaining_count is not None else 1_000_000,
+            item.rank,
+        ),
+    )
+    selected_rank = candidate.rank
+    if (
+        selected_rank != 0
+        and queue_head_delay_ms is not None
+        and queue_head_delay_ms >= max_group_delay_ms
+    ):
+        return WorkflowGroupSelection(
+            request=all_requests[0],
+            selected_rank=0,
+            group_key=_join_tail_group_key_for_request(all_requests[0]),
+            reason="fairness_max_group_delay",
+            group_source="join_tail",
+            scan_count=scan_count,
+            candidate_group_size=len(candidates),
+            fairness_guard_reason="max_group_delay_ms",
+            queue_head_delay_ms=queue_head_delay_ms,
+            queue_head_delay_bucket=queue_head_delay_bucket,
+            join_tail_scheduling_enabled=True,
+            workflow_join_tail_selected=False,
+            workflow_join_tail_reason="fairness_max_group_delay",
+            workflow_join_tail_scan_count=scan_count,
+            workflow_join_tail_candidate_count=len(candidates),
+            workflow_join_tail_remaining_values=remaining_values,
+            workflow_join_tail_fairness_guard_reason="max_group_delay_ms",
+        )
+    if (
+        selected_rank != 0
+        and candidate.group_key == last_group_key
+        and group_burst >= max_burst
+    ):
+        return WorkflowGroupSelection(
+            request=all_requests[0],
+            selected_rank=0,
+            group_key=_join_tail_group_key_for_request(all_requests[0]),
+            reason="fairness_burst_cap",
+            group_source="join_tail",
+            scan_count=scan_count,
+            candidate_group_size=len(candidates),
+            fairness_guard_reason="max_burst",
+            queue_head_delay_ms=queue_head_delay_ms,
+            queue_head_delay_bucket=queue_head_delay_bucket,
+            join_tail_scheduling_enabled=True,
+            workflow_join_tail_selected=False,
+            workflow_join_tail_reason="fairness_burst_cap",
+            workflow_join_tail_scan_count=scan_count,
+            workflow_join_tail_candidate_count=len(candidates),
+            workflow_join_tail_remaining_values=remaining_values,
+            workflow_join_tail_fairness_guard_reason="max_burst",
+        )
+
+    reason = (
+        "request_would_release_join"
+        if candidate.request_would_release_join
+        else "join_tail_phase"
+    )
+    return WorkflowGroupSelection(
+        request=ordered_requests[selected_rank],
+        selected_rank=selected_rank,
+        group_key=candidate.group_key,
+        reason=reason,
+        group_source="join_tail",
+        scan_count=scan_count,
+        candidate_group_size=len(candidates),
+        queue_head_delay_ms=queue_head_delay_ms,
+        queue_head_delay_bucket=queue_head_delay_bucket,
+        join_tail_scheduling_enabled=True,
+        workflow_join_tail_selected=True,
+        workflow_join_tail_reason=reason,
+        workflow_join_tail_scan_count=scan_count,
+        workflow_join_tail_candidate_count=len(candidates),
+        workflow_join_tail_remaining_values=remaining_values,
+    )
+
+
 def workflow_group_keys_for_request(request: Any) -> tuple[tuple[str, str], ...]:
     """Return ordered grouping keys for a request.
 
@@ -268,6 +430,60 @@ class _Candidate:
     token_lcp_len: int | None = None
     token_lcp_hash: str | None = None
     group_size: int | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class _JoinTailCandidate:
+    rank: int
+    request: Any
+    group_key: str
+    remaining_count: int | None
+    request_would_release_join: bool
+
+
+def _join_tail_candidates(requests: tuple[Any, ...]) -> tuple[_JoinTailCandidate, ...]:
+    candidates: list[_JoinTailCandidate] = []
+    for rank, request in enumerate(requests):
+        xargs = _request_xargs(request)
+        if not xargs:
+            continue
+        release_join = _bool_xarg(xargs.get("request_would_release_join"))
+        tail_phase = _bool_xarg(xargs.get("join_tail_phase"))
+        remaining = _int_xarg(xargs.get("join_remaining_count"))
+        if release_join is not True and tail_phase is not True:
+            continue
+        group_key = _join_tail_group_key_for_request(request)
+        if group_key is None:
+            continue
+        candidates.append(
+            _JoinTailCandidate(
+                rank=rank,
+                request=request,
+                group_key=group_key,
+                remaining_count=remaining,
+                request_would_release_join=release_join is True,
+            )
+        )
+    return tuple(candidates)
+
+
+def _join_tail_group_key_for_request(request: Any) -> str | None:
+    xargs = _request_xargs(request)
+    if not xargs:
+        return None
+    join_group_id = xargs.get("join_group_id")
+    if isinstance(join_group_id, str) and join_group_id:
+        return f"join_tail:{join_group_id}"
+    workflow_instance_id = xargs.get("workflow_instance_id")
+    site_id = xargs.get("site_id")
+    if (
+        isinstance(workflow_instance_id, str)
+        and workflow_instance_id
+        and isinstance(site_id, str)
+        and site_id
+    ):
+        return f"join_tail:{workflow_instance_id}:{site_id}"
+    return None
 
 
 def _best_group_candidate(
@@ -555,6 +771,27 @@ def _request_xargs(request: Any) -> dict[str, Any] | None:
     sampling_params = getattr(request, "sampling_params", None)
     extra_args = getattr(sampling_params, "extra_args", None)
     return extra_args if isinstance(extra_args, dict) else None
+
+
+def _bool_xarg(value: Any) -> bool | None:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        if value.lower() == "true":
+            return True
+        if value.lower() == "false":
+            return False
+    return None
+
+
+def _int_xarg(value: Any) -> int | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str) and value.isdigit():
+        return int(value)
+    return None
 
 
 def _request_prompt_token_ids(request: Any) -> list[int] | None:

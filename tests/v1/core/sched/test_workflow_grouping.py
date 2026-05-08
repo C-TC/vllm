@@ -6,12 +6,14 @@ from types import SimpleNamespace
 
 from vllm.v1.core.sched.workflow_grouping import (
     select_workflow_group_request,
+    select_workflow_join_tail_request,
     workflow_group_aware_max_burst,
     workflow_group_aware_max_group_delay_ms,
     workflow_group_aware_max_queue_scan,
     workflow_group_aware_scheduling_enabled,
     workflow_group_aware_ungrouped_min_share,
     workflow_group_keys_for_request,
+    workflow_join_tail_scheduling_enabled,
 )
 
 
@@ -36,8 +38,10 @@ def test_workflow_grouping_env_defaults(monkeypatch) -> None:
     monkeypatch.delenv("WORKFLOW_GROUP_AWARE_MAX_QUEUE_SCAN", raising=False)
     monkeypatch.delenv("WORKFLOW_GROUP_AWARE_MAX_GROUP_DELAY_MS", raising=False)
     monkeypatch.delenv("WORKFLOW_GROUP_AWARE_UNGROUPED_MIN_SHARE", raising=False)
+    monkeypatch.delenv("WORKFLOW_JOIN_TAIL_SCHEDULING", raising=False)
 
     assert workflow_group_aware_scheduling_enabled() is False
+    assert workflow_join_tail_scheduling_enabled() is False
     assert workflow_group_aware_max_burst() == 4
     assert workflow_group_aware_max_queue_scan() == 64
     assert workflow_group_aware_max_group_delay_ms() == 200.0
@@ -274,3 +278,107 @@ def test_workflow_grouping_missing_sideband_keeps_stock_head() -> None:
     assert selection.selected_rank == 0
     assert selection.group_key is None
     assert selection.reason == "stock_fallback_no_group"
+
+
+def test_workflow_join_tail_prefers_release_join_candidate() -> None:
+    req_non_tail = _request(
+        "non-tail",
+        xargs={
+            "join_group_id": "join-a",
+            "join_tail_phase": "true",
+            "join_remaining_count": "1",
+            "request_would_release_join": "false",
+        },
+    )
+    req_tail = _request(
+        "tail",
+        xargs={
+            "join_group_id": "join-a",
+            "join_tail_phase": "true",
+            "join_remaining_count": "0",
+            "request_would_release_join": "true",
+        },
+    )
+
+    selection = select_workflow_join_tail_request(
+        [req_non_tail, req_tail],
+        last_group_key=None,
+        group_burst=0,
+    )
+
+    assert selection is not None
+    assert selection.request is req_tail
+    assert selection.selected_rank == 1
+    assert selection.group_key == "join_tail:join-a"
+    assert selection.reason == "request_would_release_join"
+    assert selection.workflow_join_tail_selected is True
+    assert selection.workflow_join_tail_candidate_count == 2
+    assert selection.workflow_join_tail_remaining_values == (0, 1)
+
+
+def test_workflow_join_tail_falls_back_without_metadata() -> None:
+    req_head = _request("head", xargs={"spawn_group_id": "group-a"})
+    req_other = _request("other", xargs={"spawn_group_id": "group-b"})
+
+    selection = select_workflow_join_tail_request(
+        [req_head, req_other],
+        last_group_key=None,
+        group_burst=0,
+    )
+
+    assert selection is not None
+    assert selection.request is req_head
+    assert selection.workflow_join_tail_selected is False
+    assert selection.workflow_join_tail_reason == "stock_fallback_no_join_tail"
+
+
+def test_workflow_join_tail_max_delay_protects_old_head() -> None:
+    req_head = _request("head", xargs=None, arrival_time=1.0)
+    req_tail = _request(
+        "tail",
+        xargs={
+            "join_group_id": "join-a",
+            "join_tail_phase": "true",
+            "join_remaining_count": "0",
+            "request_would_release_join": "true",
+        },
+        arrival_time=1.2,
+    )
+
+    selection = select_workflow_join_tail_request(
+        [req_head, req_tail],
+        last_group_key=None,
+        group_burst=0,
+        max_group_delay_ms=200,
+        now_s=1.3,
+    )
+
+    assert selection is not None
+    assert selection.request is req_head
+    assert selection.reason == "fairness_max_group_delay"
+    assert selection.workflow_join_tail_fairness_guard_reason == "max_group_delay_ms"
+
+
+def test_workflow_join_tail_burst_cap_can_force_head() -> None:
+    req_head = _request("head", xargs=None)
+    req_tail = _request(
+        "tail",
+        xargs={
+            "join_group_id": "join-a",
+            "join_tail_phase": "true",
+            "join_remaining_count": "0",
+            "request_would_release_join": "true",
+        },
+    )
+
+    selection = select_workflow_join_tail_request(
+        [req_head, req_tail],
+        last_group_key="join_tail:join-a",
+        group_burst=1,
+        max_burst=1,
+    )
+
+    assert selection is not None
+    assert selection.request is req_head
+    assert selection.reason == "fairness_burst_cap"
+    assert selection.workflow_join_tail_fairness_guard_reason == "max_burst"

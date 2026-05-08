@@ -57,11 +57,13 @@ from vllm.v1.core.sched.utils import check_stop, remove_all
 from vllm.v1.core.sched.workflow_grouping import (
     WorkflowGroupSelection,
     select_workflow_group_request,
+    select_workflow_join_tail_request,
     workflow_group_aware_max_burst,
     workflow_group_aware_max_group_delay_ms,
     workflow_group_aware_max_queue_scan,
     workflow_group_aware_scheduling_enabled,
     workflow_group_aware_ungrouped_min_share,
+    workflow_join_tail_scheduling_enabled,
 )
 from vllm.v1.engine import EngineCoreEventType, EngineCoreOutput, EngineCoreOutputs
 from vllm.v1.kv_cache_interface import AttentionSpec, KVCacheConfig
@@ -1690,6 +1692,18 @@ class Scheduler(SchedulerInterface):
         self,
         request_queue: RequestQueue,
     ) -> WorkflowGroupSelection:
+        if workflow_join_tail_scheduling_enabled() and request_queue is self.waiting:
+            selection = select_workflow_join_tail_request(
+                request_queue,
+                last_group_key=self._workflow_scheduler_last_group_key,
+                group_burst=self._workflow_scheduler_group_burst,
+                max_burst=workflow_group_aware_max_burst(),
+                max_queue_scan=workflow_group_aware_max_queue_scan(),
+                max_group_delay_ms=workflow_group_aware_max_group_delay_ms(),
+                block_size=self.block_size,
+            )
+            if selection is not None:
+                return selection
         if (
             not workflow_group_aware_scheduling_enabled()
             or request_queue is not self.waiting
@@ -1735,7 +1749,10 @@ class Scheduler(SchedulerInterface):
         request: Request,
         selection: WorkflowGroupSelection,
     ) -> None:
-        if not workflow_group_aware_scheduling_enabled():
+        if (
+            not workflow_group_aware_scheduling_enabled()
+            and not workflow_join_tail_scheduling_enabled()
+        ):
             return
 
         if selection.group_key == self._workflow_scheduler_last_group_key:
@@ -1754,7 +1771,8 @@ class Scheduler(SchedulerInterface):
             client_index=request.client_index,
             prompt_token_ids=request.prompt_token_ids,
             engine_prompt_token_count=request.num_prompt_tokens,
-            group_aware_scheduling_enabled=True,
+            group_aware_scheduling_enabled=workflow_group_aware_scheduling_enabled(),
+            join_tail_scheduling_enabled=selection.join_tail_scheduling_enabled,
             workflow_scheduler_group_key=selection.group_key,
             workflow_scheduler_selected_rank=selection.selected_rank,
             workflow_scheduler_reason=selection.reason,
@@ -1766,6 +1784,18 @@ class Scheduler(SchedulerInterface):
             workflow_scheduler_fairness_guard_reason=selection.fairness_guard_reason,
             workflow_scheduler_queue_head_delay_ms=selection.queue_head_delay_ms,
             workflow_scheduler_queue_head_delay_bucket=selection.queue_head_delay_bucket,
+            workflow_join_tail_selected=selection.workflow_join_tail_selected,
+            workflow_join_tail_reason=selection.workflow_join_tail_reason,
+            workflow_join_tail_scan_count=selection.workflow_join_tail_scan_count,
+            workflow_join_tail_candidate_count=(
+                selection.workflow_join_tail_candidate_count
+            ),
+            workflow_join_tail_remaining_values=(
+                selection.workflow_join_tail_remaining_values
+            ),
+            workflow_join_tail_fairness_guard_reason=(
+                selection.workflow_join_tail_fairness_guard_reason
+            ),
         )
 
     def _workflow_try_lease_prepared_prefix(

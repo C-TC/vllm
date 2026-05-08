@@ -56,6 +56,13 @@ class WorkflowTestHookRecord:
     workflow_scheduler_fairness_guard_reason: str | None = None
     workflow_scheduler_queue_head_delay_ms: float | None = None
     workflow_scheduler_queue_head_delay_bucket: str | None = None
+    join_tail_scheduling_enabled: bool | None = None
+    workflow_join_tail_selected: bool | None = None
+    workflow_join_tail_reason: str | None = None
+    workflow_join_tail_scan_count: int | None = None
+    workflow_join_tail_candidate_count: int | None = None
+    workflow_join_tail_remaining_values: tuple[int, ...] | None = None
+    workflow_join_tail_fairness_guard_reason: str | None = None
     action_id: str | None = None
     action_kind: str | None = None
     lifecycle_status: str | None = None
@@ -159,6 +166,13 @@ def record_scheduler_request(
     workflow_scheduler_fairness_guard_reason: str | None = None,
     workflow_scheduler_queue_head_delay_ms: float | None = None,
     workflow_scheduler_queue_head_delay_bucket: str | None = None,
+    join_tail_scheduling_enabled: bool | None = None,
+    workflow_join_tail_selected: bool | None = None,
+    workflow_join_tail_reason: str | None = None,
+    workflow_join_tail_scan_count: int | None = None,
+    workflow_join_tail_candidate_count: int | None = None,
+    workflow_join_tail_remaining_values: tuple[int, ...] | None = None,
+    workflow_join_tail_fairness_guard_reason: str | None = None,
 ) -> None:
     internal_prefill_only_action_id = _internal_prefill_only_action_id(vllm_xargs)
     public_vllm_xargs = _public_workflow_xargs(vllm_xargs)
@@ -193,6 +207,15 @@ def record_scheduler_request(
         workflow_scheduler_queue_head_delay_ms=workflow_scheduler_queue_head_delay_ms,
         workflow_scheduler_queue_head_delay_bucket=(
             workflow_scheduler_queue_head_delay_bucket
+        ),
+        join_tail_scheduling_enabled=join_tail_scheduling_enabled,
+        workflow_join_tail_selected=workflow_join_tail_selected,
+        workflow_join_tail_reason=workflow_join_tail_reason,
+        workflow_join_tail_scan_count=workflow_join_tail_scan_count,
+        workflow_join_tail_candidate_count=workflow_join_tail_candidate_count,
+        workflow_join_tail_remaining_values=workflow_join_tail_remaining_values,
+        workflow_join_tail_fairness_guard_reason=(
+            workflow_join_tail_fairness_guard_reason
         ),
         action_id=internal_prefill_only_action_id,
         action_kind="prefix_prepare"
@@ -291,6 +314,13 @@ def _record_event(
     workflow_scheduler_fairness_guard_reason: str | None = None,
     workflow_scheduler_queue_head_delay_ms: float | None = None,
     workflow_scheduler_queue_head_delay_bucket: str | None = None,
+    join_tail_scheduling_enabled: bool | None = None,
+    workflow_join_tail_selected: bool | None = None,
+    workflow_join_tail_reason: str | None = None,
+    workflow_join_tail_scan_count: int | None = None,
+    workflow_join_tail_candidate_count: int | None = None,
+    workflow_join_tail_remaining_values: tuple[int, ...] | None = None,
+    workflow_join_tail_fairness_guard_reason: str | None = None,
     action_id: str | None = None,
     action_kind: str | None = None,
     lifecycle_status: str | None = None,
@@ -378,6 +408,15 @@ def _record_event(
         workflow_scheduler_queue_head_delay_ms=workflow_scheduler_queue_head_delay_ms,
         workflow_scheduler_queue_head_delay_bucket=(
             workflow_scheduler_queue_head_delay_bucket
+        ),
+        join_tail_scheduling_enabled=join_tail_scheduling_enabled,
+        workflow_join_tail_selected=workflow_join_tail_selected,
+        workflow_join_tail_reason=workflow_join_tail_reason,
+        workflow_join_tail_scan_count=workflow_join_tail_scan_count,
+        workflow_join_tail_candidate_count=workflow_join_tail_candidate_count,
+        workflow_join_tail_remaining_values=workflow_join_tail_remaining_values,
+        workflow_join_tail_fairness_guard_reason=(
+            workflow_join_tail_fairness_guard_reason
         ),
         action_id=action_id,
         action_kind=action_kind,

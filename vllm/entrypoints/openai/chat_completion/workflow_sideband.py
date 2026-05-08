@@ -33,6 +33,12 @@ OPTIONAL_WORKFLOW_SIDEBAND_FIELDS = (
     "cohort_shared_fields",
     "pressure_score",
     "sync_target_id",
+    "criticality_source",
+    "join_group_id",
+    "join_width",
+    "join_remaining_count",
+    "request_would_release_join",
+    "join_tail_phase",
 )
 
 ALLOWED_WORKFLOW_SIDEBAND_FIELDS = (
@@ -64,6 +70,12 @@ _INTEGER_STRING_FIELDS = {
     "stable_prefix_group_size",
     "cohort_group_size",
     "pressure_score",
+    "join_width",
+    "join_remaining_count",
+}
+_BOOLEAN_STRING_FIELDS = {
+    "request_would_release_join",
+    "join_tail_phase",
 }
 
 
@@ -135,6 +147,10 @@ def validate_workflow_sideband(
             issues.append(
                 WorkflowSidebandIssue(field, "expected non-negative integer")
             )
+    for field in _BOOLEAN_STRING_FIELDS:
+        value = vllm_xargs.get(field)
+        if isinstance(value, str) and value not in {"true", "false"}:
+            issues.append(WorkflowSidebandIssue(field, "expected boolean string"))
     if ("spawn_index" in vllm_xargs) != ("spawn_size" in vllm_xargs):
         issues.append(
             WorkflowSidebandIssue(
