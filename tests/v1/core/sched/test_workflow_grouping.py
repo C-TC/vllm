@@ -5,11 +5,13 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 from vllm.v1.core.sched.workflow_grouping import (
+    DEFAULT_WORKFLOW_GROUP_AWARE_SCAN_TIME_BUDGET_US,
     select_workflow_group_request,
     select_workflow_join_tail_request,
     workflow_group_aware_max_burst,
     workflow_group_aware_max_group_delay_ms,
     workflow_group_aware_max_queue_scan,
+    workflow_group_aware_scan_time_budget_us,
     workflow_group_aware_scheduling_enabled,
     workflow_group_aware_ungrouped_min_share,
     workflow_group_keys_for_request,
@@ -38,6 +40,7 @@ def test_workflow_grouping_env_defaults(monkeypatch) -> None:
     monkeypatch.delenv("WORKFLOW_GROUP_AWARE_MAX_QUEUE_SCAN", raising=False)
     monkeypatch.delenv("WORKFLOW_GROUP_AWARE_MAX_GROUP_DELAY_MS", raising=False)
     monkeypatch.delenv("WORKFLOW_GROUP_AWARE_UNGROUPED_MIN_SHARE", raising=False)
+    monkeypatch.delenv("WORKFLOW_GROUP_AWARE_SCAN_TIME_BUDGET_US", raising=False)
     monkeypatch.delenv("WORKFLOW_JOIN_TAIL_SCHEDULING", raising=False)
 
     assert workflow_group_aware_scheduling_enabled() is False
@@ -46,6 +49,56 @@ def test_workflow_grouping_env_defaults(monkeypatch) -> None:
     assert workflow_group_aware_max_queue_scan() == 64
     assert workflow_group_aware_max_group_delay_ms() == 200.0
     assert workflow_group_aware_ungrouped_min_share() == 0.2
+    assert (
+        workflow_group_aware_scan_time_budget_us()
+        == DEFAULT_WORKFLOW_GROUP_AWARE_SCAN_TIME_BUDGET_US
+    )
+
+
+def test_workflow_grouping_scan_time_budget_env_override(monkeypatch) -> None:
+    monkeypatch.setenv("WORKFLOW_GROUP_AWARE_SCAN_TIME_BUDGET_US", "1500")
+    assert workflow_group_aware_scan_time_budget_us() == 1500.0
+    monkeypatch.setenv("WORKFLOW_GROUP_AWARE_SCAN_TIME_BUDGET_US", "-3")
+    assert workflow_group_aware_scan_time_budget_us() == 0.0
+    monkeypatch.setenv("WORKFLOW_GROUP_AWARE_SCAN_TIME_BUDGET_US", "not-a-number")
+    assert (
+        workflow_group_aware_scan_time_budget_us()
+        == DEFAULT_WORKFLOW_GROUP_AWARE_SCAN_TIME_BUDGET_US
+    )
+
+
+def test_workflow_grouping_scan_time_budget_zero_falls_back_to_stock_head(
+    monkeypatch,
+) -> None:
+    """When the scan budget is exhausted before any candidate is found, the
+    helper must fall back to the queue head with reason stock_fallback_no_group.
+    Setting the budget to 0 forces an immediate timeout on the first bucket
+    iteration regardless of how cheap the actual scan would be.
+    """
+
+    monkeypatch.setenv("WORKFLOW_GROUP_AWARE_SCAN_TIME_BUDGET_US", "0")
+    req_a0 = _request(
+        "a0",
+        xargs={"shared_prefill_group_id": "shared-a"},
+        prompt_token_ids=[1, 2, 3, 4, 5, 6, 7, 8],
+    )
+    req_a1 = _request(
+        "a1",
+        xargs={"shared_prefill_group_id": "shared-a"},
+        prompt_token_ids=[1, 2, 3, 4, 9, 9, 9, 9],
+    )
+    selection = select_workflow_group_request(
+        [req_a0, req_a1],
+        last_group_key=None,
+        group_burst=0,
+        block_size=2,
+    )
+    assert selection is not None
+    assert selection.request is req_a0
+    # The token-LCP scan times out immediately, but the metadata fallback
+    # still finds the matching shared_prefill_group_id pair, so we get a
+    # metadata-grouping selection rather than stock_fallback_no_group.
+    assert selection.reason == "shared_prefill_group_id"
 
 
 def test_workflow_grouping_prefers_token_verified_lcp() -> None:

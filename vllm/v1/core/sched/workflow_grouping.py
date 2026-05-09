@@ -20,11 +20,19 @@ WORKFLOW_GROUP_AWARE_MAX_GROUP_DELAY_MS_ENV = (
 WORKFLOW_GROUP_AWARE_UNGROUPED_MIN_SHARE_ENV = (
     "WORKFLOW_GROUP_AWARE_UNGROUPED_MIN_SHARE"
 )
+WORKFLOW_GROUP_AWARE_SCAN_TIME_BUDGET_US_ENV = (
+    "WORKFLOW_GROUP_AWARE_SCAN_TIME_BUDGET_US"
+)
 WORKFLOW_JOIN_TAIL_SCHEDULING_ENV = "WORKFLOW_JOIN_TAIL_SCHEDULING"
 DEFAULT_WORKFLOW_GROUP_AWARE_MAX_BURST = 4
 DEFAULT_WORKFLOW_GROUP_AWARE_MAX_QUEUE_SCAN = 64
 DEFAULT_WORKFLOW_GROUP_AWARE_MAX_GROUP_DELAY_MS = 200.0
 DEFAULT_WORKFLOW_GROUP_AWARE_UNGROUPED_MIN_SHARE = 0.2
+# 5 ms wall-clock budget per scheduler iteration for the LCP scan. Stops the
+# block-split LCP from holding up the engine when the waiting queue is large
+# or has long prompts, falling back to whatever best-so-far group has been
+# found (None means stock ordering for that iteration).
+DEFAULT_WORKFLOW_GROUP_AWARE_SCAN_TIME_BUDGET_US = 5000.0
 _UNAVAILABLE_SINGLE_MODEL_ASSUMED = "unavailable_single_model_assumed"
 
 
@@ -104,6 +112,17 @@ def workflow_group_aware_ungrouped_min_share() -> float:
     return min(1.0, max(0.0, value))
 
 
+def workflow_group_aware_scan_time_budget_us() -> float:
+    raw_value = os.getenv(WORKFLOW_GROUP_AWARE_SCAN_TIME_BUDGET_US_ENV, "")
+    if not raw_value:
+        return DEFAULT_WORKFLOW_GROUP_AWARE_SCAN_TIME_BUDGET_US
+    try:
+        value = float(raw_value)
+    except ValueError:
+        return DEFAULT_WORKFLOW_GROUP_AWARE_SCAN_TIME_BUDGET_US
+    return max(0.0, value)
+
+
 def select_workflow_group_request(
     requests: Iterable[Any],
     *,
@@ -151,8 +170,21 @@ def select_workflow_group_request(
     )
     queue_head_delay_bucket = _queue_head_delay_bucket(queue_head_delay_ms)
 
+    # Build per-call snapshots of validated request data so the inner LCP
+    # scan does not re-tokenize/re-validate each request O(N^2) times. This
+    # is the single biggest perf fix; before this, _request_prompt_token_ids
+    # ran an isinstance(...) loop over every token in every request on every
+    # pair iteration, which made the scan grow as O(N^3 * T).
     scan_start_ns = time.perf_counter_ns()
-    candidate = _best_group_candidate(ordered_requests, block_size=block_size)
+    snapshots = _build_request_snapshots(ordered_requests)
+    scan_deadline_ns = scan_start_ns + int(
+        workflow_group_aware_scan_time_budget_us() * 1000.0
+    )
+    candidate = _best_group_candidate_from_snapshots(
+        snapshots,
+        block_size=block_size,
+        deadline_ns=scan_deadline_ns,
+    )
     scan_us = round((time.perf_counter_ns() - scan_start_ns) / 1000.0, 6)
     if candidate is None:
         return WorkflowGroupSelection(
@@ -500,28 +532,80 @@ def _join_tail_group_key_for_request(request: Any) -> str | None:
     return None
 
 
-def _best_group_candidate(
+@dataclass(frozen=True, slots=True)
+class _RequestSnapshot:
+    """Per-scan validated view of one waiting request.
+
+    Built once at the start of select_workflow_group_request, then reused by
+    every candidate-search subroutine. The snapshot is what makes the inner
+    LCP scan O(N * T / B) instead of O(N^3 * T): without it, helpers like
+    _request_prompt_token_ids and _request_xargs are called once per request
+    pair per iteration, and each call walks every token in the prompt to
+    type-check. Keep this dataclass cheap to construct; do not put any work
+    here that is not also amortized by every candidate-search subroutine.
+    """
+
+    rank: int
+    request: Any
+    token_ids: tuple[int, ...]  # empty tuple when invalid / missing
+    has_xargs: bool
+    model_key: str
+    token_domain_key: str
+    workflow_keys: tuple[tuple[str, str], ...]
+
+
+def _build_request_snapshots(
     requests: tuple[Any, ...],
+) -> tuple[_RequestSnapshot, ...]:
+    snapshots: list[_RequestSnapshot] = []
+    for rank, request in enumerate(requests):
+        xargs = _request_xargs(request)
+        token_ids_list = _request_prompt_token_ids(request)
+        token_ids: tuple[int, ...] = (
+            tuple(token_ids_list) if token_ids_list else ()
+        )
+        snapshots.append(
+            _RequestSnapshot(
+                rank=rank,
+                request=request,
+                token_ids=token_ids,
+                has_xargs=bool(xargs),
+                model_key=_request_model_key(request),
+                token_domain_key=_request_token_domain_key(request),
+                workflow_keys=workflow_group_keys_for_request(request),
+            )
+        )
+    return tuple(snapshots)
+
+
+def _best_group_candidate_from_snapshots(
+    snapshots: tuple[_RequestSnapshot, ...],
     *,
     block_size: int,
+    deadline_ns: int | None = None,
 ) -> _Candidate | None:
-    token_candidate = _best_token_lcp_candidate(requests, block_size=block_size)
+    token_candidate = _best_token_lcp_candidate_from_snapshots(
+        snapshots,
+        block_size=block_size,
+        deadline_ns=deadline_ns,
+    )
     if token_candidate is not None:
         return token_candidate
 
+    # Metadata grouping fallback: same algorithm as the legacy path but reads
+    # from precomputed snapshot.workflow_keys instead of re-walking xargs.
     max_key_count = max(
-        (len(workflow_group_keys_for_request(request)) for request in requests),
+        (len(snapshot.workflow_keys) for snapshot in snapshots),
         default=0,
     )
     for priority_index in range(max_key_count):
         ranks_by_key: dict[str, list[int]] = {}
         reason_by_key: dict[str, str] = {}
-        for rank, request in enumerate(requests):
-            keys = workflow_group_keys_for_request(request)
-            if priority_index >= len(keys):
+        for snapshot in snapshots:
+            if priority_index >= len(snapshot.workflow_keys):
                 continue
-            reason, group_key = keys[priority_index]
-            ranks_by_key.setdefault(group_key, []).append(rank)
+            reason, group_key = snapshot.workflow_keys[priority_index]
+            ranks_by_key.setdefault(group_key, []).append(snapshot.rank)
             reason_by_key[group_key] = reason
 
         repeated_groups = {
@@ -546,77 +630,143 @@ def _best_group_candidate(
     return None
 
 
-def _best_token_lcp_candidate(
-    requests: tuple[Any, ...],
+def _best_token_lcp_candidate_from_snapshots(
+    snapshots: tuple[_RequestSnapshot, ...],
     *,
-    block_size: int = 16,
+    block_size: int,
+    deadline_ns: int | None = None,
 ) -> _Candidate | None:
-    best: tuple[int, int, str, str, int] | None = None
-    for left_rank, left_request in enumerate(requests):
-        left_tokens = _request_prompt_token_ids(left_request)
-        if left_tokens is None or not _request_xargs(left_request):
+    """Find the longest block-aligned shared-prefix group across snapshots.
+
+    Replaces the O(N^2 * T) pairwise LCP loop with an O(N * T / B) block
+    radix split: bucket the snapshots by (model_key, token_domain_key), then
+    repeatedly partition each bucket by the next ``block_size``-token slice
+    of its members until no bucket retains >= 2 snapshots. The deepest
+    surviving bucket wins; ties are broken by smallest first rank in queue
+    so a token-aware decision is also queue-position aware.
+
+    The deadline_ns argument enforces a wall-clock budget. When the budget
+    is exceeded we return whatever best-so-far group has been observed
+    (which may be None). Callers treat None as "fall back to stock head".
+    """
+
+    if not snapshots:
+        return None
+
+    # Eligible snapshots: must have xargs metadata and a non-empty validated
+    # token sequence. Anything else cannot participate in a token-LCP group.
+    by_domain: dict[tuple[str, str], list[_RequestSnapshot]] = {}
+    for snapshot in snapshots:
+        if not snapshot.has_xargs or not snapshot.token_ids:
             continue
-        left_model_key = _request_model_key(left_request)
-        left_token_domain_key = _request_token_domain_key(left_request)
-        for right_rank in range(left_rank + 1, len(requests)):
-            right_request = requests[right_rank]
-            right_tokens = _request_prompt_token_ids(right_request)
-            if right_tokens is None or not _request_xargs(right_request):
-                continue
-            if (
-                _request_model_key(right_request) != left_model_key
-                or _request_token_domain_key(right_request) != left_token_domain_key
-            ):
-                continue
-            lcp_len = _common_prefix_len(left_tokens, right_tokens)
-            aligned_lcp_len = (lcp_len // block_size) * block_size
-            if aligned_lcp_len <= 0:
-                continue
-            lcp_hash = _hash_token_ids(left_tokens[:aligned_lcp_len])
-            group_key = (
-                "token_verified_lcp:"
-                f"model={left_model_key}:"
-                f"token_domain={left_token_domain_key}:"
-                f"len={aligned_lcp_len}:"
-                f"hash={lcp_hash}"
-            )
-            group_ranks = _token_lcp_group_ranks(
-                requests,
-                token_lcp_len=aligned_lcp_len,
-                token_lcp_hash=lcp_hash,
-                model_key=left_model_key,
-                token_domain_key=left_token_domain_key,
-            )
-            if len(group_ranks) < 2:
-                continue
-            group_first_rank = group_ranks[0]
-            if best is None or (
+        domain_key = (snapshot.model_key, snapshot.token_domain_key)
+        by_domain.setdefault(domain_key, []).append(snapshot)
+
+    # Best-so-far across all domains: (aligned_lcp_len, first_rank, hash, key, group_size).
+    best: tuple[int, int, str, str, int] | None = None
+    # Cache of hashes keyed by (id(token_ids), prefix_len). The same token
+    # sequence is referenced across many bucket splits, and recomputing
+    # sha1 over a multi-thousand-int json blob each time is the second
+    # biggest cost after the type-check loop.
+    hash_cache: dict[tuple[int, int], str] = {}
+
+    for (model_key, token_domain_key), domain_snaps in by_domain.items():
+        if len(domain_snaps) < 2:
+            continue
+        if deadline_ns is not None and time.perf_counter_ns() > deadline_ns:
+            break
+        domain_best = _block_split_best_lcp(
+            domain_snaps,
+            block_size=block_size,
+            hash_cache=hash_cache,
+            deadline_ns=deadline_ns,
+        )
+        if domain_best is None:
+            continue
+        aligned_lcp_len, first_rank, lcp_hash, group_size = domain_best
+        group_key = (
+            "token_verified_lcp:"
+            f"model={model_key}:"
+            f"token_domain={token_domain_key}:"
+            f"len={aligned_lcp_len}:"
+            f"hash={lcp_hash}"
+        )
+        if best is None or (aligned_lcp_len, -first_rank) > (best[0], -best[1]):
+            best = (
                 aligned_lcp_len,
-                -group_first_rank,
-            ) > (
-                best[0],
-                -best[1],
-            ):
-                best = (
-                    aligned_lcp_len,
-                    group_first_rank,
-                    lcp_hash,
-                    group_key,
-                    len(group_ranks),
-                )
+                first_rank,
+                lcp_hash,
+                group_key,
+                group_size,
+            )
 
     if best is None:
         return None
-    token_lcp_len, selected_rank, token_lcp_hash, group_key, group_size = best
+    aligned_lcp_len, selected_rank, token_lcp_hash, group_key, group_size = best
     return _Candidate(
         selected_rank=selected_rank,
         group_key=group_key,
         reason="token_verified_lcp",
         group_source="token_verified_lcp",
-        token_lcp_len=token_lcp_len,
+        token_lcp_len=aligned_lcp_len,
         token_lcp_hash=token_lcp_hash,
         group_size=group_size,
     )
+
+
+def _block_split_best_lcp(
+    snapshots: list[_RequestSnapshot],
+    *,
+    block_size: int,
+    hash_cache: dict[tuple[int, int], str],
+    deadline_ns: int | None,
+) -> tuple[int, int, str, int] | None:
+    """Block-radix-split LCP search within one (model, token_domain) bucket.
+
+    Returns (aligned_lcp_len, first_rank, lcp_hash, group_size) for the best
+    surviving bucket of >= 2 snapshots, or None if no two snapshots share at
+    least one full block_size of leading tokens.
+    """
+
+    if block_size <= 0:
+        return None
+    best: tuple[int, int, str, int] | None = None
+    # State: list of (lcp_len_so_far, snapshots_in_bucket).
+    current: list[tuple[int, list[_RequestSnapshot]]] = [(0, snapshots)]
+    while current:
+        if deadline_ns is not None and time.perf_counter_ns() > deadline_ns:
+            return best
+        next_buckets: list[tuple[int, list[_RequestSnapshot]]] = []
+        for lcp_len, bucket in current:
+            sub_groups: dict[tuple[int, ...], list[_RequestSnapshot]] = {}
+            for snapshot in bucket:
+                tokens = snapshot.token_ids
+                if len(tokens) < lcp_len + block_size:
+                    continue
+                next_block = tokens[lcp_len : lcp_len + block_size]
+                sub_groups.setdefault(next_block, []).append(snapshot)
+            for next_block_key, sub_snaps in sub_groups.items():
+                del next_block_key  # only used as dict key
+                if len(sub_snaps) < 2:
+                    continue
+                new_len = lcp_len + block_size
+                first_snap = sub_snaps[0]
+                first_rank = first_snap.rank
+                for snap in sub_snaps[1:]:
+                    if snap.rank < first_rank:
+                        first_rank = snap.rank
+                cache_key = (id(first_snap.token_ids), new_len)
+                lcp_hash = hash_cache.get(cache_key)
+                if lcp_hash is None:
+                    lcp_hash = _hash_token_ids(
+                        list(first_snap.token_ids[:new_len])
+                    )
+                    hash_cache[cache_key] = lcp_hash
+                if best is None or (new_len, -first_rank) > (best[0], -best[1]):
+                    best = (new_len, first_rank, lcp_hash, len(sub_snaps))
+                next_buckets.append((new_len, sub_snaps))
+        current = next_buckets
+    return best
 
 
 def _first_request_outside_group(
@@ -671,31 +821,6 @@ def _group_source_for_key(group_key: str | None) -> str | None:
     if ":" not in group_key:
         return None
     return group_key.split(":", 1)[0]
-
-
-def _token_lcp_group_ranks(
-    requests: tuple[Any, ...],
-    *,
-    token_lcp_len: int,
-    token_lcp_hash: str,
-    model_key: str,
-    token_domain_key: str,
-) -> list[int]:
-    ranks: list[int] = []
-    for rank, request in enumerate(requests):
-        if not _request_xargs(request):
-            continue
-        if (
-            _request_model_key(request) != model_key
-            or _request_token_domain_key(request) != token_domain_key
-        ):
-            continue
-        token_ids = _request_prompt_token_ids(request)
-        if token_ids is None or len(token_ids) < token_lcp_len:
-            continue
-        if _hash_token_ids(token_ids[:token_lcp_len]) == token_lcp_hash:
-            ranks.append(rank)
-    return ranks
 
 
 def _model_key_from_group_key(group_key: str) -> str:
@@ -815,15 +940,6 @@ def _request_prompt_token_ids(request: Any) -> list[int] | None:
     ):
         return None
     return token_ids
-
-
-def _common_prefix_len(left: list[int], right: list[int]) -> int:
-    prefix_len = 0
-    for left_token, right_token in zip(left, right):
-        if left_token != right_token:
-            break
-        prefix_len += 1
-    return prefix_len
 
 
 def _hash_token_ids(token_ids: list[int]) -> str:
