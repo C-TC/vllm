@@ -38,6 +38,7 @@ class WorkflowGroupSelection:
     token_lcp_len: int | None = None
     token_lcp_hash: str | None = None
     scan_count: int | None = None
+    scan_us: float | None = None
     candidate_group_size: int | None = None
     fairness_guard_reason: str | None = None
     queue_head_delay_ms: float | None = None
@@ -150,7 +151,9 @@ def select_workflow_group_request(
     )
     queue_head_delay_bucket = _queue_head_delay_bucket(queue_head_delay_ms)
 
+    scan_start_ns = time.perf_counter_ns()
     candidate = _best_group_candidate(ordered_requests, block_size=block_size)
+    scan_us = round((time.perf_counter_ns() - scan_start_ns) / 1000.0, 6)
     if candidate is None:
         return WorkflowGroupSelection(
             request=all_requests[0],
@@ -159,6 +162,7 @@ def select_workflow_group_request(
             reason="stock_fallback_no_group",
             group_source=None,
             scan_count=scan_count,
+            scan_us=scan_us,
             queue_head_delay_ms=queue_head_delay_ms,
             queue_head_delay_bucket=queue_head_delay_bucket,
         )
@@ -179,6 +183,7 @@ def select_workflow_group_request(
             reason="fairness_max_group_delay",
             group_source=_group_source_for_key(fallback_group_key),
             scan_count=scan_count,
+            scan_us=scan_us,
             candidate_group_size=candidate.group_size,
             fairness_guard_reason="max_group_delay_ms",
             queue_head_delay_ms=queue_head_delay_ms,
@@ -201,6 +206,7 @@ def select_workflow_group_request(
             reason="fairness_ungrouped_min_share",
             group_source=None,
             scan_count=scan_count,
+            scan_us=scan_us,
             candidate_group_size=candidate.group_size,
             fairness_guard_reason="ungrouped_min_share",
             queue_head_delay_ms=queue_head_delay_ms,
@@ -225,6 +231,7 @@ def select_workflow_group_request(
                 reason="fairness_burst_cap",
                 group_source=_group_source_for_key(fairness_group_key),
                 scan_count=scan_count,
+                scan_us=scan_us,
                 candidate_group_size=candidate.group_size,
                 fairness_guard_reason="max_burst",
                 queue_head_delay_ms=queue_head_delay_ms,
@@ -240,6 +247,7 @@ def select_workflow_group_request(
         token_lcp_len=candidate.token_lcp_len,
         token_lcp_hash=candidate.token_lcp_hash,
         scan_count=scan_count,
+        scan_us=scan_us,
         candidate_group_size=candidate.group_size,
         queue_head_delay_ms=queue_head_delay_ms,
         queue_head_delay_bucket=queue_head_delay_bucket,
@@ -286,7 +294,9 @@ def select_workflow_join_tail_request(
         now_s=time.time() if now_s is None else now_s,
     )
     queue_head_delay_bucket = _queue_head_delay_bucket(queue_head_delay_ms)
+    scan_start_ns = time.perf_counter_ns()
     candidates = _join_tail_candidates(ordered_requests)
+    scan_us = round((time.perf_counter_ns() - scan_start_ns) / 1000.0, 6)
     remaining_values = tuple(
         sorted(
             {
@@ -304,6 +314,7 @@ def select_workflow_join_tail_request(
             reason="stock_fallback_no_join_tail",
             group_source=None,
             scan_count=scan_count,
+            scan_us=scan_us,
             queue_head_delay_ms=queue_head_delay_ms,
             queue_head_delay_bucket=queue_head_delay_bucket,
             join_tail_scheduling_enabled=True,
@@ -335,6 +346,7 @@ def select_workflow_join_tail_request(
             reason="fairness_max_group_delay",
             group_source="join_tail",
             scan_count=scan_count,
+            scan_us=scan_us,
             candidate_group_size=len(candidates),
             fairness_guard_reason="max_group_delay_ms",
             queue_head_delay_ms=queue_head_delay_ms,
@@ -359,6 +371,7 @@ def select_workflow_join_tail_request(
             reason="fairness_burst_cap",
             group_source="join_tail",
             scan_count=scan_count,
+            scan_us=scan_us,
             candidate_group_size=len(candidates),
             fairness_guard_reason="max_burst",
             queue_head_delay_ms=queue_head_delay_ms,
@@ -384,6 +397,7 @@ def select_workflow_join_tail_request(
         reason=reason,
         group_source="join_tail",
         scan_count=scan_count,
+        scan_us=scan_us,
         candidate_group_size=len(candidates),
         queue_head_delay_ms=queue_head_delay_ms,
         queue_head_delay_bucket=queue_head_delay_bucket,

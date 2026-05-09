@@ -52,7 +52,9 @@ class WorkflowTestHookRecord:
     workflow_scheduler_token_lcp_len: int | None = None
     workflow_scheduler_token_lcp_hash: str | None = None
     workflow_scheduler_scan_count: int | None = None
+    workflow_scheduler_scan_us: float | None = None
     workflow_scheduler_candidate_group_size: int | None = None
+    workflow_scheduler_group_burst_size: int | None = None
     workflow_scheduler_fairness_guard_reason: str | None = None
     workflow_scheduler_queue_head_delay_ms: float | None = None
     workflow_scheduler_queue_head_delay_bucket: str | None = None
@@ -162,7 +164,9 @@ def record_scheduler_request(
     workflow_scheduler_token_lcp_len: int | None = None,
     workflow_scheduler_token_lcp_hash: str | None = None,
     workflow_scheduler_scan_count: int | None = None,
+    workflow_scheduler_scan_us: float | None = None,
     workflow_scheduler_candidate_group_size: int | None = None,
+    workflow_scheduler_group_burst_size: int | None = None,
     workflow_scheduler_fairness_guard_reason: str | None = None,
     workflow_scheduler_queue_head_delay_ms: float | None = None,
     workflow_scheduler_queue_head_delay_bucket: str | None = None,
@@ -200,7 +204,9 @@ def record_scheduler_request(
         workflow_scheduler_token_lcp_len=workflow_scheduler_token_lcp_len,
         workflow_scheduler_token_lcp_hash=workflow_scheduler_token_lcp_hash,
         workflow_scheduler_scan_count=workflow_scheduler_scan_count,
+        workflow_scheduler_scan_us=workflow_scheduler_scan_us,
         workflow_scheduler_candidate_group_size=workflow_scheduler_candidate_group_size,
+        workflow_scheduler_group_burst_size=workflow_scheduler_group_burst_size,
         workflow_scheduler_fairness_guard_reason=(
             workflow_scheduler_fairness_guard_reason
         ),
@@ -310,7 +316,9 @@ def _record_event(
     workflow_scheduler_token_lcp_len: int | None = None,
     workflow_scheduler_token_lcp_hash: str | None = None,
     workflow_scheduler_scan_count: int | None = None,
+    workflow_scheduler_scan_us: float | None = None,
     workflow_scheduler_candidate_group_size: int | None = None,
+    workflow_scheduler_group_burst_size: int | None = None,
     workflow_scheduler_fairness_guard_reason: str | None = None,
     workflow_scheduler_queue_head_delay_ms: float | None = None,
     workflow_scheduler_queue_head_delay_bucket: str | None = None,
@@ -401,7 +409,9 @@ def _record_event(
         workflow_scheduler_token_lcp_len=workflow_scheduler_token_lcp_len,
         workflow_scheduler_token_lcp_hash=workflow_scheduler_token_lcp_hash,
         workflow_scheduler_scan_count=workflow_scheduler_scan_count,
+        workflow_scheduler_scan_us=workflow_scheduler_scan_us,
         workflow_scheduler_candidate_group_size=workflow_scheduler_candidate_group_size,
+        workflow_scheduler_group_burst_size=workflow_scheduler_group_burst_size,
         workflow_scheduler_fairness_guard_reason=(
             workflow_scheduler_fairness_guard_reason
         ),

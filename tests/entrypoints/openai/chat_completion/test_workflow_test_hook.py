@@ -194,7 +194,9 @@ def test_workflow_test_hook_records_group_aware_scheduler_telemetry(
         workflow_scheduler_token_lcp_len=4,
         workflow_scheduler_token_lcp_hash="sha1:lcp",
         workflow_scheduler_scan_count=8,
+        workflow_scheduler_scan_us=17.25,
         workflow_scheduler_candidate_group_size=3,
+        workflow_scheduler_group_burst_size=4,
         workflow_scheduler_fairness_guard_reason="max_burst",
         workflow_scheduler_queue_head_delay_ms=42.0,
         workflow_scheduler_queue_head_delay_bucket="lt_50ms",
@@ -215,7 +217,9 @@ def test_workflow_test_hook_records_group_aware_scheduler_telemetry(
     assert record.workflow_scheduler_token_lcp_len == 4
     assert record.workflow_scheduler_token_lcp_hash == "sha1:lcp"
     assert record.workflow_scheduler_scan_count == 8
+    assert record.workflow_scheduler_scan_us == 17.25
     assert record.workflow_scheduler_candidate_group_size == 3
+    assert record.workflow_scheduler_group_burst_size == 4
     assert record.workflow_scheduler_fairness_guard_reason == "max_burst"
     assert record.workflow_scheduler_queue_head_delay_ms == 42.0
     assert record.workflow_scheduler_queue_head_delay_bucket == "lt_50ms"
@@ -223,6 +227,8 @@ def test_workflow_test_hook_records_group_aware_scheduler_telemetry(
     assert "workflow_scheduler_group_key" in file_text
     assert "workflow_scheduler_token_lcp_len" in file_text
     assert "workflow_scheduler_scan_count" in file_text
+    assert "workflow_scheduler_scan_us" in file_text
+    assert "workflow_scheduler_group_burst_size" in file_text
     assert "sha1:lcp" in file_text
     assert "[10, 20, 30, 40]" not in file_text
     assert '"prompt_token_ids"' not in file_text
