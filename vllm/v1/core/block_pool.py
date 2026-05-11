@@ -163,8 +163,23 @@ class BlockPool:
         ]
         # Free block queue that constructs and manipulates a doubly linked
         # list of free blocks (including eviction candidates when caching is
-        # enabled).
+        # enabled). Mode dispatched via WIRES_KVCACHE_VICTIM_POLICY env
+        # (default: wires_three_pool; see docs/v2/32 §2 + §2.7).
         self.free_block_queue = FreeKVCacheBlockQueue(self.blocks)
+
+        # WIRES Phase B: register the queue's update_block_hint as the
+        # callback used by SegmentRegistry.update_block_hints, so
+        # post-prefill hint flips correctly move blocks between pools
+        # in the 3-pool victim policy. Best-effort import — the
+        # OpenAI entrypoint is optional in some build configs.
+        try:
+            from vllm.entrypoints.openai.chat_completion import segment_actions
+
+            segment_actions.set_block_hint_updater(
+                self.free_block_queue.update_block_hint
+            )
+        except ImportError:
+            pass
 
         # Cache for block lookup
         self.cached_block_hash_to_block: BlockHashToBlockMap = BlockHashToBlockMap()

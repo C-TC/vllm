@@ -457,6 +457,60 @@ def test_segment_lifecycle_update_flips_block_hints(monkeypatch, tmp_path) -> No
     assert blk_c.lifecycle_hint == "no"
 
 
+def test_segment_lifecycle_update_routes_through_block_pool_queue(
+    monkeypatch, tmp_path
+) -> None:
+    """WIRES Phase B: when block_pool registers update_block_hint as the
+    updater, segment_lifecycle_update flips block hints AND moves them
+    between pools in the 3-pool queue (docs/v2/32 §2.3 + §2.7).
+    """
+
+    from vllm.v1.core.kv_cache_utils import (
+        VICTIM_POLICY_WIRES_THREE_POOL,
+        FreeKVCacheBlockQueue,
+        KVCacheBlock,
+    )
+    from vllm.entrypoints.openai.chat_completion.segment_actions import (
+        set_block_hint_updater,
+        tag_blocks_with_segment_id,
+    )
+
+    client, _handler = _make_app(monkeypatch, tmp_path)
+    prepare_resp = client.post(
+        "/v1/coopt/segment_prepare", json=_segment_prepare_action()
+    )
+    assert prepare_resp.status_code == 200
+
+    # Construct a real 3-pool queue and wire it up.
+    real_blocks = [KVCacheBlock(block_id=i) for i in range(3)]
+    queue = FreeKVCacheBlockQueue(
+        real_blocks, mode=VICTIM_POLICY_WIRES_THREE_POOL
+    )
+    set_block_hint_updater(queue.update_block_hint)
+    try:
+        # All three start in the may pool (default hint).
+        assert queue.num_free_blocks_in_pool("may") == 3
+        assert queue.num_free_blocks_in_pool("must") == 0
+
+        tag_blocks_with_segment_id(real_blocks, "seg-abc")
+
+        # Promote the segment to "must" via the HTTP endpoint.
+        resp = client.post(
+            "/v1/coopt/segment_lifecycle_update",
+            json={"segment_id": "seg-abc", "new_hint": "must"},
+        )
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["updated"] == 3
+
+        # All three blocks should now live in the must pool.
+        assert queue.num_free_blocks_in_pool("may") == 0
+        assert queue.num_free_blocks_in_pool("must") == 3
+        for blk in real_blocks:
+            assert blk.lifecycle_hint == "must"
+    finally:
+        set_block_hint_updater(None)
+
+
 def test_segment_lifecycle_update_self_heals_stale_tag(
     monkeypatch, tmp_path
 ) -> None:

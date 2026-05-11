@@ -47,6 +47,7 @@ import hashlib
 import json
 import os
 from collections import OrderedDict
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from threading import Lock
 from typing import Any
@@ -75,7 +76,40 @@ __all__ = [
     "tag_blocks_with_segment_id",
     "update_segment_lifecycle_hint",
     "mark_segment_prepare_prefilled",
+    "set_block_hint_updater",
 ]
+
+
+# WIRES Phase B: hint updates routed through the block_pool's queue.
+#
+# When a block is in the free queue, mutating ``block.lifecycle_hint``
+# directly is INSUFFICIENT under the 3-pool victim policy
+# (docs/v2/32 §2.3) — the block's pool membership won't change, so
+# the new hint has no effect on eviction order.
+#
+# block_pool registers ``free_block_queue.update_block_hint`` here at
+# startup. SegmentRegistry.update_block_hints calls this function
+# (rather than direct field assignment) so hint flips correctly move
+# blocks between pools.
+#
+# When unset (e.g. unit tests that don't construct a real block_pool),
+# ``update_block_hints`` falls back to direct assignment — pool
+# membership won't update, but that's a no-op concern in tests that
+# don't exercise the queue.
+_block_hint_updater: Callable[[Any, str], None] | None = None
+
+
+def set_block_hint_updater(fn: Callable[[Any, str], None] | None) -> None:
+    """Install (or clear) the callback used by ``SegmentRegistry.update_block_hints``
+    to flip a block's lifecycle_hint via the block_pool's queue
+    (which knows how to move it between pools).
+
+    Called by ``BlockPool.__init__`` with
+    ``self.free_block_queue.update_block_hint``. Multiple block_pool
+    instances share this module-level slot — last writer wins.
+    """
+    global _block_hint_updater
+    _block_hint_updater = fn
 
 
 # Action kinds (mirrors runner-side v2/backend/segment_action.py constants).
@@ -737,6 +771,14 @@ class SegmentRegistry:
         and reused) are removed from the reverse map.
         """
 
+        # WIRES Phase B: route the hint flip through the block_pool's
+        # queue so blocks currently in a free pool actually move to the
+        # right pool (docs/v2/32 §2.3). Falls back to direct field
+        # mutation when no updater is registered (e.g. unit tests
+        # that don't construct a real block_pool); in that fallback,
+        # pool membership is inconsistent — but those tests don't
+        # exercise eviction order.
+        updater = _block_hint_updater
         with self._lock:
             blocks = self._blocks_by_segment_id.get(segment_id, [])
             updated = 0
@@ -748,7 +790,10 @@ class SegmentRegistry:
                     skipped += 1
                     continue
                 try:
-                    blk.lifecycle_hint = new_hint
+                    if updater is not None:
+                        updater(blk, new_hint)
+                    else:
+                        blk.lifecycle_hint = new_hint
                     updated += 1
                     kept.append(blk)
                 except AttributeError:
