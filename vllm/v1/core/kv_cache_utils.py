@@ -126,6 +126,21 @@ class KVCacheBlock:
     # Whether the block is a null block that should never be cached.
     is_null: bool = False
 
+    # WIRES Phase E2: per-block lifecycle hint driving 3-priority
+    # eviction within the free queue. See docs/v2/31 §E2.
+    #   "no"   — caller has signaled the block is safe to evict ASAP.
+    #            Eviction picks these first; effectively LRU within "no".
+    #   "may"  — DEFAULT. Standard LRU-aware behavior; evicted after "no"
+    #            blocks are exhausted.
+    #   "must" — caller has signaled the block is still live; engine
+    #            avoids evicting these unless the pool is fully starved.
+    # Set by:
+    #   - request submission (per-request hint propagated to allocated blocks
+    #     via vllm_xargs["lifecycle_hint"]; see kv_cache_manager.allocate_slots)
+    #   - WIRES `/v1/coopt/segment_lifecycle_update` endpoint (deferred)
+    #   - Monitor callback after CFG events (loop exit -> "no")
+    lifecycle_hint: str = "may"
+
     @property
     def block_hash(self) -> BlockHashWithGroupId | None:
         return self._block_hash
@@ -247,6 +262,13 @@ class FreeKVCacheBlockQueue:
     def popleft_n(self, n: int) -> list[KVCacheBlock]:
         """Pop the first n free blocks and reduce num_free_blocks by n.
 
+        WIRES Phase E2: priority-aware. Walks the queue in 3 passes,
+        preferring blocks with ``lifecycle_hint`` of "no" (most safe to
+        evict), then "may" (default), then "must" (last resort). Within
+        each priority class the existing front-to-back LRU order is
+        preserved. Setting all blocks to the default "may" reproduces
+        legacy single-priority FIFO behavior exactly.
+
         Args:
             n: The number of blocks to pop.
 
@@ -256,25 +278,38 @@ class FreeKVCacheBlockQueue:
         if n == 0:
             return []
         assert self.num_free_blocks >= n
+
+        ret: list[KVCacheBlock] = []
+        for priority in ("no", "may", "must"):
+            if len(ret) == n:
+                break
+            curr = self.fake_free_list_head.next_free_block
+            while (
+                curr is not None
+                and curr is not self.fake_free_list_tail
+                and len(ret) < n
+            ):
+                nxt = curr.next_free_block
+                if curr.lifecycle_hint == priority:
+                    # Detach without going through self.remove() to avoid
+                    # double-decrement of num_free_blocks (we adjust once
+                    # at the end). Mirrors the in-place detach in the
+                    # legacy popleft_n loop.
+                    if curr.prev_free_block is not None:
+                        curr.prev_free_block.next_free_block = curr.next_free_block
+                    if curr.next_free_block is not None:
+                        curr.next_free_block.prev_free_block = curr.prev_free_block
+                    curr.prev_free_block = None
+                    curr.next_free_block = None
+                    ret.append(curr)
+                curr = nxt
+
+        if len(ret) < n:
+            raise ValueError(
+                f"Cannot pop {n} blocks (got {len(ret)}); "
+                "free queue is logically full but lifecycle hints prevented eviction"
+            )
         self.num_free_blocks -= n
-
-        curr_block = self.fake_free_list_head.next_free_block
-        # Pop n blocks from the head of the list
-        ret = []
-        for _ in range(n):
-            assert curr_block is not None
-            ret.append(curr_block)
-            last_block = curr_block
-            curr_block = curr_block.next_free_block
-            # Reset prev_free_block and next_free_block of all popped blocks
-            last_block.prev_free_block = None
-            last_block.next_free_block = None
-
-        if curr_block is not None:
-            # The queue is not empty, connect the fake head to
-            # the new first block.
-            self.fake_free_list_head.next_free_block = curr_block
-            curr_block.prev_free_block = self.fake_free_list_head
         return ret
 
     def remove(self, block: KVCacheBlock) -> None:
