@@ -100,6 +100,17 @@ class Request:
         # OpenAI router populates from the request's vllm_xargs field).
         # See docs/v2/31 §E2.
         self.lifecycle_hint: str = "may"
+        # WIRES Phase E5 (V1-native segment prewarm): per-request
+        # workflow segment id. Set from
+        # SamplingParams.extra_args["workflow_segment_id"] when the
+        # internal hidden ``submit_workflow_segment_prewarm`` request
+        # is built. The KVCacheManager propagates this onto every
+        # newly-allocated KVCacheBlock via tag_blocks_with_segment_id
+        # so subsequent segment_telemetry GETs can attribute
+        # cache_hit_count / evict_count_by_hint per segment.
+        # Default ``None`` for ordinary user-facing requests.
+        # See docs/v2/31 §E5.
+        self.segment_id: str | None = None
 
         if pooling_params is not None:
             # Pooling models.
@@ -118,6 +129,11 @@ class Request:
                 hint_raw = sampling_params.extra_args.get("lifecycle_hint")
                 if hint_raw in ("must", "may", "no"):
                     self.lifecycle_hint = hint_raw
+                segment_id_raw = sampling_params.extra_args.get(
+                    "workflow_segment_id"
+                )
+                if isinstance(segment_id_raw, str) and segment_id_raw:
+                    self.segment_id = segment_id_raw
         else:
             raise ValueError("sampling_params and pooling_params can't both be unset")
 

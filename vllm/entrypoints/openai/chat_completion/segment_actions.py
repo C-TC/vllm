@@ -74,6 +74,7 @@ __all__ = [
     "record_segment_eviction",
     "tag_blocks_with_segment_id",
     "update_segment_lifecycle_hint",
+    "mark_segment_prepare_prefilled",
 ]
 
 
@@ -661,6 +662,40 @@ class SegmentRegistry:
                 return None
             return entry.redacted_status()
 
+    def mark_prefilled(
+        self,
+        *,
+        action_id: str,
+        prefill_status: str,
+        prefill_token_count: int | None,
+    ) -> dict[str, Any]:
+        """Phase E5 — flip an entry's prefill_status after the V1 prewarm
+        prefill request completes.
+
+        ``action_id`` must match the action that originally created the
+        registry entry (via ``submit_prepare`` or ``submit_refresh``).
+        Updates the per-entry ``prefill_status`` and (optionally) the
+        ``prefill_token_count`` so segment_telemetry GETs return the
+        real engine state.
+        """
+
+        with self._lock:
+            entry = self._entries_by_action_id.get(action_id)
+            if entry is None:
+                return {"updated": False, "reject_reason": "unknown_action_id"}
+            entry.prefill_status = prefill_status
+            if (
+                isinstance(prefill_token_count, int)
+                and prefill_token_count >= 0
+            ):
+                entry.prefill_token_count = prefill_token_count
+            return {
+                "updated": True,
+                "reject_reason": None,
+                "segment_id": entry.segment_id,
+                "prefill_status": prefill_status,
+            }
+
     def reset_for_tests(self) -> None:
         with self._lock:
             self._entries_by_key.clear()
@@ -1041,6 +1076,40 @@ def tag_blocks_with_segment_id(blocks: Any, segment_id: str | None) -> None:
             _registry.register_block_for_segment(segment_id, blk)
         except AttributeError:
             continue
+
+
+def mark_segment_prepare_prefilled(
+    *,
+    action_id: str | None,
+    prefill_status: str,
+    prefill_token_count: int | None = None,
+) -> dict[str, Any]:
+    """Phase E5 — record the result of an internal segment prewarm prefill.
+
+    Called from the OpenAIServingChat ``_consume_workflow_segment_prewarm``
+    background coroutine after the hidden ``workflow_prefill_only=True``
+    request finishes (or fails). Locates the SegmentEntry by
+    ``action_id`` and updates its ``prefill_status`` so subsequent
+    ``GET /v1/coopt/segment_telemetry/{segment_id}`` calls report the
+    real engine state ("prefilled" / "prewarm_failed:..." / etc.) rather
+    than the placeholder ``"tokenize_only"`` the registry was initialised
+    with.
+
+    Returns ``{updated: bool, reject_reason: str | None}``. ``updated``
+    is True when the entry was found and mutated; False when the
+    action_id is unknown (e.g. the registry evicted the entry before
+    the async prefill returned).
+    """
+
+    if not isinstance(action_id, str) or not action_id:
+        return {"updated": False, "reject_reason": "missing_action_id"}
+    if not isinstance(prefill_status, str) or not prefill_status:
+        return {"updated": False, "reject_reason": "missing_prefill_status"}
+    return _registry.mark_prefilled(
+        action_id=action_id,
+        prefill_status=prefill_status,
+        prefill_token_count=prefill_token_count,
+    )
 
 
 def update_segment_lifecycle_hint(

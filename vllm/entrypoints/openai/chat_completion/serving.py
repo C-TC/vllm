@@ -432,6 +432,155 @@ class OpenAIServingChat(OpenAIServing):
                 reject_reason="engine_error",
             )
 
+    async def submit_workflow_segment_prewarm(
+        self,
+        action: dict[str, Any],
+    ) -> dict[str, str]:
+        """V1-native segment_prepare prewarm: hidden internal prefill request.
+
+        Phase E5 (docs/v2/31). The chat-completion segment_actions
+        module's ``_maybe_submit_segment_prewarm`` looks up
+        ``submit_workflow_segment_prewarm`` on the chat handler and
+        delegates to it when ``WORKFLOW_SEGMENT_PREPARE_MODE`` is
+        ``prewarm_observe`` / ``experimental_prewarm``. We construct an
+        engine-internal prefill-only request that:
+
+        - Carries ``workflow_prefill_only=True`` so the request is not
+          surfaced to the user (mirrors V0 ``submit_workflow_prefix_prewarm``).
+        - Threads the segment's ``lifecycle_hint`` through
+          ``SamplingParams.extra_args["lifecycle_hint"]``; this propagates
+          via ``Request.lifecycle_hint`` (Phase E2) onto every
+          freshly-allocated ``KVCacheBlock``.
+        - Threads ``workflow_segment_id`` so ``KVCacheManager`` calls
+          ``tag_blocks_with_segment_id`` on the new blocks; subsequent
+          telemetry GETs can attribute cache_hit / evict counters back
+          to the originating segment (Phase E5 + E4).
+
+        The action's ``segment_id``, ``family_id``, ``action_id``, and
+        ``expected_consumers`` are forwarded as ``workflow_segment_*``
+        extras for forensics / telemetry. Returns a dict mirroring the
+        V0 prewarm shape (``prewarm_status``) so the segment_actions
+        ``_maybe_submit_segment_prewarm`` can read it without any
+        adapter logic.
+        """
+
+        token_ids = action.get("prompt_token_ids")
+        if not isinstance(token_ids, list) or not token_ids:
+            return {"prewarm_status": "prewarm_failed:missing_token_ids"}
+        if not all(isinstance(token_id, int) for token_id in token_ids):
+            return {"prewarm_status": "prewarm_failed:invalid_token_ids"}
+        action_id = action.get("action_id")
+        if not isinstance(action_id, str) or not action_id:
+            return {"prewarm_status": "prewarm_failed:missing_action_id"}
+        if self.engine_client.errored:
+            return {"prewarm_status": "prewarm_failed:engine_error"}
+
+        segment_id = action.get("segment_id")
+        if not isinstance(segment_id, str) or not segment_id:
+            segment_id_for_extra: str | None = None
+        else:
+            segment_id_for_extra = segment_id
+        lifecycle_status_raw = action.get("lifecycle_status")
+        lifecycle_hint = (
+            lifecycle_status_raw
+            if lifecycle_status_raw in ("must", "may", "no")
+            else "may"
+        )
+        family_id = action.get("family_id")
+        expected_consumers = action.get("expected_consumers")
+
+        request_id = f"workflow-segment-prewarm-{action_id}"
+        sampling_params = SamplingParams.from_optional(
+            temperature=0.0,
+            max_tokens=1,
+            output_kind=RequestOutputKind.FINAL_ONLY,
+            extra_args={
+                "workflow_prefill_only": True,
+                "lifecycle_hint": lifecycle_hint,
+                "workflow_segment_id": segment_id_for_extra,
+                "workflow_segment_action_id": action_id,
+                "workflow_segment_family_id": family_id
+                if isinstance(family_id, str)
+                else None,
+                "workflow_segment_expected_consumers": (
+                    expected_consumers
+                    if isinstance(expected_consumers, int)
+                    else None
+                ),
+            },
+            skip_clone=True,
+        )
+        generator = self.engine_client.generate(
+            tokens_input(list(token_ids)),
+            sampling_params,
+            request_id,
+            priority=0,
+        )
+        asyncio.create_task(
+            self._consume_workflow_segment_prewarm(
+                action_id=action_id,
+                segment_id=segment_id_for_extra,
+                result_generator=generator,
+            )
+        )
+        return {
+            "prewarm_status": "prewarm_submitted",
+            "prefill_token_count": len(token_ids),
+        }
+
+    async def _consume_workflow_segment_prewarm(
+        self,
+        *,
+        action_id: str,
+        segment_id: str | None,
+        result_generator: AsyncGenerator[RequestOutput, None],
+    ) -> None:
+        """Background drain of the hidden prewarm request.
+
+        Logs the final ``prefill_status`` against the SegmentRegistry
+        entry created by the originating ``segment_prepare`` action.
+        Mirrors ``_consume_workflow_prefix_prewarm`` but uses the
+        segment-aware marker so subsequent GET
+        ``/v1/coopt/segment_telemetry/{segment_id}`` calls return
+        ``"prefilled"`` instead of the placeholder ``"tokenize_only"``.
+        """
+
+        from vllm.entrypoints.openai.chat_completion.segment_actions import (
+            mark_segment_prepare_prefilled,
+        )
+
+        unexpected_decode = False
+        prefill_token_count: int | None = None
+        try:
+            async for result in result_generator:
+                for output in result.outputs:
+                    decoded_ids = getattr(output, "token_ids", None)
+                    decoded_text = getattr(output, "text", None)
+                    if decoded_ids:
+                        if prefill_token_count is None:
+                            prefill_token_count = len(decoded_ids)
+                        # The hidden request is prefill-only (max_tokens=1);
+                        # if any actual decode tokens were emitted that's
+                        # a contract violation worth flagging.
+                        if len(decoded_ids) > 1 or decoded_text:
+                            unexpected_decode = True
+            if unexpected_decode:
+                mark_segment_prepare_prefilled(
+                    action_id=action_id,
+                    prefill_status="prewarm_failed:unexpected_decode_token",
+                )
+                return
+            mark_segment_prepare_prefilled(
+                action_id=action_id,
+                prefill_status="prefilled",
+                prefill_token_count=prefill_token_count,
+            )
+        except Exception:  # noqa: BLE001
+            mark_segment_prepare_prefilled(
+                action_id=action_id,
+                prefill_status="prewarm_failed:engine_error",
+            )
+
     async def create_chat_completion(
         self,
         request: ChatCompletionRequest,

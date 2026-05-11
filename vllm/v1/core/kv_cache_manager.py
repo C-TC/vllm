@@ -495,6 +495,28 @@ class KVCacheManager:
                 for blk in group_blocks:
                     blk.lifecycle_hint = request_hint
 
+        # WIRES Phase E5: when the request carries a workflow_segment_id
+        # (set by submit_workflow_segment_prewarm via SamplingParams.extra_args
+        # ["workflow_segment_id"]), tag every freshly-allocated block so
+        # segment_telemetry can attribute cache_hit_count / evict_count_by_hint
+        # back to the originating segment. Skipped for ordinary user-facing
+        # requests where segment_id is None.
+        request_segment_id = getattr(request, "segment_id", None)
+        if isinstance(request_segment_id, str) and request_segment_id:
+            try:
+                from vllm.entrypoints.openai.chat_completion.segment_actions import (
+                    tag_blocks_with_segment_id,
+                )
+            except ImportError:
+                # Defensive: chat_completion module is optional in some
+                # build configs; segment tagging is purely opt-in.
+                tag_blocks_with_segment_id = None
+            if tag_blocks_with_segment_id is not None:
+                for group_blocks in new_blocks:
+                    tag_blocks_with_segment_id(
+                        list(group_blocks), request_segment_id
+                    )
+
         # P/D: delay caching blocks if we have to recv from
         # remote. Update state for locally cached blocks.
         if not self.enable_caching or delay_cache_blocks:
