@@ -179,234 +179,319 @@ class KVCacheBlock:
         )
 
 
-class FreeKVCacheBlockQueue:
-    """This class organizes a list of KVCacheBlock objects to a doubly linked
-    list of free blocks. We implement this class instead of using Python
-    builtin deque to support removing a block in the middle of the queue
-    in O(1) time. To close the performance gap to the builtin deque which is
-    implemented in C++, this class does not allocate any Python objects when
-    manipulating the linked list. Instead, this class manipulates the
-    prev_free_block and next_free_block attributes of the given blocks.
+class _PoolList:
+    """Internal: one pool's doubly-linked list (fake-head/tail sentinel
+    pattern). Not part of FreeKVCacheBlockQueue's public API.
 
-    The queue is ordered by block ID in the beginning. When a block is allocated
-    and then freed, it will be appended back with the eviction order:
-    1. The least recent used block is at the front (LRU).
-    2. If two blocks have the same last accessed time (allocated by the
-       same sequence), the one with more hash tokens (the tail of a block
-       chain) is at the front.
-    Note that we maintain this order by reversing the block order when free
-    blocks of a request. This operation is outside of this class.
-
-    Args:
-        blocks: A list of KVCacheBlock objects.
+    Operations are O(1); does not allocate Python objects per call,
+    matching the performance contract of the legacy single-queue impl.
     """
 
-    def __init__(self, blocks: list[KVCacheBlock]) -> None:
-        self.num_free_blocks = len(blocks)
+    __slots__ = ("head", "tail", "size")
 
-        # Initialize doubly links of consecutive blocks
-        for i in range(self.num_free_blocks):
-            if i > 0:
-                blocks[i].prev_free_block = blocks[i - 1]
-            if i < self.num_free_blocks - 1:
-                blocks[i].next_free_block = blocks[i + 1]
+    def __init__(self) -> None:
+        self.head = KVCacheBlock(block_id=-1)
+        self.tail = KVCacheBlock(block_id=-1)
+        self.head.next_free_block = self.tail
+        self.tail.prev_free_block = self.head
+        self.size = 0
 
-        # Create a fake head and a tail block for the doubly linked list to
-        # reduce branching in the code
-        #
-        # The implementation guaranteed that the fake head and tail
-        # are NEVER got popped, so we could safely assume each real blocks
-        # in the queue has prev and next blocks.
-        self.fake_free_list_head = KVCacheBlock(block_id=-1)
-        self.fake_free_list_tail = KVCacheBlock(block_id=-1)
-        if self.num_free_blocks > 0:
-            # Connect fake_head and fake_tail to the first and last block
-            # respectively.
-            self.fake_free_list_head.next_free_block = blocks[0]
-            blocks[0].prev_free_block = self.fake_free_list_head
-            self.fake_free_list_tail.prev_free_block = blocks[-1]
-            blocks[-1].next_free_block = self.fake_free_list_tail
-        else:
-            # For empty list, simply connect the fake head and tail.
-            self.fake_free_list_head.next_free_block = self.fake_free_list_tail
-            self.fake_free_list_tail.prev_free_block = self.fake_free_list_head
+    def append(self, block: "KVCacheBlock") -> None:
+        last = self.tail.prev_free_block
+        assert last is not None
+        last.next_free_block = block
+        block.prev_free_block = last
+        block.next_free_block = self.tail
+        self.tail.prev_free_block = block
+        self.size += 1
 
+    def append_many(self, blocks: list["KVCacheBlock"]) -> None:
+        if not blocks:
+            return
+        last = self.tail.prev_free_block
+        assert last is not None
+        for b in blocks:
+            b.prev_free_block = last
+            last.next_free_block = b
+            last = b
+        last.next_free_block = self.tail
+        self.tail.prev_free_block = last
+        self.size += len(blocks)
+
+    def remove(self, block: "KVCacheBlock") -> None:
+        prev = block.prev_free_block
+        nxt = block.next_free_block
+        assert prev is not None and nxt is not None, (
+            f"remove() called on a block not in this pool: {block}"
+        )
+        prev.next_free_block = nxt
+        nxt.prev_free_block = prev
+        block.prev_free_block = None
+        block.next_free_block = None
+        self.size -= 1
+
+    def popleft_one(self) -> "KVCacheBlock | None":
+        first = self.head.next_free_block
+        if first is self.tail or first is None:
+            return None
+        nxt = first.next_free_block
+        assert nxt is not None
+        self.head.next_free_block = nxt
+        nxt.prev_free_block = self.head
+        first.prev_free_block = None
+        first.next_free_block = None
+        self.size -= 1
+        return first
+
+    def iter_blocks(self) -> Iterator["KVCacheBlock"]:
+        b = self.head.next_free_block
+        while b is not None and b is not self.tail:
+            yield b
+            b = b.next_free_block
+
+
+VICTIM_POLICY_WIRES_THREE_POOL = "wires_three_pool"
+VICTIM_POLICY_PURE_LRU = "pure_lru"
+SUPPORTED_VICTIM_POLICIES = (VICTIM_POLICY_WIRES_THREE_POOL, VICTIM_POLICY_PURE_LRU)
+
+
+def _resolve_victim_policy_from_env() -> str:
+    """Resolve ``WIRES_KVCACHE_VICTIM_POLICY`` env var to a known mode.
+
+    Defaults to ``wires_three_pool`` (the WIRES design, docs/v2/32 §2).
+    Set to ``pure_lru`` to run baseline / related-work comparisons with
+    stock vLLM single-FIFO behavior — lifecycle hints are ignored and
+    every block flows through one queue in insertion order.
+    """
+    raw = os.environ.get("WIRES_KVCACHE_VICTIM_POLICY", VICTIM_POLICY_WIRES_THREE_POOL)
+    if raw not in SUPPORTED_VICTIM_POLICIES:
+        raise ValueError(
+            f"Unknown WIRES_KVCACHE_VICTIM_POLICY={raw!r}; "
+            f"supported values: {SUPPORTED_VICTIM_POLICIES}"
+        )
+    return raw
+
+
+class FreeKVCacheBlockQueue:
+    """Mode-dispatched eviction queue.
+
+    Mode is resolved from ``WIRES_KVCACHE_VICTIM_POLICY`` (or the
+    explicit ``mode=`` kwarg, primarily for testing):
+
+      - ``wires_three_pool`` (default): 3-pool design per docs/v2/32 §2.
+        Internally maintains three independent doubly-linked lists, one
+        per ``lifecycle_hint`` value (``no`` / ``may`` / ``must``).
+        ``popleft_n`` walks pools in priority order; each step is O(k)
+        on its own pool — no full-queue scans.
+
+      - ``pure_lru``: stock vLLM single-FIFO behavior. Every block is
+        placed in the may pool regardless of its lifecycle_hint;
+        ``popleft_n`` returns from may in insertion order. Lifecycle
+        hints become advisory metadata (still tracked on the block,
+        ignored by eviction). Use this mode for baseline / related-work
+        comparisons that need stock vLLM's exact eviction policy.
+
+    Public API is preserved relative to the legacy implementation:
+      - ``popleft()``, ``popleft_n(n)``, ``append(block)``,
+        ``append_n(blocks)``, ``remove(block)``, ``num_free_blocks``,
+        ``get_all_free_blocks()``.
+      - Backward-compat: blocks default ``lifecycle_hint = "may"`` →
+        all legacy paths land in the may pool, reproducing legacy LRU
+        exactly. Existing tests pass against either mode.
+
+    New API (used by Phase B):
+      - ``update_block_hint(block, new_hint)`` — flip a block's hint
+        and move pools if it's currently in the queue. No-op in
+        ``pure_lru`` mode (hint is metadata only).
+
+    Telemetry: ``must_pool_evicted_count`` (docs/v2/32 §2.6) increments
+    when ``popleft_n`` takes blocks from the must pool. Always 0 in
+    ``pure_lru`` mode (no must pool concept).
+    """
+
+    POOL_ORDER: tuple[str, str, str] = ("no", "may", "must")
+
+    def __init__(
+        self,
+        blocks: list[KVCacheBlock],
+        mode: str | None = None,
+    ) -> None:
+        self.mode: str = mode if mode is not None else _resolve_victim_policy_from_env()
+        if self.mode not in SUPPORTED_VICTIM_POLICIES:
+            raise ValueError(
+                f"Unknown FreeKVCacheBlockQueue mode={self.mode!r}; "
+                f"supported: {SUPPORTED_VICTIM_POLICIES}"
+            )
+
+        self._pools: dict[str, _PoolList] = {
+            name: _PoolList() for name in self.POOL_ORDER
+        }
+        # Track which pool each block was placed in. Looking up by
+        # block_id avoids reading ``block.lifecycle_hint`` at remove
+        # time — that field can be mutated externally between insert
+        # and remove (e.g. via segment hint update); pool membership
+        # must remain consistent regardless.
+        self._pool_of: dict[int, str] = {}
+        for block in blocks:
+            pool_name = self._pool_for_block(block)
+            self._pools[pool_name].append(block)
+            self._pool_of[block.block_id] = pool_name
+
+        # Telemetry counter (docs/v2/32 §2.6). Always 0 in pure_lru mode.
+        self.must_pool_evicted_count: int = 0
+
+    def _pool_for_block(self, block: KVCacheBlock) -> str:
+        """Resolve which pool ``block`` should land in given the active mode."""
+        if self.mode == VICTIM_POLICY_PURE_LRU:
+            return "may"
+        pool_name = block.lifecycle_hint
+        if pool_name not in self._pools:
+            pool_name = "may"
+        return pool_name
+
+    # --- Backward-compat fake-head/tail aliases ---------------------------
+    # Legacy tests inspect ``fake_free_list_head`` / ``fake_free_list_tail``
+    # directly. Default-may blocks all land in the may pool, so exposing
+    # the may pool's sentinels here lets those tests continue to pass.
+    @property
+    def fake_free_list_head(self) -> KVCacheBlock:
+        return self._pools["may"].head
+
+    @property
+    def fake_free_list_tail(self) -> KVCacheBlock:
+        return self._pools["may"].tail
+
+    # --- Aggregate state --------------------------------------------------
+    @property
+    def num_free_blocks(self) -> int:
+        return self._pools["no"].size + self._pools["may"].size + self._pools["must"].size
+
+    def num_free_blocks_in_pool(self, pool: str) -> int:
+        return self._pools[pool].size
+
+    # --- Pop primitives ---------------------------------------------------
     def popleft(self) -> KVCacheBlock:
-        """Pop the first free block and reduce num_free_blocks by 1.
-
-        Returns:
-            The first free block.
-        """
-        if (
-            self.fake_free_list_head.next_free_block is self.fake_free_list_tail
-            or self.fake_free_list_head.next_free_block is None
-        ):
-            assert self.num_free_blocks == 0, (
-                f"num_free_blocks ({self.num_free_blocks}) is out of sync "
-                "with the free list."
-            )
-            raise ValueError("No free blocks available")
-
-        first_block: KVCacheBlock = self.fake_free_list_head.next_free_block
-
-        if first_block.next_free_block is None:
-            # This should not happen if the block is from the free list.
-            # It indicates a bug in the caller's logic.
-            raise RuntimeError(
-                "Invalid block found in popleft() "
-                "which doesn't have a valid next_free_block"
-            )
-
-        # Connect fake_head and the next block of first_block (i.e. second block
-        # or fake tail).
-        self.fake_free_list_head.next_free_block = first_block.next_free_block
-        first_block.next_free_block.prev_free_block = self.fake_free_list_head
-
-        # Remove the block from the linked list.
-        first_block.prev_free_block = first_block.next_free_block = None
-
-        self.num_free_blocks -= 1
-        return first_block
+        """Pop the oldest block across all pools, in priority order."""
+        for name in self.POOL_ORDER:
+            blk = self._pools[name].popleft_one()
+            if blk is not None:
+                self._pool_of.pop(blk.block_id, None)
+                if name == "must":
+                    self.must_pool_evicted_count += 1
+                return blk
+        raise ValueError("No free blocks available")
 
     def popleft_n(self, n: int) -> list[KVCacheBlock]:
-        """Pop the first n free blocks and reduce num_free_blocks by n.
+        """Pop n blocks per the 3-pool priority algorithm (docs/v2/32 §2.2).
 
-        WIRES Phase E2: priority-aware. Walks the queue in 3 passes,
-        preferring blocks with ``lifecycle_hint`` of "no" (most safe to
-        evict), then "may" (default), then "must" (last resort). Within
-        each priority class the existing front-to-back LRU order is
-        preserved. Setting all blocks to the default "may" reproduces
-        legacy single-priority FIFO behavior exactly.
-
-        Args:
-            n: The number of blocks to pop.
-
-        Returns:
-            A list of n free blocks.
+        Takes from no pool (oldest first) up to n, then may pool, then
+        must pool. Each step walks only its own pool's tail end — no
+        full-queue scans.
         """
         if n == 0:
             return []
-        assert self.num_free_blocks >= n
 
         ret: list[KVCacheBlock] = []
-        for priority in ("no", "may", "must"):
+        must_taken = 0
+        for name in self.POOL_ORDER:
+            pool = self._pools[name]
+            while pool.size > 0 and len(ret) < n:
+                blk = pool.popleft_one()
+                assert blk is not None
+                self._pool_of.pop(blk.block_id, None)
+                ret.append(blk)
+                if name == "must":
+                    must_taken += 1
             if len(ret) == n:
                 break
-            curr = self.fake_free_list_head.next_free_block
-            while (
-                curr is not None
-                and curr is not self.fake_free_list_tail
-                and len(ret) < n
-            ):
-                nxt = curr.next_free_block
-                if curr.lifecycle_hint == priority:
-                    # Detach without going through self.remove() to avoid
-                    # double-decrement of num_free_blocks (we adjust once
-                    # at the end). Mirrors the in-place detach in the
-                    # legacy popleft_n loop.
-                    if curr.prev_free_block is not None:
-                        curr.prev_free_block.next_free_block = curr.next_free_block
-                    if curr.next_free_block is not None:
-                        curr.next_free_block.prev_free_block = curr.prev_free_block
-                    curr.prev_free_block = None
-                    curr.next_free_block = None
-                    ret.append(curr)
-                curr = nxt
 
         if len(ret) < n:
             raise ValueError(
                 f"Cannot pop {n} blocks (got {len(ret)}); "
                 "free queue is logically full but lifecycle hints prevented eviction"
             )
-        self.num_free_blocks -= n
+
+        if must_taken > 0:
+            self.must_pool_evicted_count += must_taken
         return ret
 
-    def remove(self, block: KVCacheBlock) -> None:
-        """Remove a block in the free list and reduce num_free_blocks by 1.
-
-        Args:
-            block: The block to remove.
-        """
-        if block.prev_free_block is None or block.next_free_block is None:
-            # This should not happen if the block is from the free list.
-            # It indicates a bug in the caller's logic.
-            raise RuntimeError(f"remove() called on an invalid block: {block}")
-
-        # Link the previous block to the next block.
-        block.prev_free_block.next_free_block = block.next_free_block
-        # Link the next block to the previous block.
-        block.next_free_block.prev_free_block = block.prev_free_block
-
-        # Remove the block from the linked list.
-        block.prev_free_block = block.next_free_block = None
-        self.num_free_blocks -= 1
-
+    # --- Insert / remove primitives ---------------------------------------
     def append(self, block: KVCacheBlock) -> None:
-        """Put a block back into the free list and increase
-        num_free_blocks by 1.
-
-        Args:
-            block: The block to append.
-        """
-        if self.fake_free_list_tail.prev_free_block is None:
-            raise RuntimeError(
-                "prev_free_block of fake_free_list_tail should always exist"
-            )
-        last_block: KVCacheBlock = self.fake_free_list_tail.prev_free_block
-
-        # Connect the new block after the last block.
-        last_block.next_free_block = block
-        block.prev_free_block = last_block
-
-        # Connect the fake tail after the new block.
-        block.next_free_block = self.fake_free_list_tail
-        self.fake_free_list_tail.prev_free_block = block
-
-        self.num_free_blocks += 1
+        """Append block to the pool that matches its current lifecycle_hint
+        (always the may pool in ``pure_lru`` mode)."""
+        pool_name = self._pool_for_block(block)
+        self._pools[pool_name].append(block)
+        self._pool_of[block.block_id] = pool_name
 
     def append_n(self, blocks: list[KVCacheBlock]) -> None:
-        """Put a list of blocks back into the free list
+        """Bulk append; groups by destination pool to do one splice per pool."""
+        if not blocks:
+            return
+        by_pool: dict[str, list[KVCacheBlock]] = {n: [] for n in self.POOL_ORDER}
+        for b in blocks:
+            pool_name = self._pool_for_block(b)
+            by_pool[pool_name].append(b)
+            self._pool_of[b.block_id] = pool_name
+        for name, group in by_pool.items():
+            if group:
+                self._pools[name].append_many(group)
 
-        Args:
-            blocks: The blocks to append.
+    def remove(self, block: KVCacheBlock) -> None:
+        """Remove block from whichever pool it's currently in."""
+        pool_name = self._pool_of.pop(block.block_id, None)
+        if pool_name is None:
+            raise RuntimeError(f"remove() called on an unknown block: {block}")
+        self._pools[pool_name].remove(block)
+
+    # --- Phase B / external hint update ------------------------------------
+    def update_block_hint(self, block: KVCacheBlock, new_hint: str) -> None:
+        """Update a block's lifecycle_hint, moving pools if necessary.
+
+        ``wires_three_pool`` mode: if the block is in a free pool and
+        the hint change crosses a pool boundary, splice it into the
+        new pool's tail. In-use blocks (not in a queue) just have
+        their metadata updated; pool placement resolves at next
+        append().
+
+        ``pure_lru`` mode: hint is metadata only. Updates the field
+        but never moves blocks between pools (everything is in may).
+
+        Used by Phase B (segment_actions.update_block_hints) so that
+        post-prefill hint flips propagate to pool membership.
         """
-        if len(blocks) == 0:
+        if new_hint not in self._pools:
+            new_hint = "may"
+        if block.lifecycle_hint == new_hint:
             return
 
-        last_block = self.fake_free_list_tail.prev_free_block
-        assert last_block is not None, (
-            "prev_free_block of fake_free_list_tail should always exist"
-        )
-        # Add inter-connections between consecutive blocks
-        for block in blocks:
-            block.prev_free_block = last_block
-            last_block.next_free_block = block
-            last_block = block
+        if self.mode == VICTIM_POLICY_PURE_LRU:
+            # Hint is metadata only; never move pools.
+            block.lifecycle_hint = new_hint
+            return
 
-        # Connect the last block of <blocks> to the fake tail
-        last_block.next_free_block = self.fake_free_list_tail
-        self.fake_free_list_tail.prev_free_block = last_block
-
-        self.num_free_blocks += len(blocks)
+        current_pool = self._pool_of.get(block.block_id)
+        if current_pool is not None:
+            # Block is in a free pool — move it.
+            self._pools[current_pool].remove(block)
+            block.lifecycle_hint = new_hint
+            self._pools[new_hint].append(block)
+            self._pool_of[block.block_id] = new_hint
+        else:
+            # Block is in-use; just update the metadata. Pool placement
+            # will be resolved at next append().
+            block.lifecycle_hint = new_hint
 
     def get_all_free_blocks(self) -> list[KVCacheBlock]:
-        """Get all free blocks in the free list. Mainly used for testing.
+        """Get all free blocks across all pools, ordered no → may → must.
 
-        Returns:
-            A list of free blocks.
+        Within each pool the natural front-to-back order is preserved
+        (LRU first). For the legacy all-default case (every block has
+        ``lifecycle_hint = "may"``), this reproduces exactly the
+        single-queue insertion order.
         """
-        ret = []
-        if self.fake_free_list_head.next_free_block is None:
-            raise RuntimeError(
-                "next_free_block of fake_free_list_head should always exist"
-            )
-        # Start from the first block
-        curr_block: KVCacheBlock = self.fake_free_list_head.next_free_block
-        # As long as next_free_block is available, we haven't reached to
-        # the fake tail yet.
-        while curr_block.next_free_block is not None:
-            ret.append(curr_block)
-            curr_block = curr_block.next_free_block
+        ret: list[KVCacheBlock] = []
+        for name in self.POOL_ORDER:
+            ret.extend(self._pools[name].iter_blocks())
         return ret
 
 

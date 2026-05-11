@@ -21,6 +21,8 @@ from vllm.utils.hashing import sha256, sha256_cbor
 from vllm.utils.mem_constants import GiB_bytes
 from vllm.v1.core.kv_cache_manager import KVCacheManager
 from vllm.v1.core.kv_cache_utils import (
+    VICTIM_POLICY_PURE_LRU,
+    VICTIM_POLICY_WIRES_THREE_POOL,
     BlockHash,
     FreeKVCacheBlockQueue,
     KVCacheBlock,
@@ -483,6 +485,197 @@ def test_free_kv_cache_block_queue_get_all_free_blocks():
     # Append a block back and check again
     queue.append(block_to_remove)
     assert queue.get_all_free_blocks() == blocks[1:2] + blocks[3:] + [block_to_remove]
+
+
+# -- WIRES docs/v2/32 §2 — 3-pool victim policy + pure_lru baseline mode -----
+
+
+def test_three_pool_no_pressure_lru_within_may_matches_legacy():
+    """Under no eviction pressure, all-default-may blocks behave as plain LRU.
+
+    Reproduces docs/v2/32 §2.2 property: "when `no` and `may` pools have
+    enough blocks, `must` blocks are never touched. Under no pressure,
+    behaviour is exactly LRU within may (matches legacy)."
+    """
+    blocks = [KVCacheBlock(block_id=i) for i in range(8)]
+    queue = FreeKVCacheBlockQueue(blocks, mode=VICTIM_POLICY_WIRES_THREE_POOL)
+    assert queue.num_free_blocks == 8
+    assert queue.num_free_blocks_in_pool("may") == 8
+    assert queue.num_free_blocks_in_pool("no") == 0
+    assert queue.num_free_blocks_in_pool("must") == 0
+    assert queue.popleft_n(3) == blocks[:3]
+    assert queue.must_pool_evicted_count == 0
+
+
+def test_three_pool_priority_no_then_may_then_must():
+    """popleft_n consumes pools in priority order regardless of insert order."""
+    blocks = [KVCacheBlock(block_id=i) for i in range(6)]
+    blocks[0].lifecycle_hint = "must"
+    blocks[1].lifecycle_hint = "must"
+    blocks[2].lifecycle_hint = "may"
+    blocks[3].lifecycle_hint = "no"
+    blocks[4].lifecycle_hint = "may"
+    blocks[5].lifecycle_hint = "no"
+    queue = FreeKVCacheBlockQueue(blocks, mode=VICTIM_POLICY_WIRES_THREE_POOL)
+    assert queue.num_free_blocks_in_pool("no") == 2
+    assert queue.num_free_blocks_in_pool("may") == 2
+    assert queue.num_free_blocks_in_pool("must") == 2
+
+    # Pop 3 → both no (in insertion order), then first may
+    out = queue.popleft_n(3)
+    assert out == [blocks[3], blocks[5], blocks[2]]
+    assert queue.must_pool_evicted_count == 0
+
+    # Pop 2 → remaining may, then first must (signal fires)
+    out = queue.popleft_n(2)
+    assert out == [blocks[4], blocks[0]]
+    assert queue.must_pool_evicted_count == 1
+
+    # Pop last → second must
+    out = queue.popleft_n(1)
+    assert out == [blocks[1]]
+    assert queue.must_pool_evicted_count == 2
+
+
+def test_three_pool_must_pool_evicted_signal_batches():
+    """must_pool_evicted_count records total must-blocks taken in one popleft_n."""
+    blocks = [KVCacheBlock(block_id=i) for i in range(4)]
+    for b in blocks:
+        b.lifecycle_hint = "must"
+    queue = FreeKVCacheBlockQueue(blocks, mode=VICTIM_POLICY_WIRES_THREE_POOL)
+    queue.popleft_n(3)
+    # 3 must-blocks taken in one call → counter += 3
+    assert queue.must_pool_evicted_count == 3
+
+
+def test_three_pool_update_block_hint_moves_pools_when_in_queue():
+    """Phase B: update_block_hint flips a free block's pool membership."""
+    blocks = [KVCacheBlock(block_id=i) for i in range(3)]
+    blocks[0].lifecycle_hint = "may"
+    blocks[1].lifecycle_hint = "may"
+    blocks[2].lifecycle_hint = "may"
+    queue = FreeKVCacheBlockQueue(blocks, mode=VICTIM_POLICY_WIRES_THREE_POOL)
+
+    # Promote block 1 to must — it should leave may pool, land in must tail.
+    queue.update_block_hint(blocks[1], "must")
+    assert blocks[1].lifecycle_hint == "must"
+    assert queue.num_free_blocks_in_pool("may") == 2
+    assert queue.num_free_blocks_in_pool("must") == 1
+
+    # Pop 2 → both may (block 0, block 2); must (block 1) untouched.
+    out = queue.popleft_n(2)
+    assert out == [blocks[0], blocks[2]]
+    assert queue.must_pool_evicted_count == 0
+
+    # Pop the last → block 1 from must.
+    out = queue.popleft_n(1)
+    assert out == [blocks[1]]
+    assert queue.must_pool_evicted_count == 1
+
+
+def test_three_pool_update_block_hint_noop_for_in_use_block():
+    """Hint update on a block not in the queue (in-use) just sets metadata."""
+    blocks = [KVCacheBlock(block_id=i) for i in range(2)]
+    queue = FreeKVCacheBlockQueue(blocks, mode=VICTIM_POLICY_WIRES_THREE_POOL)
+    # Pop block 0 → it's now "in-use" (out of queue).
+    popped = queue.popleft_n(1)
+    assert popped == [blocks[0]]
+    # Update hint on the out-of-queue block — should not crash, just set field.
+    queue.update_block_hint(blocks[0], "must")
+    assert blocks[0].lifecycle_hint == "must"
+    assert queue.num_free_blocks == 1  # only block 1 still in queue
+
+
+def test_three_pool_update_block_hint_idempotent_on_same_value():
+    """update_block_hint is no-op when current hint == new hint."""
+    blocks = [KVCacheBlock(block_id=i) for i in range(1)]
+    queue = FreeKVCacheBlockQueue(blocks, mode=VICTIM_POLICY_WIRES_THREE_POOL)
+    queue.update_block_hint(blocks[0], "may")  # already may
+    assert queue.num_free_blocks_in_pool("may") == 1
+
+
+def test_three_pool_append_n_routes_per_block_hint():
+    """Bulk append_n splits a mixed-hint batch across pools."""
+    blocks = [KVCacheBlock(block_id=i) for i in range(4)]
+    blocks[0].lifecycle_hint = "must"
+    blocks[1].lifecycle_hint = "no"
+    blocks[2].lifecycle_hint = "may"
+    blocks[3].lifecycle_hint = "must"
+    queue = FreeKVCacheBlockQueue([], mode=VICTIM_POLICY_WIRES_THREE_POOL)
+    assert queue.num_free_blocks == 0
+    queue.append_n(blocks)
+    assert queue.num_free_blocks_in_pool("no") == 1
+    assert queue.num_free_blocks_in_pool("may") == 1
+    assert queue.num_free_blocks_in_pool("must") == 2
+
+
+def test_three_pool_remove_after_external_hint_mutation_does_not_corrupt():
+    """If lifecycle_hint is mutated externally (without going through
+    update_block_hint), remove() still finds the block in its original pool.
+    Pool membership is tracked by block_id, not by reading the hint at
+    remove time — this is the docs/v2/32 §2.5 invariant.
+    """
+    blocks = [KVCacheBlock(block_id=i) for i in range(3)]
+    queue = FreeKVCacheBlockQueue(blocks, mode=VICTIM_POLICY_WIRES_THREE_POOL)
+    # External mutation (the kind segment_actions used to do pre-Phase B):
+    blocks[1].lifecycle_hint = "must"  # block stays in may pool!
+    # remove() must still find block 1 in may pool.
+    queue.remove(blocks[1])
+    assert queue.num_free_blocks == 2
+    assert queue.num_free_blocks_in_pool("may") == 2
+
+
+def test_pure_lru_mode_ignores_lifecycle_hint():
+    """`pure_lru` mode reproduces stock vLLM single-FIFO behaviour."""
+    blocks = [KVCacheBlock(block_id=i) for i in range(6)]
+    blocks[0].lifecycle_hint = "must"
+    blocks[1].lifecycle_hint = "must"
+    blocks[2].lifecycle_hint = "no"
+    blocks[3].lifecycle_hint = "may"
+    blocks[4].lifecycle_hint = "must"
+    blocks[5].lifecycle_hint = "no"
+    queue = FreeKVCacheBlockQueue(blocks, mode=VICTIM_POLICY_PURE_LRU)
+    # All blocks land in may pool regardless of hint.
+    assert queue.num_free_blocks_in_pool("may") == 6
+    assert queue.num_free_blocks_in_pool("no") == 0
+    assert queue.num_free_blocks_in_pool("must") == 0
+    # popleft_n returns blocks in insertion order (legacy FIFO).
+    assert queue.popleft_n(6) == blocks
+    # must_pool_evicted_count never increments (no must pool concept).
+    assert queue.must_pool_evicted_count == 0
+
+
+def test_pure_lru_mode_update_block_hint_does_not_move_pools():
+    """`pure_lru` treats lifecycle_hint as metadata only — never moves blocks."""
+    blocks = [KVCacheBlock(block_id=i) for i in range(2)]
+    queue = FreeKVCacheBlockQueue(blocks, mode=VICTIM_POLICY_PURE_LRU)
+    queue.update_block_hint(blocks[0], "must")
+    # Field updated but block stays in may pool.
+    assert blocks[0].lifecycle_hint == "must"
+    assert queue.num_free_blocks_in_pool("may") == 2
+    assert queue.num_free_blocks_in_pool("must") == 0
+    # Eviction order is still pure FIFO (block 0 first).
+    assert queue.popleft_n(1) == [blocks[0]]
+
+
+def test_victim_policy_env_var_default_is_wires_three_pool(monkeypatch):
+    """Absent env var → wires_three_pool is the default."""
+    monkeypatch.delenv("WIRES_KVCACHE_VICTIM_POLICY", raising=False)
+    queue = FreeKVCacheBlockQueue([])
+    assert queue.mode == VICTIM_POLICY_WIRES_THREE_POOL
+
+
+def test_victim_policy_env_var_pure_lru(monkeypatch):
+    """Setting env to pure_lru opts into baseline mode."""
+    monkeypatch.setenv("WIRES_KVCACHE_VICTIM_POLICY", VICTIM_POLICY_PURE_LRU)
+    queue = FreeKVCacheBlockQueue([])
+    assert queue.mode == VICTIM_POLICY_PURE_LRU
+
+
+def test_victim_policy_env_var_unknown_raises(monkeypatch):
+    monkeypatch.setenv("WIRES_KVCACHE_VICTIM_POLICY", "bogus_policy")
+    with pytest.raises(ValueError, match="Unknown WIRES_KVCACHE_VICTIM_POLICY"):
+        FreeKVCacheBlockQueue([])
 
 
 def test_generate_block_hash_extra_keys():
