@@ -97,6 +97,25 @@ class WorkflowTestHookRecord:
     prepared_prefix_num_cached_tokens: int | None = None
     prepared_prefix_recomputed_tokens: int | None = None
     prepared_prefix_cached_at_least_prefix: bool | None = None
+    # ----- segment_prepare / segment_refresh wire-level telemetry (Phase E1) -----
+    # Per-segment fields populated by record_workflow_segment_action(); all
+    # remain None for non-segment events. Mirrors the docs/v2/31 §E1 wire
+    # telemetry contract: prefill_token_count / prefill_status /
+    # engine_seen_token_hash plus the runner-side segment identity needed for
+    # cross-side correlation. None of these expose raw token ids.
+    segment_id: str | None = None
+    segment_family_id: str | None = None
+    segment_parent_id: str | None = None
+    segment_expected_consumers: int | None = None
+    segment_observed_consumers: int | None = None
+    segment_lifecycle_status: str | None = None
+    segment_status: str | None = None
+    segment_would_evict_without_refresh: bool | None = None
+    segment_prefill_token_count: int | None = None
+    segment_prefill_status: str | None = None
+    segment_engine_seen_token_hash: str | None = None
+    segment_ttl_ms: int | None = None
+    segment_expires_at_unix_ms: int | None = None
     dp_rank: int | None = None
     client_index: int | None = None
     pid: int | None = None
@@ -293,6 +312,61 @@ def record_workflow_action(
     )
 
 
+def record_workflow_segment_action(
+    *,
+    action_id: str | None,
+    action_kind: str,
+    lifecycle_status: str,
+    reject_reason: str | None = None,
+    segment_id: str | None = None,
+    segment_family_id: str | None = None,
+    segment_parent_id: str | None = None,
+    segment_expected_consumers: int | None = None,
+    segment_observed_consumers: int | None = None,
+    segment_lifecycle_status: str | None = None,
+    segment_status: str | None = None,
+    segment_would_evict_without_refresh: bool | None = None,
+    segment_prefill_token_count: int | None = None,
+    segment_prefill_status: str | None = None,
+    segment_engine_seen_token_hash: str | None = None,
+    segment_ttl_ms: int | None = None,
+    segment_expires_at_unix_ms: int | None = None,
+    model: str | None = None,
+) -> None:
+    """Record a wire-level segment_prepare / segment_refresh action event.
+
+    Per docs/v2/31 §E1 wire-level telemetry contract: emits the redacted
+    per-segment fields so cross-side correlation works between the runner's
+    persisted action queue and the engine's accepted-action log. Never
+    exposes raw token ids — only counts + 64-char sha256 token hashes.
+    """
+
+    _record_event(
+        source="workflow_segment_action",
+        path="/v1/coopt/" + action_kind,
+        request_id=None,
+        vllm_xargs=None,
+        action_id=action_id,
+        action_kind=action_kind,
+        lifecycle_status=lifecycle_status,
+        reject_reason=reject_reason,
+        model=model,
+        segment_id=segment_id,
+        segment_family_id=segment_family_id,
+        segment_parent_id=segment_parent_id,
+        segment_expected_consumers=segment_expected_consumers,
+        segment_observed_consumers=segment_observed_consumers,
+        segment_lifecycle_status=segment_lifecycle_status,
+        segment_status=segment_status,
+        segment_would_evict_without_refresh=segment_would_evict_without_refresh,
+        segment_prefill_token_count=segment_prefill_token_count,
+        segment_prefill_status=segment_prefill_status,
+        segment_engine_seen_token_hash=segment_engine_seen_token_hash,
+        segment_ttl_ms=segment_ttl_ms,
+        segment_expires_at_unix_ms=segment_expires_at_unix_ms,
+    )
+
+
 def _record_event(
     *,
     source: str,
@@ -352,6 +426,19 @@ def _record_event(
     prefix_token_hash: str | None = None,
     prepared_prefix_match: dict[str, Any] | None = None,
     prepared_prefix_cache: dict[str, Any] | None = None,
+    segment_id: str | None = None,
+    segment_family_id: str | None = None,
+    segment_parent_id: str | None = None,
+    segment_expected_consumers: int | None = None,
+    segment_observed_consumers: int | None = None,
+    segment_lifecycle_status: str | None = None,
+    segment_status: str | None = None,
+    segment_would_evict_without_refresh: bool | None = None,
+    segment_prefill_token_count: int | None = None,
+    segment_prefill_status: str | None = None,
+    segment_engine_seen_token_hash: str | None = None,
+    segment_ttl_ms: int | None = None,
+    segment_expires_at_unix_ms: int | None = None,
 ) -> None:
     if not workflow_test_hook_enabled():
         return
@@ -493,6 +580,19 @@ def _record_event(
             prepared_prefix_cache,
             "prepared_prefix_cached_at_least_prefix",
         ),
+        segment_id=segment_id,
+        segment_family_id=segment_family_id,
+        segment_parent_id=segment_parent_id,
+        segment_expected_consumers=segment_expected_consumers,
+        segment_observed_consumers=segment_observed_consumers,
+        segment_lifecycle_status=segment_lifecycle_status,
+        segment_status=segment_status,
+        segment_would_evict_without_refresh=segment_would_evict_without_refresh,
+        segment_prefill_token_count=segment_prefill_token_count,
+        segment_prefill_status=segment_prefill_status,
+        segment_engine_seen_token_hash=segment_engine_seen_token_hash,
+        segment_ttl_ms=segment_ttl_ms,
+        segment_expires_at_unix_ms=segment_expires_at_unix_ms,
         dp_rank=dp_rank,
         client_index=client_index,
         pid=os.getpid(),
