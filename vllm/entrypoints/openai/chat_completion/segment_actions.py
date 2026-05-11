@@ -735,6 +735,13 @@ class SegmentRegistry:
             self._entries_by_key.clear()
             self._entries_by_action_id.clear()
             self._entries_by_segment_id.clear()
+            # Also clear the segment_id -> [block, ...] reverse map.
+            # Without this, blocks tagged in an earlier test linger in
+            # the registry and pollute later tests that re-tag under
+            # the same segment_id (surfaced when adding the Phase B
+            # test_segment_lifecycle_update_routes_through_block_pool_queue
+            # alongside the existing fixed-id tests).
+            self._blocks_by_segment_id.clear()
 
     # ----- Phase E4 per-segment cache telemetry --------------------------
 

@@ -471,15 +471,22 @@ def test_segment_lifecycle_update_routes_through_block_pool_queue(
         KVCacheBlock,
     )
     from vllm.entrypoints.openai.chat_completion.segment_actions import (
+        reset_segment_registry_for_tests,
         set_block_hint_updater,
         tag_blocks_with_segment_id,
     )
 
     client, _handler = _make_app(monkeypatch, tmp_path)
     prepare_resp = client.post(
-        "/v1/coopt/segment_prepare", json=_segment_prepare_action()
+        "/v1/coopt/segment_prepare",
+        json=_segment_prepare_action(action_id="phase-b-wire-prepare"),
     )
     assert prepare_resp.status_code == 200
+
+    # Use a unique segment_id so this test doesn't collide with other
+    # tests that tag blocks under "seg-abc" against the module-level
+    # SegmentRegistry singleton.
+    seg_id = "seg-phaseb-wire"
 
     # Construct a real 3-pool queue and wire it up.
     real_blocks = [KVCacheBlock(block_id=i) for i in range(3)]
@@ -492,12 +499,12 @@ def test_segment_lifecycle_update_routes_through_block_pool_queue(
         assert queue.num_free_blocks_in_pool("may") == 3
         assert queue.num_free_blocks_in_pool("must") == 0
 
-        tag_blocks_with_segment_id(real_blocks, "seg-abc")
+        tag_blocks_with_segment_id(real_blocks, seg_id)
 
         # Promote the segment to "must" via the HTTP endpoint.
         resp = client.post(
             "/v1/coopt/segment_lifecycle_update",
-            json={"segment_id": "seg-abc", "new_hint": "must"},
+            json={"segment_id": seg_id, "new_hint": "must"},
         )
         assert resp.status_code == 200, resp.text
         assert resp.json()["updated"] == 3
@@ -509,6 +516,7 @@ def test_segment_lifecycle_update_routes_through_block_pool_queue(
             assert blk.lifecycle_hint == "must"
     finally:
         set_block_hint_updater(None)
+        reset_segment_registry_for_tests()
 
 
 def test_segment_lifecycle_update_self_heals_stale_tag(
