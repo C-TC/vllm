@@ -93,6 +93,13 @@ class Request:
 
         # P/D: Connector-specific KV transfer parameters.
         self.kv_transfer_params: dict[str, Any] | None = None
+        # WIRES Phase E2 step 2: per-request KV cache lifecycle hint.
+        # Allowed values: "must" / "may" / "no". Default "may"
+        # reproduces legacy single-priority FIFO eviction. Set from
+        # SamplingParams.extra_args["lifecycle_hint"] (which the
+        # OpenAI router populates from the request's vllm_xargs field).
+        # See docs/v2/31 §E2.
+        self.lifecycle_hint: str = "may"
 
         if pooling_params is not None:
             # Pooling models.
@@ -108,6 +115,9 @@ class Request:
                 self.kv_transfer_params = sampling_params.extra_args.get(
                     "kv_transfer_params"
                 )
+                hint_raw = sampling_params.extra_args.get("lifecycle_hint")
+                if hint_raw in ("must", "may", "no"):
+                    self.lifecycle_hint = hint_raw
         else:
             raise ValueError("sampling_params and pooling_params can't both be unset")
 
