@@ -251,6 +251,7 @@ def test_consume_marks_segment_prefilled_in_registry():
     pre_entry = _registry.get_by_action_id(action["action_id"])
     assert pre_entry is not None
     assert pre_entry["prefill_status"] != "prefilled"
+    assert pre_entry["prefill_token_count"] == 0  # nothing prefilled yet
 
     # Now run the V1 prewarm hook through the real method; the consume
     # coroutine launched as an asyncio task must drain and mark the
@@ -270,6 +271,14 @@ def test_consume_marks_segment_prefilled_in_registry():
         "Without this transition, segment_telemetry permanently reports "
         "tokenize_only and the WIRES segment-prepare claim is invisible "
         "in evidence JSONLs (Stage D regression)."
+    )
+    # The prefill input size (action's prompt_token_ids length), NOT
+    # the decode side-effect count (always 1 by construction).
+    assert post_entry["prefill_token_count"] == len(_TOKEN_IDS), (
+        f"prefill_token_count={post_entry['prefill_token_count']} should be "
+        f"{len(_TOKEN_IDS)} (the prefill input size). The Stage D verification "
+        "showed the count was being mis-reported as 1 (the max_tokens=1 decode "
+        "by-product) — segment_telemetry GETs would under-count work done."
     )
 
 

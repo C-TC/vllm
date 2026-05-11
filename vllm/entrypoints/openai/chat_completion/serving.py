@@ -520,6 +520,7 @@ class OpenAIServingChat(OpenAIServing):
             self._consume_workflow_segment_prewarm(
                 action_id=action_id,
                 segment_id=segment_id_for_extra,
+                prompt_token_count=len(token_ids),
                 result_generator=generator,
             )
         )
@@ -533,6 +534,7 @@ class OpenAIServingChat(OpenAIServing):
         *,
         action_id: str,
         segment_id: str | None,
+        prompt_token_count: int,
         result_generator: AsyncGenerator[RequestOutput, None],
     ) -> None:
         """Background drain of the hidden prewarm request.
@@ -550,20 +552,17 @@ class OpenAIServingChat(OpenAIServing):
         )
 
         unexpected_decode = False
-        prefill_token_count: int | None = None
         try:
             async for result in result_generator:
                 for output in result.outputs:
                     decoded_ids = getattr(output, "token_ids", None)
-                    decoded_text = getattr(output, "text", None)
-                    if decoded_ids:
-                        if prefill_token_count is None:
-                            prefill_token_count = len(decoded_ids)
+                    if decoded_ids and len(decoded_ids) > 1:
                         # The hidden request is prefill-only (max_tokens=1);
-                        # if any actual decode tokens were emitted that's
-                        # a contract violation worth flagging.
-                        if len(decoded_ids) > 1 or decoded_text:
-                            unexpected_decode = True
+                        # the engine emits exactly 1 decode token by
+                        # construction. ANY MORE than that means the
+                        # sampling settings were ignored — flag as a
+                        # contract violation.
+                        unexpected_decode = True
             if unexpected_decode:
                 mark_segment_prepare_prefilled(
                     action_id=action_id,
@@ -573,7 +572,10 @@ class OpenAIServingChat(OpenAIServing):
             mark_segment_prepare_prefilled(
                 action_id=action_id,
                 prefill_status="prefilled",
-                prefill_token_count=prefill_token_count,
+                # Use the prefill input size (passed in by the caller),
+                # NOT the decode side-effect count (which is always 1
+                # by construction since max_tokens=1).
+                prefill_token_count=prompt_token_count,
             )
         except Exception:  # noqa: BLE001
             mark_segment_prepare_prefilled(
