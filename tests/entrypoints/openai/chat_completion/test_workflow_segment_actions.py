@@ -406,3 +406,119 @@ def test_telemetry_records_cache_hit(monkeypatch, tmp_path) -> None:
     assert refresh_record.engine_segment_cache_hit_count == 3
     assert refresh_record.engine_segment_retention_count == 2
     assert refresh_record.engine_segment_evict_count == 0
+
+
+def test_segment_lifecycle_update_flips_block_hints(monkeypatch, tmp_path) -> None:
+    """Phase E2 step 3 — POST /v1/coopt/segment_lifecycle_update flips
+    the lifecycle_hint on every block currently tagged with the segment.
+
+    Self-heals on stale tags (block reused for a different segment).
+    """
+
+    client, _handler = _make_app(monkeypatch, tmp_path)
+
+    # Register a segment (so the registry has it; tag_blocks needs it)
+    prepare_resp = client.post(
+        "/v1/coopt/segment_prepare", json=_segment_prepare_action()
+    )
+    assert prepare_resp.status_code == 200
+
+    from vllm.entrypoints.openai.chat_completion.segment_actions import (
+        tag_blocks_with_segment_id,
+    )
+
+    # Create three fake blocks (just dataclass-like objects)
+    class _FakeBlock:
+        __slots__ = ("_segment_id", "lifecycle_hint")
+
+        def __init__(self):
+            self._segment_id = None
+            self.lifecycle_hint = "may"
+
+    blk_a = _FakeBlock()
+    blk_b = _FakeBlock()
+    blk_c = _FakeBlock()
+    tag_blocks_with_segment_id([blk_a, blk_b, blk_c], "seg-abc")
+    assert blk_a._segment_id == "seg-abc"
+
+    # Update hint via HTTP endpoint
+    resp = client.post(
+        "/v1/coopt/segment_lifecycle_update",
+        json={"segment_id": "seg-abc", "new_hint": "no"},
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["updated"] == 3
+    assert body["skipped"] == 0
+    assert body["reject_reason"] is None
+
+    assert blk_a.lifecycle_hint == "no"
+    assert blk_b.lifecycle_hint == "no"
+    assert blk_c.lifecycle_hint == "no"
+
+
+def test_segment_lifecycle_update_self_heals_stale_tag(
+    monkeypatch, tmp_path
+) -> None:
+    """A block whose ``_segment_id`` was reassigned mid-flight is skipped."""
+
+    client, _handler = _make_app(monkeypatch, tmp_path)
+    prepare_resp = client.post(
+        "/v1/coopt/segment_prepare", json=_segment_prepare_action()
+    )
+    assert prepare_resp.status_code == 200
+
+    from vllm.entrypoints.openai.chat_completion.segment_actions import (
+        tag_blocks_with_segment_id,
+    )
+
+    class _FakeBlock:
+        __slots__ = ("_segment_id", "lifecycle_hint")
+
+        def __init__(self):
+            self._segment_id = None
+            self.lifecycle_hint = "may"
+
+    blk_a = _FakeBlock()
+    blk_b = _FakeBlock()
+    tag_blocks_with_segment_id([blk_a, blk_b], "seg-abc")
+    # Simulate eviction + reuse: blk_b gets retagged for a different segment
+    blk_b._segment_id = "seg-other"
+
+    resp = client.post(
+        "/v1/coopt/segment_lifecycle_update",
+        json={"segment_id": "seg-abc", "new_hint": "must"},
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["updated"] == 1  # only blk_a
+    assert body["skipped"] == 1  # blk_b stale
+    assert blk_a.lifecycle_hint == "must"
+    assert blk_b.lifecycle_hint == "may"  # untouched
+
+
+def test_segment_lifecycle_update_rejects_invalid_hint(
+    monkeypatch, tmp_path
+) -> None:
+    client, _handler = _make_app(monkeypatch, tmp_path)
+    resp = client.post(
+        "/v1/coopt/segment_lifecycle_update",
+        json={"segment_id": "seg-abc", "new_hint": "INVALID"},
+    )
+    assert resp.status_code == 400
+    body = resp.json()
+    assert body["reject_reason"] == "invalid_hint"
+
+
+def test_segment_lifecycle_update_rejects_unknown_segment(
+    monkeypatch, tmp_path
+) -> None:
+    client, _handler = _make_app(monkeypatch, tmp_path)
+    resp = client.post(
+        "/v1/coopt/segment_lifecycle_update",
+        json={"segment_id": "unknown-seg", "new_hint": "no"},
+    )
+    assert resp.status_code == 400
+    body = resp.json()
+    assert body["updated"] == 0
+    assert body["reject_reason"] in ("no_blocks_for_segment", "all_stale")

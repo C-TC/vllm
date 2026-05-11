@@ -73,6 +73,7 @@ __all__ = [
     "record_segment_retention",
     "record_segment_eviction",
     "tag_blocks_with_segment_id",
+    "update_segment_lifecycle_hint",
 ]
 
 
@@ -519,6 +520,14 @@ class SegmentRegistry:
         # key remains canonical; this mirror is rebuilt whenever an entry
         # is created or evicted so block_pool callbacks stay O(1).
         self._entries_by_segment_id: dict[str, SegmentEntry] = {}
+        # WIRES Phase E2 step 3 — segment_id -> list of currently-tagged
+        # KVCacheBlocks. Populated by tag_blocks_with_segment_id; queried
+        # by the /v1/coopt/segment_lifecycle_update endpoint when the
+        # monitor downgrades the per-segment hint after a CFG event.
+        # Strong refs (KVCacheBlock uses slots so weakref isn't free);
+        # entries are pruned lazily when their _segment_id no longer
+        # matches (block reused for a different segment).
+        self._blocks_by_segment_id: dict[str, list[Any]] = {}
 
     def submit_prepare(
         self,
@@ -659,6 +668,67 @@ class SegmentRegistry:
             self._entries_by_segment_id.clear()
 
     # ----- Phase E4 per-segment cache telemetry --------------------------
+
+    def register_block_for_segment(self, segment_id: str, block: Any) -> None:
+        """WIRES Phase E2 step 3 — track which blocks belong to a segment.
+
+        Called by ``tag_blocks_with_segment_id`` for every block the
+        segment_prepare prefill helper allocates. The reverse map enables
+        ``update_block_hints`` to find blocks by segment_id without an
+        O(num_total_blocks) scan.
+
+        Same block tagged twice for the same segment → de-duped via
+        identity check at registration time.
+        """
+
+        if not isinstance(segment_id, str) or not segment_id:
+            return
+        with self._lock:
+            blocks = self._blocks_by_segment_id.setdefault(segment_id, [])
+            if all(b is not block for b in blocks):
+                blocks.append(block)
+
+    def update_block_hints(
+        self, segment_id: str, new_hint: str
+    ) -> dict[str, Any]:
+        """WIRES Phase E2 step 3 — flip lifecycle_hint on tagged blocks.
+
+        Walks the registered blocks for ``segment_id``, validates each
+        is still tagged with the same id (self-heals stale entries),
+        and updates ``block.lifecycle_hint = new_hint``. Returns a
+        small status dict for the HTTP endpoint.
+
+        Stale blocks (``_segment_id`` no longer matches — e.g., evicted
+        and reused) are removed from the reverse map.
+        """
+
+        with self._lock:
+            blocks = self._blocks_by_segment_id.get(segment_id, [])
+            updated = 0
+            kept: list[Any] = []
+            skipped = 0
+            for blk in blocks:
+                tagged = getattr(blk, "_segment_id", None)
+                if tagged != segment_id:
+                    skipped += 1
+                    continue
+                try:
+                    blk.lifecycle_hint = new_hint
+                    updated += 1
+                    kept.append(blk)
+                except AttributeError:
+                    skipped += 1
+            if kept:
+                self._blocks_by_segment_id[segment_id] = kept
+            else:
+                self._blocks_by_segment_id.pop(segment_id, None)
+            return {
+                "updated": updated,
+                "skipped": skipped,
+                "reject_reason": None
+                if updated > 0
+                else ("no_blocks_for_segment" if not blocks else "all_stale"),
+            }
 
     def _entry_by_segment_id_locked(self, segment_id: str) -> SegmentEntry | None:
         """Lookup a segment entry by its ``segment_id``.
@@ -947,6 +1017,12 @@ def tag_blocks_with_segment_id(blocks: Any, segment_id: str | None) -> None:
     blocks for a WIRES segment. Non-WIRES blocks remain untagged
     (``_segment_id is None``) so the block-pool hooks short-circuit.
 
+    Also registers each tagged block in the global
+    ``segment_id -> blocks`` reverse map used by Phase E2 step 3's
+    ``/v1/coopt/segment_lifecycle_update`` endpoint to find blocks by
+    segment_id (e.g., when the workflow monitor downgrades must -> no
+    after a loop exit).
+
     Best-effort: silently ignores blocks that don't have the attribute
     (prevents type coupling to KVCacheBlock from this layer).
     """
@@ -962,8 +1038,38 @@ def tag_blocks_with_segment_id(blocks: Any, segment_id: str | None) -> None:
     for blk in iterator:
         try:
             blk._segment_id = segment_id  # noqa: SLF001
+            _registry.register_block_for_segment(segment_id, blk)
         except AttributeError:
             continue
+
+
+def update_segment_lifecycle_hint(
+    segment_id: str | None, new_hint: str | None
+) -> dict[str, Any]:
+    """Phase E2 step 3 — flip the lifecycle_hint on every tagged block.
+
+    The workflow monitor calls this after a CFG event narrows the
+    segment's future consumer set (e.g., loop exit → "no", or loop
+    continuation → "must"). The new hint propagates to all currently-
+    tagged blocks for that segment_id; subsequent
+    ``FreeKVCacheBlockQueue.popleft_n`` calls honor it via the
+    3-priority traversal (no → may → must).
+
+    Self-healing on stale tags: if a block's ``_segment_id`` no longer
+    matches (e.g., evicted and reused), it is silently skipped and
+    removed from the registry's reverse map.
+
+    Returns a small status dict: ``{updated: int, skipped: int,
+    reject_reason: str | None}``. ``reject_reason`` is set if the
+    segment_id is unknown or new_hint is invalid; ``updated``/``skipped``
+    are zero in those cases.
+    """
+
+    if not isinstance(segment_id, str) or not segment_id:
+        return {"updated": 0, "skipped": 0, "reject_reason": "segment_id_missing"}
+    if new_hint not in ("must", "may", "no"):
+        return {"updated": 0, "skipped": 0, "reject_reason": "invalid_hint"}
+    return _registry.update_block_hints(segment_id, new_hint)
 
 
 # ----- Telemetry ----------------------------------------------------------
@@ -1167,3 +1273,35 @@ async def http_get_segment_telemetry(segment_id: str) -> JSONResponse:
             status_code=404,
         )
     return JSONResponse(content=response)
+
+
+@router.post("/v1/coopt/segment_lifecycle_update")
+async def http_segment_lifecycle_update(raw_request: Request) -> JSONResponse:
+    """WIRES Phase E2 step 3 — flip a segment's lifecycle hint at runtime.
+
+    Body: ``{"segment_id": str, "new_hint": "must" | "may" | "no"}``.
+    Looks up all KVCacheBlocks the segment_prepare prefill helper
+    tagged with ``segment_id`` and updates their ``lifecycle_hint``.
+    The next ``FreeKVCacheBlockQueue.popleft_n`` honors the new hint
+    via the 3-priority traversal (no -> may -> must).
+
+    Returned: ``{"updated": int, "skipped": int, "reject_reason":
+    str | None}``. Empty body / unknown segment / bad hint → 400.
+
+    Workflow monitor calls this after a CFG event (loop exit, branch
+    arm taken) narrows or expands the segment's future consumer set.
+    """
+
+    if not workflow_coopt_actions_enabled():
+        return _disabled_response()
+    try:
+        payload = await raw_request.json()
+    except Exception:  # noqa: BLE001
+        return _bad_payload_response("invalid_json")
+    if not isinstance(payload, dict):
+        return _bad_payload_response("expected_object")
+    segment_id = payload.get("segment_id")
+    new_hint = payload.get("new_hint")
+    result = update_segment_lifecycle_hint(segment_id, new_hint)
+    status_code = 200 if result.get("updated", 0) > 0 else 400
+    return JSONResponse(content=result, status_code=status_code)
