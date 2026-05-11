@@ -116,6 +116,14 @@ class WorkflowTestHookRecord:
     segment_engine_seen_token_hash: str | None = None
     segment_ttl_ms: int | None = None
     segment_expires_at_unix_ms: int | None = None
+    # ----- Phase E4 per-segment cache telemetry --------------------------
+    # Engine-side counters mirrored from the SegmentRegistry; populated
+    # whenever a wire-action handler asks the registry for the entry's
+    # current redacted_status() and forwards the cache-event counters
+    # so the test hook log captures the full picture in one record.
+    engine_segment_cache_hit_count: int | None = None
+    engine_segment_retention_count: int | None = None
+    engine_segment_evict_count: int | None = None
     dp_rank: int | None = None
     client_index: int | None = None
     pid: int | None = None
@@ -331,6 +339,9 @@ def record_workflow_segment_action(
     segment_engine_seen_token_hash: str | None = None,
     segment_ttl_ms: int | None = None,
     segment_expires_at_unix_ms: int | None = None,
+    engine_segment_cache_hit_count: int | None = None,
+    engine_segment_retention_count: int | None = None,
+    engine_segment_evict_count: int | None = None,
     model: str | None = None,
 ) -> None:
     """Record a wire-level segment_prepare / segment_refresh action event.
@@ -364,6 +375,9 @@ def record_workflow_segment_action(
         segment_engine_seen_token_hash=segment_engine_seen_token_hash,
         segment_ttl_ms=segment_ttl_ms,
         segment_expires_at_unix_ms=segment_expires_at_unix_ms,
+        engine_segment_cache_hit_count=engine_segment_cache_hit_count,
+        engine_segment_retention_count=engine_segment_retention_count,
+        engine_segment_evict_count=engine_segment_evict_count,
     )
 
 
@@ -439,6 +453,9 @@ def _record_event(
     segment_engine_seen_token_hash: str | None = None,
     segment_ttl_ms: int | None = None,
     segment_expires_at_unix_ms: int | None = None,
+    engine_segment_cache_hit_count: int | None = None,
+    engine_segment_retention_count: int | None = None,
+    engine_segment_evict_count: int | None = None,
 ) -> None:
     if not workflow_test_hook_enabled():
         return
@@ -593,6 +610,9 @@ def _record_event(
         segment_engine_seen_token_hash=segment_engine_seen_token_hash,
         segment_ttl_ms=segment_ttl_ms,
         segment_expires_at_unix_ms=segment_expires_at_unix_ms,
+        engine_segment_cache_hit_count=engine_segment_cache_hit_count,
+        engine_segment_retention_count=engine_segment_retention_count,
+        engine_segment_evict_count=engine_segment_evict_count,
         dp_rank=dp_rank,
         client_index=client_index,
         pid=os.getpid(),

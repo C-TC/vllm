@@ -141,6 +141,15 @@ class KVCacheBlock:
     #   - Monitor callback after CFG events (loop exit -> "no")
     lifecycle_hint: str = "may"
 
+    # WIRES Phase E4: per-block segment id used by the block-pool
+    # touch / eviction hooks to attribute cache events back to the
+    # SegmentRegistry. ``None`` for non-WIRES blocks (the vast
+    # majority); set by ``segment_actions.tag_blocks_with_segment_id``
+    # when a segment_prepare prefill returns. The block_pool hooks
+    # short-circuit when this is None, so non-WIRES request paths pay
+    # zero telemetry cost.
+    _segment_id: str | None = None
+
     @property
     def block_hash(self) -> BlockHashWithGroupId | None:
         return self._block_hash

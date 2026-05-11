@@ -277,3 +277,132 @@ def test_segment_endpoints_disabled_without_env(monkeypatch, tmp_path) -> None:
     )
     # Route is not attached at all -> FastAPI returns 404.
     assert response.status_code == 404
+
+
+# ---------------------------------------------------------------------------
+# Phase E4 — per-segment cache telemetry
+# ---------------------------------------------------------------------------
+
+
+def test_telemetry_endpoint_returns_zero_counters_initially(
+    monkeypatch, tmp_path
+) -> None:
+    """Right after segment_prepare, the per-segment cache counters are zero.
+
+    Verifies the telemetry endpoint shape + the documented invariant
+    that the engine has not yet observed any cache hits / retentions /
+    evictions for a freshly-registered segment.
+    """
+
+    client, _handler = _make_app(monkeypatch, tmp_path)
+
+    prepare_resp = client.post(
+        "/v1/coopt/segment_prepare", json=_segment_prepare_action()
+    )
+    assert prepare_resp.status_code == 200
+
+    telem = client.get("/v1/coopt/segment_telemetry/seg-abc")
+    assert telem.status_code == 200
+    payload = telem.json()
+    # Per-segment lifecycle is preserved alongside the new counters.
+    assert payload["segment_id"] == "seg-abc"
+    assert payload["family_id"] == "fam-1"
+    assert payload["status"] == "prefilled"
+    # Phase E4 counters: present, zero / empty before any block-pool event.
+    assert payload["cache_hit_count"] == 0
+    assert payload["retention_count"] == 0
+    assert payload["evict_count_by_hint"] == {}
+    # Redaction contract: the telemetry surface never leaks token ids.
+    assert "prompt_token_ids" not in payload
+
+    # Unknown segment id returns 404 with a reject reason.
+    missing = client.get("/v1/coopt/segment_telemetry/seg-does-not-exist")
+    assert missing.status_code == 404
+    assert missing.json()["reject_reason"] == "segment_not_found"
+
+
+def test_telemetry_records_eviction_with_hint(monkeypatch, tmp_path) -> None:
+    """``record_segment_eviction`` increments ``evict_count_by_hint``.
+
+    Drives the registry helper directly so the test exercises the
+    counter logic without needing a live block_pool. Mirrors the way
+    block_pool._maybe_evict_cached_block calls back into segment_actions.
+    """
+
+    client, _handler = _make_app(monkeypatch, tmp_path)
+    prepare_resp = client.post(
+        "/v1/coopt/segment_prepare", json=_segment_prepare_action()
+    )
+    assert prepare_resp.status_code == 200
+
+    from vllm.entrypoints.openai.chat_completion.segment_actions import (
+        record_segment_eviction,
+    )
+
+    record_segment_eviction("seg-abc", "must")
+    record_segment_eviction("seg-abc", "must")
+    record_segment_eviction("seg-abc", "may")
+    record_segment_eviction("seg-abc", None)  # treated as default "may"
+    # No-op for unknown segments — must not raise + must not alter state.
+    record_segment_eviction("seg-unknown", "must")
+    record_segment_eviction(None, "must")
+
+    telem = client.get("/v1/coopt/segment_telemetry/seg-abc")
+    assert telem.status_code == 200
+    payload = telem.json()
+    assert payload["evict_count_by_hint"] == {"must": 2, "may": 2}
+    # Eviction counters do not affect cache_hit / retention buckets.
+    assert payload["cache_hit_count"] == 0
+    assert payload["retention_count"] == 0
+
+
+def test_telemetry_records_cache_hit(monkeypatch, tmp_path) -> None:
+    """``record_segment_cache_hit`` + ``record_segment_retention`` increment.
+
+    Verifies the two helpers used by ``BlockPool.touch`` increment
+    independent counters and that the running totals are surfaced
+    through both the telemetry endpoint and the workflow_test_hook
+    record on the next wire-action emission.
+    """
+
+    client, _handler = _make_app(monkeypatch, tmp_path)
+    prepare_resp = client.post(
+        "/v1/coopt/segment_prepare", json=_segment_prepare_action()
+    )
+    assert prepare_resp.status_code == 200
+
+    from vllm.entrypoints.openai.chat_completion.segment_actions import (
+        record_segment_cache_hit,
+        record_segment_retention,
+    )
+
+    record_segment_cache_hit("seg-abc")
+    record_segment_cache_hit("seg-abc")
+    record_segment_cache_hit("seg-abc")
+    record_segment_retention("seg-abc")
+    record_segment_retention("seg-abc")
+    record_segment_cache_hit("seg-unknown")  # silently ignored
+    record_segment_cache_hit(None)
+
+    telem = client.get("/v1/coopt/segment_telemetry/seg-abc")
+    assert telem.status_code == 200
+    payload = telem.json()
+    assert payload["cache_hit_count"] == 3
+    assert payload["retention_count"] == 2
+    assert payload["evict_count_by_hint"] == {}
+
+    # Subsequent wire action emission carries the counters through to
+    # the workflow_test_hook record (engine_segment_* mirror fields).
+    refresh_resp = client.post(
+        "/v1/coopt/segment_refresh", json=_segment_refresh_action()
+    )
+    assert refresh_resp.status_code == 200
+    refresh_record = next(
+        record
+        for record in reversed(_records)
+        if record.source == "workflow_segment_action"
+        and record.action_kind == SEGMENT_REFRESH_ACTION_KIND
+    )
+    assert refresh_record.engine_segment_cache_hit_count == 3
+    assert refresh_record.engine_segment_retention_count == 2
+    assert refresh_record.engine_segment_evict_count == 0

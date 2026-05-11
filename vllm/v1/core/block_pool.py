@@ -374,6 +374,24 @@ class BlockPool:
             # eviction is not needed
             return False
 
+        # WIRES Phase E4: if this block was tagged with a segment id by
+        # segment_actions.tag_blocks_with_segment_id, attribute the
+        # eviction back to that segment so the per-segment telemetry
+        # surface (GET /v1/coopt/segment_telemetry/{segment_id})
+        # accurately reflects what the eviction policy is doing.
+        # Best-effort + import-local to avoid a hard dependency from
+        # the v1 core onto the OpenAI entrypoint package.
+        segment_id = getattr(block, "_segment_id", None)
+        if segment_id is not None:
+            try:
+                from vllm.entrypoints.openai.chat_completion.segment_actions import (
+                    record_segment_eviction,
+                )
+
+                record_segment_eviction(segment_id, block.lifecycle_hint)
+            except Exception:  # noqa: BLE001 - telemetry must never break serving
+                pass
+
         block.reset_hash()
 
         if self.enable_kv_cache_events:
@@ -397,6 +415,26 @@ class BlockPool:
         Args:
             blocks: A list of blocks to touch.
         """
+        # WIRES Phase E4: if any of the touched blocks carry a segment
+        # id, attribute the cache hit + retention to that segment.
+        # Resolve the helpers once per call (not per block) to avoid
+        # the import overhead in the inner loop.
+        record_cache_hit = None
+        record_retention = None
+        for block in blocks:
+            if getattr(block, "_segment_id", None) is not None:
+                try:
+                    from vllm.entrypoints.openai.chat_completion.segment_actions import (  # noqa: E501
+                        record_segment_cache_hit,
+                        record_segment_retention,
+                    )
+
+                    record_cache_hit = record_segment_cache_hit
+                    record_retention = record_segment_retention
+                except Exception:  # noqa: BLE001
+                    record_cache_hit = None
+                    record_retention = None
+                break
         for block in blocks:
             # ref_cnt=0 means this block is in the free list (i.e. eviction
             # candidate), so remove it.
@@ -405,6 +443,16 @@ class BlockPool:
             block.ref_cnt += 1
             if self.metrics_collector:
                 self.metrics_collector.on_block_accessed(block)
+            if record_cache_hit is not None:
+                segment_id = getattr(block, "_segment_id", None)
+                if segment_id is not None:
+                    try:
+                        record_cache_hit(segment_id)
+                        # Touch implies the block was kept in cache and
+                        # reused — counts as a retention event.
+                        record_retention(segment_id)
+                    except Exception:  # noqa: BLE001
+                        pass
 
     def free_blocks(self, ordered_blocks: Iterable[KVCacheBlock]) -> None:
         """Free a list of blocks. The blocks should be ordered by their

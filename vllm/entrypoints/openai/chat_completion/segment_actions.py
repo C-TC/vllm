@@ -68,6 +68,11 @@ __all__ = [
     "submit_segment_refresh_action",
     "get_segment_action",
     "reset_segment_registry_for_tests",
+    "get_segment_telemetry",
+    "record_segment_cache_hit",
+    "record_segment_retention",
+    "record_segment_eviction",
+    "tag_blocks_with_segment_id",
 ]
 
 
@@ -445,6 +450,16 @@ class SegmentEntry:
     would_evict_without_refresh: bool | None = None
     last_refresh_at_unix_ms: int | None = None
     refresh_count: int = 0
+    # WIRES Phase E4 — per-segment cache statistics. Populated by the
+    # block-pool hooks in vllm/v1/core/block_pool.py whenever a block
+    # tagged with this segment's id participates in a touch / allocation
+    # / eviction event. None of these counters are used to drive
+    # behavior; they are observability-only so we can verify the
+    # 3-priority popleft + lifecycle_hint plumbing actually keeps
+    # `must` segments resident.
+    cache_hit_count: int = 0
+    retention_count: int = 0
+    evict_count_by_hint: dict[str, int] = field(default_factory=dict)
     extra: dict[str, Any] = field(default_factory=dict)
 
     def expire_if_due(self) -> None:
@@ -478,6 +493,9 @@ class SegmentEntry:
             "would_evict_without_refresh": self.would_evict_without_refresh,
             "last_refresh_at_unix_ms": self.last_refresh_at_unix_ms,
             "refresh_count": self.refresh_count,
+            "cache_hit_count": self.cache_hit_count,
+            "retention_count": self.retention_count,
+            "evict_count_by_hint": dict(self.evict_count_by_hint),
             "prewarm_status": self.prefill_status,
         }
 
@@ -496,6 +514,11 @@ class SegmentRegistry:
             tuple[str, str], SegmentEntry
         ] = OrderedDict()
         self._entries_by_action_id: dict[str, SegmentEntry] = {}
+        # WIRES Phase E4 — secondary segment_id -> entry index used by
+        # block-pool hooks (touch / eviction). The (family_id, token_hash)
+        # key remains canonical; this mirror is rebuilt whenever an entry
+        # is created or evicted so block_pool callbacks stay O(1).
+        self._entries_by_segment_id: dict[str, SegmentEntry] = {}
 
     def submit_prepare(
         self,
@@ -539,6 +562,8 @@ class SegmentRegistry:
             self._entries_by_key.move_to_end(key)
             if action_id:
                 self._entries_by_action_id[action_id] = entry
+            if segment_id:
+                self._entries_by_segment_id[segment_id] = entry
             self._evict_locked()
         return entry.redacted_status()
 
@@ -607,6 +632,8 @@ class SegmentRegistry:
                 self._entries_by_key.move_to_end(key)
             if action_id:
                 self._entries_by_action_id[action_id] = entry
+            if segment_id:
+                self._entries_by_segment_id[segment_id] = entry
             self._evict_locked()
             response = entry.redacted_status()
         # Override response action_kind to refresh so callers see what
@@ -629,12 +656,96 @@ class SegmentRegistry:
         with self._lock:
             self._entries_by_key.clear()
             self._entries_by_action_id.clear()
+            self._entries_by_segment_id.clear()
+
+    # ----- Phase E4 per-segment cache telemetry --------------------------
+
+    def _entry_by_segment_id_locked(self, segment_id: str) -> SegmentEntry | None:
+        """Lookup a segment entry by its ``segment_id``.
+
+        The (family_id, token_hash) keyspace is the canonical registry
+        key, but block-pool hooks only know which segment they were
+        allocated for. ``_entries_by_segment_id`` is a secondary index
+        kept in lock-step with the primary one.
+        """
+
+        return self._entries_by_segment_id.get(segment_id)
+
+    def get_telemetry(self, segment_id: str) -> dict[str, Any] | None:
+        """Return the redacted full state for ``segment_id``.
+
+        Returns ``None`` when no entry has been registered for that
+        segment id. The returned dict is the same shape as
+        ``redacted_status()`` plus the Phase E4 counters
+        (already included by ``redacted_status``); never exposes raw
+        token ids.
+        """
+
+        with self._lock:
+            entry = self._entry_by_segment_id_locked(segment_id)
+            if entry is None:
+                return None
+            return entry.redacted_status()
+
+    def record_cache_hit(self, segment_id: str) -> None:
+        """Increment cache_hit_count for ``segment_id`` if registered.
+
+        No-op for unknown segment ids — block_pool hooks fire for every
+        block and the vast majority of blocks are not WIRES-tagged, so
+        this must be cheap and never raise.
+        """
+
+        with self._lock:
+            entry = self._entry_by_segment_id_locked(segment_id)
+            if entry is None:
+                return
+            entry.cache_hit_count += 1
+
+    def record_retention(self, segment_id: str) -> None:
+        """Increment retention_count for ``segment_id`` if registered.
+
+        Called on each allocation pass where the block-pool's priority
+        traversal kept this segment in cache (i.e. did NOT evict it).
+        Together with ``record_eviction`` this lets us compute the
+        survival ratio per lifecycle_hint class.
+        """
+
+        with self._lock:
+            entry = self._entry_by_segment_id_locked(segment_id)
+            if entry is None:
+                return
+            entry.retention_count += 1
+
+    def record_eviction(self, segment_id: str, hint: str | None) -> None:
+        """Increment ``evict_count_by_hint[hint]`` for ``segment_id``.
+
+        ``hint`` defaults to ``"may"`` when not provided so the bucket
+        names match ``KVCacheBlock.lifecycle_hint`` values verbatim.
+        """
+
+        bucket = hint if isinstance(hint, str) and hint else "may"
+        with self._lock:
+            entry = self._entry_by_segment_id_locked(segment_id)
+            if entry is None:
+                return
+            entry.evict_count_by_hint[bucket] = (
+                entry.evict_count_by_hint.get(bucket, 0) + 1
+            )
 
     def _evict_locked(self) -> None:
         max_outstanding = _segment_max_outstanding()
         while len(self._entries_by_key) > max_outstanding:
             _evicted_key, evicted_entry = self._entries_by_key.popitem(last=False)
             self._entries_by_action_id.pop(evicted_entry.action_id, None)
+            if evicted_entry.segment_id:
+                # Only drop the secondary index entry if it still maps to
+                # this exact entry (a later submit_prepare for the same
+                # segment_id would have superseded it).
+                if (
+                    self._entries_by_segment_id.get(evicted_entry.segment_id)
+                    is evicted_entry
+                ):
+                    self._entries_by_segment_id.pop(evicted_entry.segment_id, None)
 
 
 _registry = SegmentRegistry()
@@ -784,6 +895,77 @@ def get_segment_action(action_id: str) -> dict[str, Any] | None:
     return _registry.get_by_action_id(action_id)
 
 
+# ----- Phase E4 cache telemetry helpers ----------------------------------
+
+
+def get_segment_telemetry(segment_id: str) -> dict[str, Any] | None:
+    """Module-level shortcut to ``_registry.get_telemetry`` for the
+    ``GET /v1/coopt/segment_telemetry/{segment_id}`` route and any
+    callers that hold a segment_id but not a registry handle.
+    """
+
+    return _registry.get_telemetry(segment_id)
+
+
+def record_segment_cache_hit(segment_id: str | None) -> None:
+    """Block-pool entry point: record a cache hit for ``segment_id``.
+
+    Tolerates ``None`` so the block_pool hook can pass a block's
+    ``_segment_id`` attribute unconditionally without branching.
+    """
+
+    if not isinstance(segment_id, str) or not segment_id:
+        return
+    _registry.record_cache_hit(segment_id)
+
+
+def record_segment_retention(segment_id: str | None) -> None:
+    """Record that this segment's blocks survived an allocation pass."""
+
+    if not isinstance(segment_id, str) or not segment_id:
+        return
+    _registry.record_retention(segment_id)
+
+
+def record_segment_eviction(segment_id: str | None, hint: str | None) -> None:
+    """Record an eviction of a block tagged with ``segment_id``.
+
+    ``hint`` is the block's ``lifecycle_hint`` at the moment the
+    eviction fires; ``None`` is treated as the default ``"may"``.
+    """
+
+    if not isinstance(segment_id, str) or not segment_id:
+        return
+    _registry.record_eviction(segment_id, hint)
+
+
+def tag_blocks_with_segment_id(blocks: Any, segment_id: str | None) -> None:
+    """Stamp ``segment_id`` onto the iterable of KVCacheBlocks.
+
+    Called from the segment_prepare prefill helper once
+    ``kv_cache_manager.allocate_slots`` returns the freshly-allocated
+    blocks for a WIRES segment. Non-WIRES blocks remain untagged
+    (``_segment_id is None``) so the block-pool hooks short-circuit.
+
+    Best-effort: silently ignores blocks that don't have the attribute
+    (prevents type coupling to KVCacheBlock from this layer).
+    """
+
+    if not isinstance(segment_id, str) or not segment_id:
+        return
+    if blocks is None:
+        return
+    try:
+        iterator = iter(blocks)
+    except TypeError:
+        return
+    for blk in iterator:
+        try:
+            blk._segment_id = segment_id  # noqa: SLF001
+        except AttributeError:
+            continue
+
+
 # ----- Telemetry ----------------------------------------------------------
 
 
@@ -800,6 +982,18 @@ def _emit_segment_telemetry(
     expected_consumers = _optional_int(response_view.get("expected_consumers"))
     if expected_consumers is None:
         expected_consumers = _optional_int(request_action.get("expected_consumers"))
+    # Phase E4: forward the engine-side cache counters into the test
+    # hook record so a single workflow_segment_action event captures
+    # both the wire-action lifecycle AND the latest cache-event totals.
+    cache_hit_count = _optional_int(response_view.get("cache_hit_count"))
+    retention_count = _optional_int(response_view.get("retention_count"))
+    evict_by_hint = response_view.get("evict_count_by_hint")
+    if isinstance(evict_by_hint, dict):
+        evict_total: int | None = sum(
+            value for value in evict_by_hint.values() if isinstance(value, int)
+        )
+    else:
+        evict_total = None
     record_workflow_segment_action(
         action_id=action_id,
         action_kind=action_kind,
@@ -831,6 +1025,9 @@ def _emit_segment_telemetry(
         segment_expires_at_unix_ms=_optional_int(
             response_view.get("expires_at_unix_ms")
         ),
+        engine_segment_cache_hit_count=cache_hit_count,
+        engine_segment_retention_count=retention_count,
+        engine_segment_evict_count=evict_total,
         model=_optional_str(request_action.get("model")),
     )
 
@@ -927,6 +1124,44 @@ async def http_get_segment_refresh(action_id: str) -> JSONResponse:
                 "action_id": action_id,
                 "lifecycle_status": "missing",
                 "reject_reason": "action_not_found",
+                "engine_wire_status": "missing",
+            },
+            status_code=404,
+        )
+    return JSONResponse(content=response)
+
+
+@router.get("/v1/coopt/segment_telemetry/{segment_id}")
+async def http_get_segment_telemetry(segment_id: str) -> JSONResponse:
+    """WIRES Phase E4 — per-segment cache telemetry surface.
+
+    Returns the registry entry's ``redacted_status()`` payload, which
+    includes the standard segment_prepare lifecycle fields PLUS the
+    Phase E4 counters:
+
+    * ``cache_hit_count`` — block-pool ``touch()`` hits attributed to
+      this segment's cached blocks.
+    * ``retention_count`` — number of allocation passes where this
+      segment's blocks survived eviction.
+    * ``evict_count_by_hint`` — dict keyed on the block's
+      ``lifecycle_hint`` ("no" / "may" / "must") at the moment its
+      block was evicted from the cache. Lets us verify ``must`` blocks
+      rarely evict and ``no`` blocks evict first.
+
+    Returns 404 when no segment with that id has been registered;
+    raw token ids are never serialized (same redaction contract as
+    ``GET /v1/coopt/segment_prepare/{action_id}``).
+    """
+
+    if not workflow_coopt_actions_enabled():
+        return _disabled_response()
+    response = get_segment_telemetry(segment_id)
+    if response is None:
+        return JSONResponse(
+            content={
+                "segment_id": segment_id,
+                "lifecycle_status": "missing",
+                "reject_reason": "segment_not_found",
                 "engine_wire_status": "missing",
             },
             status_code=404,
