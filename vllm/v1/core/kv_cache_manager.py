@@ -485,6 +485,16 @@ class KVCacheManager:
             num_encoder_tokens,
         )
 
+        # WIRES Phase E2 step 2: propagate the request's lifecycle hint
+        # to the freshly-allocated blocks so subsequent eviction (via
+        # FreeKVCacheBlockQueue.popleft_n's 3-priority traversal) honors
+        # it. Default "may" reproduces legacy LRU behavior. See docs/v2/31 §E2.
+        request_hint = getattr(request, "lifecycle_hint", "may")
+        if request_hint != "may":
+            for group_blocks in new_blocks:
+                for blk in group_blocks:
+                    blk.lifecycle_hint = request_hint
+
         # P/D: delay caching blocks if we have to recv from
         # remote. Update state for locally cached blocks.
         if not self.enable_caching or delay_cache_blocks:
