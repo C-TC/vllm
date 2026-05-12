@@ -572,15 +572,38 @@ def test_segment_lifecycle_update_rejects_invalid_hint(
     assert body["reject_reason"] == "invalid_hint"
 
 
-def test_segment_lifecycle_update_rejects_unknown_segment(
+def test_segment_lifecycle_update_unknown_segment_is_soft_noop(
     monkeypatch, tmp_path
 ) -> None:
+    """Unknown segment_id is a SOFT no-op (200), not an error (400).
+
+    Speculative promotions (docs/v2/32 §4 OQ6 #1) target may segments
+    that haven't been prepared yet — the engine has no blocks tagged
+    for those, so update_block_hints returns updated=0 with
+    reject_reason='no_blocks_for_segment'. That's a valid response,
+    not a payload error; surfacing it as 400 spams the operator log
+    and trips per-request error metrics.
+    """
     client, _handler = _make_app(monkeypatch, tmp_path)
     resp = client.post(
         "/v1/coopt/segment_lifecycle_update",
         json={"segment_id": "unknown-seg", "new_hint": "no"},
     )
-    assert resp.status_code == 400
+    assert resp.status_code == 200
     body = resp.json()
     assert body["updated"] == 0
     assert body["reject_reason"] in ("no_blocks_for_segment", "all_stale")
+
+
+def test_segment_lifecycle_update_rejects_missing_segment_id(
+    monkeypatch, tmp_path
+) -> None:
+    """Missing segment_id is a structural error (400)."""
+    client, _handler = _make_app(monkeypatch, tmp_path)
+    resp = client.post(
+        "/v1/coopt/segment_lifecycle_update",
+        json={"new_hint": "no"},  # no segment_id
+    )
+    assert resp.status_code == 400
+    body = resp.json()
+    assert body["reject_reason"] == "segment_id_missing"

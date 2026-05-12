@@ -1424,5 +1424,27 @@ async def http_segment_lifecycle_update(raw_request: Request) -> JSONResponse:
     segment_id = payload.get("segment_id")
     new_hint = payload.get("new_hint")
     result = update_segment_lifecycle_hint(segment_id, new_hint)
-    status_code = 200 if result.get("updated", 0) > 0 else 400
+    # Status policy: success or "soft no-op" → 200; structurally bad
+    # request → 400.
+    # - updated > 0                    → 200 (work happened)
+    # - reject_reason in {              → 200 (caller's payload was
+    #     "no_blocks_for_segment",       valid; the engine just had
+    #     "all_stale",                   nothing to act on. Speculative
+    #   }                                promotions like docs/v2/32 §4
+    #                                    OQ6 #1 issue these on may
+    #                                    segments that haven't been
+    #                                    prepared yet — that's a
+    #                                    soft no-op, not an error.)
+    # - reject_reason in {              → 400 (malformed request)
+    #     "segment_id_missing",
+    #     "invalid_hint",
+    #   }
+    reject = result.get("reject_reason")
+    if result.get("updated", 0) > 0 or reject in {
+        "no_blocks_for_segment",
+        "all_stale",
+    }:
+        status_code = 200
+    else:
+        status_code = 400
     return JSONResponse(content=result, status_code=status_code)
