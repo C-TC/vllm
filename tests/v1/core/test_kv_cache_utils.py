@@ -410,6 +410,57 @@ def test_free_kv_cache_block_queue_popleft_n():
         assert block.next_free_block is None
 
 
+def test_free_kv_cache_block_queue_lifecycle_priority_popleft_n():
+    """WIRES Phase E2: popleft_n prefers lifecycle_hint='no' > 'may' > 'must'.
+
+    Exercises 3-priority eviction order:
+      - "no" blocks pulled first (eviction-safe)
+      - "may" blocks (default) pulled next (LRU within class)
+      - "must" blocks pulled last resort
+    Within each class the existing front-to-back LRU order is preserved.
+    """
+    blocks = [KVCacheBlock(block_id=i) for i in range(6)]
+    # Layout (LRU order): b0=may b1=must b2=no b3=may b4=must b5=no
+    blocks[0].lifecycle_hint = "may"
+    blocks[1].lifecycle_hint = "must"
+    blocks[2].lifecycle_hint = "no"
+    blocks[3].lifecycle_hint = "may"
+    blocks[4].lifecycle_hint = "must"
+    blocks[5].lifecycle_hint = "no"
+    queue = FreeKVCacheBlockQueue(blocks)
+    assert queue.num_free_blocks == 6
+
+    # Pop 1 → should pull b2 (first "no" in LRU order)
+    out = queue.popleft_n(1)
+    assert out == [blocks[2]]
+    assert queue.num_free_blocks == 5
+
+    # Pop 2 → b5 (last remaining "no") then b0 (first "may")
+    out = queue.popleft_n(2)
+    assert out == [blocks[5], blocks[0]]
+    assert queue.num_free_blocks == 3
+
+    # Pop 2 → b3 ("may") then b1 (first "must")
+    out = queue.popleft_n(2)
+    assert out == [blocks[3], blocks[1]]
+    assert queue.num_free_blocks == 1
+
+    # Pop last → b4 (only "must" left)
+    out = queue.popleft_n(1)
+    assert out == [blocks[4]]
+    assert queue.num_free_blocks == 0
+
+
+def test_free_kv_cache_block_queue_default_priority_is_legacy_fifo():
+    """All-default ("may") blocks must reproduce legacy FIFO popleft_n order."""
+
+    blocks = [KVCacheBlock(block_id=i) for i in range(4)]
+    queue = FreeKVCacheBlockQueue(blocks)
+    out = queue.popleft_n(4)
+    assert out == blocks
+    assert queue.num_free_blocks == 0
+
+
 def test_free_kv_cache_block_queue_get_all_free_blocks():
     # Create a list of KVCacheBlock objects
     blocks = [KVCacheBlock(block_id=i) for i in range(5)]
