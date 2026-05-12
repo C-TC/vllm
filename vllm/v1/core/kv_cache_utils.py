@@ -146,12 +146,29 @@ class KVCacheBlock:
     # was last promoted into the must pool. 0 = never promoted (block
     # has always lived in no/may, or was just allocated). Used by the
     # lazy TTL sweep at the head of popleft_n to demote blocks whose
-    # `last_promoted_ns + TTL_must < now`. See docs/v2/32 §2.4.
-    # In the v1 implementation only one source class is wired
-    # (structured, via update_segment_lifecycle_hint), so a single
-    # TTL constant suffices. When Phase D adds access-based promotion
-    # the queue will also tag a `source_class` and pick the right TTL.
+    # `last_promoted_ns + TTL_must_for_source < now`. See docs/v2/32 §2.4.
     last_promoted_ns: int = 0
+
+    # WIRES Phase D: which promotion path put this block into the must
+    # pool. Drives per-class TTL during the lazy sweep.
+    #   "structured"   — explicit promotion via update_segment_lifecycle_hint
+    #                    (driver / monitor knows the segment will recur)
+    #   "unstructured" — access-based promotion via block_pool.touch()
+    #                    once _access_count crosses the threshold
+    # Default "structured" matches the pre-Phase-D world (everything
+    # was structured because access-based promotion didn't exist).
+    # Refreshed each time the block is promoted; demotion does not
+    # clear it (so a block re-promoted via access continues to use
+    # the unstructured TTL).
+    source_class: str = "structured"
+
+    # WIRES Phase D: per-block hit count, used by access-based
+    # promotion. Incremented in block_pool.touch() (one cache hit on
+    # this block = one increment). Compared to
+    # WIRES_KVCACHE_ACCESS_PROMOTION_THRESHOLD (default 1) to decide
+    # whether to promote may -> must. Reset to 0 in reset_hash() so
+    # a slot recycled for a different cache entry starts fresh.
+    _access_count: int = 0
 
     # WIRES Phase E4: per-block segment id used by the block-pool
     # touch / eviction hooks to attribute cache events back to the
@@ -174,8 +191,14 @@ class KVCacheBlock:
         self._block_hash = block_hash
 
     def reset_hash(self):
-        """Reset the block hash when the block is evicted."""
+        """Reset the block hash when the block is evicted.
+
+        Also resets WIRES Phase D's per-block access counter, since the
+        slot is being recycled for new content; the previous content's
+        hit history is no longer meaningful.
+        """
         self._block_hash = None
+        self._access_count = 0
 
     def __repr__(self) -> str:
         # Use block_id instead of KVCacheBlock object to avoid calling __repr__
@@ -291,29 +314,75 @@ SUPPORTED_VICTIM_POLICIES = (VICTIM_POLICY_WIRES_THREE_POOL, VICTIM_POLICY_PURE_
 # Unstructured TTL is the cross-class fairness lever and is held until
 # the expert-brief design lands (see docs/v2/33 OQ-Fairness).
 _DEFAULT_STRUCTURED_TTL_MS = 300_000
+# v1 default: unstructured TTL = structured TTL. The full v1 fairness
+# design (docs/v2/32 §2.4 + §3.1, DL-14..DL-18) uses an EMA-driven
+# `T̂_u + k·ε_u` formula with α-shrinkage capacity boundary; that
+# estimator is a follow-up. For now both classes use the same
+# constant so Phase D can land + be GPU-verified independently.
+_DEFAULT_UNSTRUCTURED_TTL_MS = _DEFAULT_STRUCTURED_TTL_MS
+
+# Phase D access-based promotion threshold (DL-OQ5 = 1).
+_DEFAULT_ACCESS_PROMOTION_THRESHOLD = 1
 
 
-def _resolve_structured_ttl_ns_from_env() -> int:
-    """Resolve ``WIRES_KVCACHE_STRUCTURED_TTL_MS`` env var to nanoseconds.
+def _resolve_ttl_ns_from_env(env_name: str, default_ms: int) -> int:
+    """Resolve ``WIRES_KVCACHE_*_TTL_MS`` env var to nanoseconds.
 
-    A value of 0 disables the TTL sweep entirely (structured `must`
-    blocks live until force-evicted by `popleft_n` step 3). Useful for
-    isolating Phase A/B regressions from Phase C TTL behaviour.
+    A value of 0 disables the TTL sweep for that source class
+    (blocks of that class live in must until force-evicted by
+    `popleft_n` step 3). Useful for A/B isolating per-class
+    behaviour.
     """
-    raw = os.environ.get("WIRES_KVCACHE_STRUCTURED_TTL_MS")
+    raw = os.environ.get(env_name)
     if raw is None:
-        return _DEFAULT_STRUCTURED_TTL_MS * 1_000_000
+        return default_ms * 1_000_000
     try:
         ms = int(raw)
     except ValueError as e:
         raise ValueError(
-            f"WIRES_KVCACHE_STRUCTURED_TTL_MS must be an integer (got {raw!r})"
+            f"{env_name} must be an integer (got {raw!r})"
         ) from e
     if ms < 0:
-        raise ValueError(
-            f"WIRES_KVCACHE_STRUCTURED_TTL_MS must be >= 0 (got {ms})"
-        )
+        raise ValueError(f"{env_name} must be >= 0 (got {ms})")
     return ms * 1_000_000
+
+
+def _resolve_structured_ttl_ns_from_env() -> int:
+    return _resolve_ttl_ns_from_env(
+        "WIRES_KVCACHE_STRUCTURED_TTL_MS", _DEFAULT_STRUCTURED_TTL_MS
+    )
+
+
+def _resolve_unstructured_ttl_ns_from_env() -> int:
+    return _resolve_ttl_ns_from_env(
+        "WIRES_KVCACHE_UNSTRUCTURED_TTL_MS", _DEFAULT_UNSTRUCTURED_TTL_MS
+    )
+
+
+def _resolve_access_promotion_threshold_from_env() -> int:
+    """Resolve ``WIRES_KVCACHE_ACCESS_PROMOTION_THRESHOLD`` env var.
+
+    A value of 0 disables access-based promotion entirely (Phase D
+    becomes inert; only explicit promotion via update_block_hint
+    fires). Default 1 per DL-OQ5: any cached block hit at least
+    once gets promoted to must.
+    """
+    raw = os.environ.get("WIRES_KVCACHE_ACCESS_PROMOTION_THRESHOLD")
+    if raw is None:
+        return _DEFAULT_ACCESS_PROMOTION_THRESHOLD
+    try:
+        threshold = int(raw)
+    except ValueError as e:
+        raise ValueError(
+            f"WIRES_KVCACHE_ACCESS_PROMOTION_THRESHOLD must be an integer "
+            f"(got {raw!r})"
+        ) from e
+    if threshold < 0:
+        raise ValueError(
+            f"WIRES_KVCACHE_ACCESS_PROMOTION_THRESHOLD must be >= 0 "
+            f"(got {threshold})"
+        )
+    return threshold
 
 
 def _resolve_victim_policy_from_env() -> str:
@@ -377,6 +446,8 @@ class FreeKVCacheBlockQueue:
         blocks: list[KVCacheBlock],
         mode: str | None = None,
         structured_ttl_ns: int | None = None,
+        unstructured_ttl_ns: int | None = None,
+        access_promotion_threshold: int | None = None,
     ) -> None:
         self.mode: str = mode if mode is not None else _resolve_victim_policy_from_env()
         if self.mode not in SUPPORTED_VICTIM_POLICIES:
@@ -388,6 +459,16 @@ class FreeKVCacheBlockQueue:
             structured_ttl_ns
             if structured_ttl_ns is not None
             else _resolve_structured_ttl_ns_from_env()
+        )
+        self._unstructured_ttl_ns: int = (
+            unstructured_ttl_ns
+            if unstructured_ttl_ns is not None
+            else _resolve_unstructured_ttl_ns_from_env()
+        )
+        self.access_promotion_threshold: int = (
+            access_promotion_threshold
+            if access_promotion_threshold is not None
+            else _resolve_access_promotion_threshold_from_env()
         )
 
         self._pools: dict[str, _PoolList] = {
@@ -413,6 +494,9 @@ class FreeKVCacheBlockQueue:
         # Telemetry counter (docs/v2/32 §2.4). Cumulative count of blocks
         # demoted from must -> may by the lazy TTL sweep at popleft_n.
         self.ttl_demoted_count: int = 0
+        # WIRES Phase D telemetry: cumulative count of blocks promoted
+        # may -> must via access threshold (called by block_pool.touch).
+        self.access_promoted_count: int = 0
 
     def _pool_for_block(self, block: KVCacheBlock) -> str:
         """Resolve which pool ``block`` should land in given the active mode."""
@@ -463,22 +547,45 @@ class FreeKVCacheBlockQueue:
         """
         if self.mode == VICTIM_POLICY_PURE_LRU:
             return 0
-        ttl = self._structured_ttl_ns
-        if ttl <= 0:
+        # Per-class TTL: pick cutoff per block based on source_class
+        # (DL-8 + Phase D). When BOTH TTLs are 0, no sweep happens.
+        ttl_struct = self._structured_ttl_ns
+        ttl_unstruct = self._unstructured_ttl_ns
+        if ttl_struct <= 0 and ttl_unstruct <= 0:
             return 0
         must = self._pools["must"]
         if must.size == 0:
             return 0
         now_ns = time.monotonic_ns()
-        cutoff = now_ns - ttl
+        # Walking from the head: pool ordering is by promotion time
+        # WITHIN each source class — but with mixed source classes
+        # at the head, the strict "stop at first non-expired" trick
+        # doesn't hold (a structured block ahead of an unstructured
+        # one might have a longer TTL and not be expired, while the
+        # unstructured one behind it IS expired). For correctness we
+        # walk until we hit a block that's non-expired AND the
+        # remaining-pool TTL minimum couldn't have expired anything
+        # else either; pragmatically: walk while each successive head
+        # is expired by ITS class TTL, stop at first non-expired.
+        # Worst case: skipping past mixed-class non-expired blocks at
+        # the head delays demotion of expired blocks behind them by
+        # one popleft_n cycle. Acceptable; revisit if mixed-class
+        # head ordering becomes pathological.
         demoted: list[KVCacheBlock] = []
         while must.size > 0:
             head = must.head.next_free_block
             if head is None or head is must.tail:
                 break
-            if head.last_promoted_ns > cutoff:
-                # Head is still fresh; pool order is by promotion time
-                # so everything else is fresher too.
+            ttl_for_head = (
+                ttl_struct if head.source_class == "structured" else ttl_unstruct
+            )
+            if ttl_for_head <= 0:
+                # This class has TTL disabled — head can't be demoted.
+                # Per the design comment above, stop walking; later
+                # blocks of the OTHER class won't be reached this
+                # cycle. Acceptable.
+                break
+            if head.last_promoted_ns > (now_ns - ttl_for_head):
                 break
             blk = must.popleft_one()
             assert blk is not None
@@ -574,7 +681,12 @@ class FreeKVCacheBlockQueue:
         self._pools[pool_name].remove(block)
 
     # --- Phase B / external hint update ------------------------------------
-    def update_block_hint(self, block: KVCacheBlock, new_hint: str) -> None:
+    def update_block_hint(
+        self,
+        block: KVCacheBlock,
+        new_hint: str,
+        source_class: str = "structured",
+    ) -> None:
         """Update a block's lifecycle_hint, moving pools if necessary.
 
         ``wires_three_pool`` mode: if the block is in a free pool and
@@ -586,11 +698,22 @@ class FreeKVCacheBlockQueue:
         ``pure_lru`` mode: hint is metadata only. Updates the field
         but never moves blocks between pools (everything is in may).
 
-        Used by Phase B (segment_actions.update_block_hints) so that
-        post-prefill hint flips propagate to pool membership.
+        Used by Phase B (segment_actions.update_block_hints) for the
+        explicit / structured promotion path (default
+        source_class="structured"); Phase D's access-based
+        promotion calls this with source_class="unstructured".
+
+        ``source_class`` is recorded on the block ONLY when the new
+        hint is "must" (it's only meaningful for must-pool blocks
+        whose TTL the sweep needs to pick).
         """
         if new_hint not in self._pools:
             new_hint = "may"
+        if source_class not in ("structured", "unstructured"):
+            raise ValueError(
+                f"source_class must be 'structured' or 'unstructured' "
+                f"(got {source_class!r})"
+            )
         if block.lifecycle_hint == new_hint:
             return
 
@@ -605,8 +728,10 @@ class FreeKVCacheBlockQueue:
             self._pools[current_pool].remove(block)
             block.lifecycle_hint = new_hint
             if new_hint == "must":
-                # Promotion to must restarts the TTL clock.
+                # Promotion to must restarts the TTL clock and tags
+                # the block with the source class for per-class TTL.
                 block.last_promoted_ns = time.monotonic_ns()
+                block.source_class = source_class
             self._pools[new_hint].append(block)
             self._pool_of[block.block_id] = new_hint
         else:
@@ -614,6 +739,45 @@ class FreeKVCacheBlockQueue:
             # will be resolved at next append() (which stamps
             # last_promoted_ns if landing in must).
             block.lifecycle_hint = new_hint
+            if new_hint == "must":
+                block.source_class = source_class
+
+    # --- Phase D: access-based promotion ------------------------------------
+    def try_access_promote(self, block: KVCacheBlock) -> bool:
+        """Increment ``block._access_count`` and promote may → must if
+        the threshold is reached. Called from ``BlockPool.touch()``
+        on every cache hit, BEFORE the block is removed from the
+        free queue (so promotion can splice it from may to must
+        atomically).
+
+        Returns True if a promotion happened, False otherwise. No-op
+        when:
+        - mode is pure_lru (hint is ignored)
+        - access_promotion_threshold == 0 (Phase D disabled via env)
+        - block is the null block
+        - block.lifecycle_hint != "may" (already promoted, or
+          declared no — both inappropriate for access-based promote)
+
+        Source class is "unstructured" — access-based promotion is
+        the canonical unstructured-source promotion path
+        (docs/v2/32 §2.4 + DL-8). When the block is in-use (touched
+        but already removed from queue), update_block_hint just sets
+        the metadata; pool placement on re-free will pick must.
+        """
+        if self.mode == VICTIM_POLICY_PURE_LRU:
+            return False
+        if self.access_promotion_threshold <= 0:
+            return False
+        if getattr(block, "is_null", False):
+            return False
+        block._access_count += 1
+        if block._access_count < self.access_promotion_threshold:
+            return False
+        if block.lifecycle_hint != "may":
+            return False
+        self.update_block_hint(block, "must", source_class="unstructured")
+        self.access_promoted_count += 1
+        return True
 
     def get_all_free_blocks(self) -> list[KVCacheBlock]:
         """Get all free blocks across all pools, ordered no → may → must.

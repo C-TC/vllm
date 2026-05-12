@@ -826,6 +826,165 @@ def test_phase_c_ttl_env_invalid_raises(monkeypatch):
         FreeKVCacheBlockQueue([])
 
 
+# -- WIRES Phase D: access-based promotion + per-class TTL -------------------
+
+
+def test_phase_d_access_promote_threshold_1_promotes_after_first_hit():
+    """Default threshold=1: any cache hit on a may block promotes it to must
+    with source_class='unstructured'."""
+    blocks = [KVCacheBlock(block_id=i) for i in range(2)]  # default may
+    queue = FreeKVCacheBlockQueue(
+        blocks,
+        mode=VICTIM_POLICY_WIRES_THREE_POOL,
+        access_promotion_threshold=1,
+    )
+    assert queue.num_free_blocks_in_pool("may") == 2
+    # First access promotes block[0].
+    promoted = queue.try_access_promote(blocks[0])
+    assert promoted is True
+    assert blocks[0].lifecycle_hint == "must"
+    assert blocks[0].source_class == "unstructured"
+    assert queue.num_free_blocks_in_pool("must") == 1
+    assert queue.num_free_blocks_in_pool("may") == 1
+    assert queue.access_promoted_count == 1
+
+
+def test_phase_d_access_promote_higher_threshold_requires_multiple_hits(
+    monkeypatch,
+):
+    """threshold=3: takes 3 hits to promote."""
+    blocks = [KVCacheBlock(block_id=0)]
+    queue = FreeKVCacheBlockQueue(
+        blocks,
+        mode=VICTIM_POLICY_WIRES_THREE_POOL,
+        access_promotion_threshold=3,
+    )
+    assert queue.try_access_promote(blocks[0]) is False  # count=1
+    assert queue.try_access_promote(blocks[0]) is False  # count=2
+    assert queue.try_access_promote(blocks[0]) is True   # count=3 → fire
+    assert blocks[0].lifecycle_hint == "must"
+    assert blocks[0]._access_count == 3
+
+
+def test_phase_d_access_promote_threshold_0_disables(monkeypatch):
+    """threshold=0 disables Phase D entirely."""
+    blocks = [KVCacheBlock(block_id=0)]
+    queue = FreeKVCacheBlockQueue(
+        blocks,
+        mode=VICTIM_POLICY_WIRES_THREE_POOL,
+        access_promotion_threshold=0,
+    )
+    for _ in range(5):
+        assert queue.try_access_promote(blocks[0]) is False
+    assert blocks[0].lifecycle_hint == "may"
+    assert blocks[0]._access_count == 0  # not even incremented when disabled
+
+
+def test_phase_d_access_promote_skips_already_must():
+    """Blocks already in must pool aren't re-promoted; access count stays 0
+    (we exit before incrementing if hint != may)."""
+    blocks = [KVCacheBlock(block_id=0)]
+    blocks[0].lifecycle_hint = "must"
+    queue = FreeKVCacheBlockQueue(
+        blocks,
+        mode=VICTIM_POLICY_WIRES_THREE_POOL,
+        access_promotion_threshold=1,
+    )
+    # Increment access count, but no promote because hint is already must.
+    promoted = queue.try_access_promote(blocks[0])
+    assert promoted is False
+    assert blocks[0].lifecycle_hint == "must"  # unchanged
+    assert queue.access_promoted_count == 0
+
+
+def test_phase_d_access_promote_pure_lru_mode_noop():
+    """pure_lru mode never promotes via access (lifecycle_hint is metadata)."""
+    blocks = [KVCacheBlock(block_id=0)]
+    queue = FreeKVCacheBlockQueue(
+        blocks,
+        mode=VICTIM_POLICY_PURE_LRU,
+        access_promotion_threshold=1,
+    )
+    assert queue.try_access_promote(blocks[0]) is False
+    assert blocks[0].lifecycle_hint == "may"
+    assert queue.access_promoted_count == 0
+
+
+def test_phase_d_per_class_ttl_structured_only_picks_structured_ttl():
+    """A structured-source block uses structured_ttl_ns; unstructured-source
+    block uses unstructured_ttl_ns. Independently configurable."""
+    # Build a queue with very short structured TTL and very long unstructured.
+    blocks = [KVCacheBlock(block_id=i) for i in range(2)]
+    queue = FreeKVCacheBlockQueue(
+        blocks,
+        mode=VICTIM_POLICY_WIRES_THREE_POOL,
+        structured_ttl_ns=1_000_000,         # 1 ms
+        unstructured_ttl_ns=10_000_000_000,  # 10 s
+    )
+    # Promote block[0] structured, block[1] unstructured.
+    queue.update_block_hint(blocks[0], "must", source_class="structured")
+    queue.update_block_hint(blocks[1], "must", source_class="unstructured")
+    assert blocks[0].source_class == "structured"
+    assert blocks[1].source_class == "unstructured"
+    assert queue.num_free_blocks_in_pool("must") == 2
+
+    # Backdate blocks so structured one is expired but unstructured isn't.
+    blocks[0].last_promoted_ns = 1  # ancient — expired by structured TTL (1ms)
+    # blocks[1] keeps its fresh timestamp from update_block_hint.
+
+    # Sweep should demote ONLY the structured block.
+    demoted = queue._sweep_ttl_must()
+    assert demoted == 1
+    assert queue.num_free_blocks_in_pool("must") == 1
+    assert queue.num_free_blocks_in_pool("may") == 1
+    # The remaining must block is the unstructured one.
+    must_remaining = queue._pools["must"].head.next_free_block
+    assert must_remaining is blocks[1]
+
+
+def test_phase_d_access_count_resets_on_block_eviction():
+    """When a block's hash is reset (cache slot recycled for new content),
+    _access_count zeroes so the new entry starts fresh."""
+    block = KVCacheBlock(block_id=0)
+    block._access_count = 5
+    block.reset_hash()
+    assert block._access_count == 0
+
+
+def test_phase_d_threshold_env_default_1(monkeypatch):
+    monkeypatch.delenv("WIRES_KVCACHE_ACCESS_PROMOTION_THRESHOLD", raising=False)
+    queue = FreeKVCacheBlockQueue([])
+    assert queue.access_promotion_threshold == 1
+
+
+def test_phase_d_threshold_env_override(monkeypatch):
+    monkeypatch.setenv("WIRES_KVCACHE_ACCESS_PROMOTION_THRESHOLD", "5")
+    queue = FreeKVCacheBlockQueue([])
+    assert queue.access_promotion_threshold == 5
+
+
+def test_phase_d_unstructured_ttl_env_default(monkeypatch):
+    monkeypatch.delenv("WIRES_KVCACHE_UNSTRUCTURED_TTL_MS", raising=False)
+    monkeypatch.delenv("WIRES_KVCACHE_STRUCTURED_TTL_MS", raising=False)
+    queue = FreeKVCacheBlockQueue([])
+    # v1 default: equal to structured TTL.
+    assert queue._unstructured_ttl_ns == queue._structured_ttl_ns
+    assert queue._unstructured_ttl_ns == 300 * 1_000_000_000
+
+
+def test_phase_d_unstructured_ttl_env_override(monkeypatch):
+    monkeypatch.setenv("WIRES_KVCACHE_UNSTRUCTURED_TTL_MS", "60000")
+    queue = FreeKVCacheBlockQueue([])
+    assert queue._unstructured_ttl_ns == 60 * 1_000_000_000
+
+
+def test_phase_d_update_block_hint_invalid_source_class_raises():
+    blocks = [KVCacheBlock(block_id=0)]
+    queue = FreeKVCacheBlockQueue(blocks, mode=VICTIM_POLICY_WIRES_THREE_POOL)
+    with pytest.raises(ValueError, match="source_class"):
+        queue.update_block_hint(blocks[0], "must", source_class="bogus")
+
+
 def test_generate_block_hash_extra_keys():
     request = make_request(
         request_id="0",

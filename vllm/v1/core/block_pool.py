@@ -451,6 +451,14 @@ class BlockPool:
                     record_retention = None
                 break
         for block in blocks:
+            # WIRES Phase D: access-based promotion. Increment per-block
+            # _access_count; if it crosses WIRES_KVCACHE_ACCESS_PROMOTION_THRESHOLD
+            # (default 1), promote may -> must with source_class="unstructured".
+            # Done BEFORE the queue.remove() below so the promotion
+            # splices the block from may to must atomically while it's
+            # still in the queue. No-op if not in may, if pool is
+            # pure_lru, or threshold is 0.
+            self.free_block_queue.try_access_promote(block)
             # ref_cnt=0 means this block is in the free list (i.e. eviction
             # candidate), so remove it.
             if block.ref_cnt == 0 and not block.is_null:
