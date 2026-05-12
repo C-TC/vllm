@@ -5,6 +5,7 @@
 import copy
 import hashlib
 import os
+import time
 from collections import defaultdict
 from collections.abc import Callable, Iterable, Iterator, Sequence
 from dataclasses import dataclass, replace
@@ -141,6 +142,17 @@ class KVCacheBlock:
     #   - Monitor callback after CFG events (loop exit -> "no")
     lifecycle_hint: str = "may"
 
+    # WIRES Phase C: monotonic ns timestamp recorded when this block
+    # was last promoted into the must pool. 0 = never promoted (block
+    # has always lived in no/may, or was just allocated). Used by the
+    # lazy TTL sweep at the head of popleft_n to demote blocks whose
+    # `last_promoted_ns + TTL_must < now`. See docs/v2/32 §2.4.
+    # In the v1 implementation only one source class is wired
+    # (structured, via update_segment_lifecycle_hint), so a single
+    # TTL constant suffices. When Phase D adds access-based promotion
+    # the queue will also tag a `source_class` and pick the right TTL.
+    last_promoted_ns: int = 0
+
     # WIRES Phase E4: per-block segment id used by the block-pool
     # touch / eviction hooks to attribute cache events back to the
     # SegmentRegistry. ``None`` for non-WIRES blocks (the vast
@@ -218,6 +230,25 @@ class _PoolList:
         self.tail.prev_free_block = last
         self.size += len(blocks)
 
+    def prepend_many(self, blocks: list["KVCacheBlock"]) -> None:
+        """Insert blocks at the LRU end (front). Used by the TTL sweep
+        to drop demoted-from-must blocks at the front of the may pool
+        so they evict before may's existing entries (next-to-evict
+        semantics). See docs/v2/32 §2.4."""
+        if not blocks:
+            return
+        first = self.head.next_free_block
+        assert first is not None
+        # Splice [blocks...] between head and current first.
+        prev = self.head
+        for b in blocks:
+            b.prev_free_block = prev
+            prev.next_free_block = b
+            prev = b
+        prev.next_free_block = first
+        first.prev_free_block = prev
+        self.size += len(blocks)
+
     def remove(self, block: "KVCacheBlock") -> None:
         prev = block.prev_free_block
         nxt = block.next_free_block
@@ -253,6 +284,36 @@ class _PoolList:
 VICTIM_POLICY_WIRES_THREE_POOL = "wires_three_pool"
 VICTIM_POLICY_PURE_LRU = "pure_lru"
 SUPPORTED_VICTIM_POLICIES = (VICTIM_POLICY_WIRES_THREE_POOL, VICTIM_POLICY_PURE_LRU)
+
+# WIRES Phase C: structured-source TTL_must default = 5 minutes.
+# Per docs/v2/32 DL-8: structured TTL is a heuristic constant in v1
+# (refined later via per-segment next-consumer ETA from monitor).
+# Unstructured TTL is the cross-class fairness lever and is held until
+# the expert-brief design lands (see docs/v2/33 OQ-Fairness).
+_DEFAULT_STRUCTURED_TTL_MS = 300_000
+
+
+def _resolve_structured_ttl_ns_from_env() -> int:
+    """Resolve ``WIRES_KVCACHE_STRUCTURED_TTL_MS`` env var to nanoseconds.
+
+    A value of 0 disables the TTL sweep entirely (structured `must`
+    blocks live until force-evicted by `popleft_n` step 3). Useful for
+    isolating Phase A/B regressions from Phase C TTL behaviour.
+    """
+    raw = os.environ.get("WIRES_KVCACHE_STRUCTURED_TTL_MS")
+    if raw is None:
+        return _DEFAULT_STRUCTURED_TTL_MS * 1_000_000
+    try:
+        ms = int(raw)
+    except ValueError as e:
+        raise ValueError(
+            f"WIRES_KVCACHE_STRUCTURED_TTL_MS must be an integer (got {raw!r})"
+        ) from e
+    if ms < 0:
+        raise ValueError(
+            f"WIRES_KVCACHE_STRUCTURED_TTL_MS must be >= 0 (got {ms})"
+        )
+    return ms * 1_000_000
 
 
 def _resolve_victim_policy_from_env() -> str:
@@ -315,6 +376,7 @@ class FreeKVCacheBlockQueue:
         self,
         blocks: list[KVCacheBlock],
         mode: str | None = None,
+        structured_ttl_ns: int | None = None,
     ) -> None:
         self.mode: str = mode if mode is not None else _resolve_victim_policy_from_env()
         if self.mode not in SUPPORTED_VICTIM_POLICIES:
@@ -322,6 +384,11 @@ class FreeKVCacheBlockQueue:
                 f"Unknown FreeKVCacheBlockQueue mode={self.mode!r}; "
                 f"supported: {SUPPORTED_VICTIM_POLICIES}"
             )
+        self._structured_ttl_ns: int = (
+            structured_ttl_ns
+            if structured_ttl_ns is not None
+            else _resolve_structured_ttl_ns_from_env()
+        )
 
         self._pools: dict[str, _PoolList] = {
             name: _PoolList() for name in self.POOL_ORDER
@@ -332,13 +399,20 @@ class FreeKVCacheBlockQueue:
         # and remove (e.g. via segment hint update); pool membership
         # must remain consistent regardless.
         self._pool_of: dict[int, str] = {}
+        now_ns = time.monotonic_ns()
         for block in blocks:
             pool_name = self._pool_for_block(block)
+            if pool_name == "must":
+                # Initial placement counts as promotion-time for TTL.
+                block.last_promoted_ns = now_ns
             self._pools[pool_name].append(block)
             self._pool_of[block.block_id] = pool_name
 
         # Telemetry counter (docs/v2/32 §2.6). Always 0 in pure_lru mode.
         self.must_pool_evicted_count: int = 0
+        # Telemetry counter (docs/v2/32 §2.4). Cumulative count of blocks
+        # demoted from must -> may by the lazy TTL sweep at popleft_n.
+        self.ttl_demoted_count: int = 0
 
     def _pool_for_block(self, block: KVCacheBlock) -> str:
         """Resolve which pool ``block`` should land in given the active mode."""
@@ -370,8 +444,55 @@ class FreeKVCacheBlockQueue:
         return self._pools[pool].size
 
     # --- Pop primitives ---------------------------------------------------
+    def _sweep_ttl_must(self) -> int:
+        """Lazy TTL sweep on the must pool head (docs/v2/32 §2.4 + DL-10).
+
+        Walks the must pool from the head; any block whose
+        ``last_promoted_ns + structured_ttl_ns < now`` is demoted to
+        the may pool's HEAD (LRU end — they evict before may's
+        existing entries on the next popleft_n). Stops at the first
+        non-expired block; since pool ordering reflects promotion
+        time, all subsequent blocks are fresher.
+
+        No-op when:
+        - mode is pure_lru (must pool is always empty there)
+        - structured_ttl_ns is 0 (TTL disabled)
+        - must pool is empty
+
+        Returns the number of blocks demoted.
+        """
+        if self.mode == VICTIM_POLICY_PURE_LRU:
+            return 0
+        ttl = self._structured_ttl_ns
+        if ttl <= 0:
+            return 0
+        must = self._pools["must"]
+        if must.size == 0:
+            return 0
+        now_ns = time.monotonic_ns()
+        cutoff = now_ns - ttl
+        demoted: list[KVCacheBlock] = []
+        while must.size > 0:
+            head = must.head.next_free_block
+            if head is None or head is must.tail:
+                break
+            if head.last_promoted_ns > cutoff:
+                # Head is still fresh; pool order is by promotion time
+                # so everything else is fresher too.
+                break
+            blk = must.popleft_one()
+            assert blk is not None
+            blk.lifecycle_hint = "may"
+            demoted.append(blk)
+            self._pool_of[blk.block_id] = "may"
+        if demoted:
+            self._pools["may"].prepend_many(demoted)
+            self.ttl_demoted_count += len(demoted)
+        return len(demoted)
+
     def popleft(self) -> KVCacheBlock:
         """Pop the oldest block across all pools, in priority order."""
+        self._sweep_ttl_must()
         for name in self.POOL_ORDER:
             blk = self._pools[name].popleft_one()
             if blk is not None:
@@ -384,12 +505,15 @@ class FreeKVCacheBlockQueue:
     def popleft_n(self, n: int) -> list[KVCacheBlock]:
         """Pop n blocks per the 3-pool priority algorithm (docs/v2/32 §2.2).
 
-        Takes from no pool (oldest first) up to n, then may pool, then
-        must pool. Each step walks only its own pool's tail end — no
-        full-queue scans.
+        Step 0: lazy TTL sweep on must pool head (§2.4).
+        Step 1-3: take from no -> may -> must in order; each step
+        walks only its own pool's tail end (no full-queue scans).
         """
         if n == 0:
             return []
+
+        # Step 0: lazy TTL sweep before deciding eviction order.
+        self._sweep_ttl_must()
 
         ret: list[KVCacheBlock] = []
         must_taken = 0
@@ -418,8 +542,11 @@ class FreeKVCacheBlockQueue:
     # --- Insert / remove primitives ---------------------------------------
     def append(self, block: KVCacheBlock) -> None:
         """Append block to the pool that matches its current lifecycle_hint
-        (always the may pool in ``pure_lru`` mode)."""
+        (always the may pool in ``pure_lru`` mode). Stamps
+        ``last_promoted_ns`` when the destination is the must pool."""
         pool_name = self._pool_for_block(block)
+        if pool_name == "must":
+            block.last_promoted_ns = time.monotonic_ns()
         self._pools[pool_name].append(block)
         self._pool_of[block.block_id] = pool_name
 
@@ -428,8 +555,11 @@ class FreeKVCacheBlockQueue:
         if not blocks:
             return
         by_pool: dict[str, list[KVCacheBlock]] = {n: [] for n in self.POOL_ORDER}
+        now_ns = time.monotonic_ns()
         for b in blocks:
             pool_name = self._pool_for_block(b)
+            if pool_name == "must":
+                b.last_promoted_ns = now_ns
             by_pool[pool_name].append(b)
             self._pool_of[b.block_id] = pool_name
         for name, group in by_pool.items():
@@ -474,11 +604,15 @@ class FreeKVCacheBlockQueue:
             # Block is in a free pool — move it.
             self._pools[current_pool].remove(block)
             block.lifecycle_hint = new_hint
+            if new_hint == "must":
+                # Promotion to must restarts the TTL clock.
+                block.last_promoted_ns = time.monotonic_ns()
             self._pools[new_hint].append(block)
             self._pool_of[block.block_id] = new_hint
         else:
             # Block is in-use; just update the metadata. Pool placement
-            # will be resolved at next append().
+            # will be resolved at next append() (which stamps
+            # last_promoted_ns if landing in must).
             block.lifecycle_hint = new_hint
 
     def get_all_free_blocks(self) -> list[KVCacheBlock]:

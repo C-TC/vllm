@@ -678,6 +678,154 @@ def test_victim_policy_env_var_unknown_raises(monkeypatch):
         FreeKVCacheBlockQueue([])
 
 
+# -- WIRES Phase C: lazy TTL sweep on must pool head -------------------------
+
+
+def _make_must_blocks(n: int) -> list[KVCacheBlock]:
+    blocks = []
+    for i in range(n):
+        b = KVCacheBlock(block_id=i)
+        b.lifecycle_hint = "must"
+        blocks.append(b)
+    return blocks
+
+
+def test_phase_c_ttl_disabled_zero_means_no_sweep(monkeypatch):
+    """structured_ttl_ns=0 disables the TTL sweep (must blocks stay forever)."""
+    blocks = _make_must_blocks(3)
+    queue = FreeKVCacheBlockQueue(
+        blocks, mode=VICTIM_POLICY_WIRES_THREE_POOL, structured_ttl_ns=0
+    )
+    # Even after a "long" wait, no demotion fires.
+    for b in blocks:
+        b.last_promoted_ns = 1  # ancient timestamp
+    demoted = queue._sweep_ttl_must()
+    assert demoted == 0
+    assert queue.num_free_blocks_in_pool("must") == 3
+    assert queue.ttl_demoted_count == 0
+
+
+def test_phase_c_ttl_expired_blocks_demoted_to_may_lru_end():
+    """Expired must blocks demote to may pool HEAD (LRU end), so they
+    evict before may's existing entries on the next popleft_n."""
+    must_blocks = _make_must_blocks(2)
+    may_block = KVCacheBlock(block_id=42)  # default may
+    queue = FreeKVCacheBlockQueue(
+        must_blocks + [may_block],
+        mode=VICTIM_POLICY_WIRES_THREE_POOL,
+        structured_ttl_ns=1_000_000_000,  # 1s
+    )
+    assert queue.num_free_blocks_in_pool("must") == 2
+    assert queue.num_free_blocks_in_pool("may") == 1
+
+    # Make both must blocks "expired" by backdating their promotion timestamp.
+    for b in must_blocks:
+        b.last_promoted_ns = 1  # ancient
+
+    # Trigger sweep via popleft_n.
+    out = queue.popleft_n(1)
+    assert queue.ttl_demoted_count == 2
+    assert queue.num_free_blocks_in_pool("must") == 0
+    assert queue.num_free_blocks_in_pool("may") == 2  # 2 demoted in front of original may
+    # First popped should be the FIRST demoted block (LRU within may)
+    # since prepend_many places them at may's HEAD in source order.
+    assert out == [must_blocks[0]]
+    for blk in out:
+        assert blk.lifecycle_hint == "may"
+
+
+def test_phase_c_ttl_sweep_stops_at_first_non_expired():
+    """Sweep walks from head and stops at first non-expired block."""
+    must_blocks = _make_must_blocks(4)
+    queue = FreeKVCacheBlockQueue(
+        must_blocks,
+        mode=VICTIM_POLICY_WIRES_THREE_POOL,
+        structured_ttl_ns=1_000_000_000,
+    )
+    # Expire the first 2; leave 3 + 4 fresh.
+    must_blocks[0].last_promoted_ns = 1
+    must_blocks[1].last_promoted_ns = 1
+    # 2 and 3 keep the timestamp from constructor (now-ish) → fresh.
+
+    demoted = queue._sweep_ttl_must()
+    assert demoted == 2
+    assert queue.num_free_blocks_in_pool("must") == 2
+    assert queue.num_free_blocks_in_pool("may") == 2
+
+
+def test_phase_c_ttl_promotion_restarts_clock():
+    """update_block_hint(may->must) stamps last_promoted_ns to now."""
+    blocks = [KVCacheBlock(block_id=i) for i in range(1)]  # default may
+    queue = FreeKVCacheBlockQueue(
+        blocks,
+        mode=VICTIM_POLICY_WIRES_THREE_POOL,
+        structured_ttl_ns=1_000_000_000,
+    )
+    blocks[0].last_promoted_ns = 1  # ancient (irrelevant — block is in may)
+    queue.update_block_hint(blocks[0], "must")
+    # Promotion to must just stamped a fresh timestamp; block won't expire.
+    assert blocks[0].last_promoted_ns > 1_000_000_000  # > 1 sec since epoch ns
+    demoted = queue._sweep_ttl_must()
+    assert demoted == 0
+    assert queue.num_free_blocks_in_pool("must") == 1
+
+
+def test_phase_c_ttl_no_pressure_no_sweep_when_must_empty():
+    """popleft_n with no must blocks doesn't waste sweep work."""
+    blocks = [KVCacheBlock(block_id=i) for i in range(3)]  # default may
+    queue = FreeKVCacheBlockQueue(
+        blocks,
+        mode=VICTIM_POLICY_WIRES_THREE_POOL,
+        structured_ttl_ns=1_000_000_000,
+    )
+    # popleft a few; should never increment ttl_demoted_count.
+    queue.popleft_n(2)
+    assert queue.ttl_demoted_count == 0
+
+
+def test_phase_c_ttl_pure_lru_mode_skips_sweep():
+    """pure_lru mode treats must pool as nonexistent; no sweep work."""
+    blocks = [KVCacheBlock(block_id=i) for i in range(3)]
+    for b in blocks:
+        b.lifecycle_hint = "must"  # ignored in pure_lru
+        b.last_promoted_ns = 1  # ancient
+    queue = FreeKVCacheBlockQueue(
+        blocks,
+        mode=VICTIM_POLICY_PURE_LRU,
+        structured_ttl_ns=1_000_000_000,
+    )
+    demoted = queue._sweep_ttl_must()
+    assert demoted == 0
+
+
+def test_phase_c_ttl_env_default_300s(monkeypatch):
+    """Default structured TTL is 300s = 300 * 1e9 ns when env unset."""
+    monkeypatch.delenv("WIRES_KVCACHE_STRUCTURED_TTL_MS", raising=False)
+    queue = FreeKVCacheBlockQueue([])
+    assert queue._structured_ttl_ns == 300 * 1_000_000_000
+
+
+def test_phase_c_ttl_env_override(monkeypatch):
+    monkeypatch.setenv("WIRES_KVCACHE_STRUCTURED_TTL_MS", "60000")
+    queue = FreeKVCacheBlockQueue([])
+    assert queue._structured_ttl_ns == 60 * 1_000_000_000
+
+
+def test_phase_c_ttl_env_zero_disables_sweep(monkeypatch):
+    monkeypatch.setenv("WIRES_KVCACHE_STRUCTURED_TTL_MS", "0")
+    queue = FreeKVCacheBlockQueue([])
+    assert queue._structured_ttl_ns == 0
+
+
+def test_phase_c_ttl_env_invalid_raises(monkeypatch):
+    monkeypatch.setenv("WIRES_KVCACHE_STRUCTURED_TTL_MS", "bogus")
+    with pytest.raises(ValueError, match="must be an integer"):
+        FreeKVCacheBlockQueue([])
+    monkeypatch.setenv("WIRES_KVCACHE_STRUCTURED_TTL_MS", "-100")
+    with pytest.raises(ValueError, match="must be >= 0"):
+        FreeKVCacheBlockQueue([])
+
+
 def test_generate_block_hash_extra_keys():
     request = make_request(
         request_id="0",
