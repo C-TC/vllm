@@ -145,9 +145,31 @@ class KVCacheBlock:
     # WIRES Phase C: monotonic ns timestamp recorded when this block
     # was last promoted into the must pool. 0 = never promoted (block
     # has always lived in no/may, or was just allocated). Used by the
-    # lazy TTL sweep at the head of popleft_n to demote blocks whose
-    # `last_promoted_ns + TTL_must_for_source < now`. See docs/v2/32 §2.4.
+    # lazy TTL sweep at the head of popleft_n. Phase C3+ uses
+    # ``last_promoted_ns + alpha * ttl_at_promotion_ns < now`` as the
+    # demotion deadline. See docs/v2/32 §2.4.
     last_promoted_ns: int = 0
+
+    # WIRES Phase C3 (per docs/v2/32 §2.4.1 unstructured TTL design):
+    # snapshot of the TTL value (in ns) computed at promotion time.
+    # For structured-source promotions: equal to
+    # WIRES_KVCACHE_STRUCTURED_TTL_MS converted to ns.
+    # For unstructured-source promotions: equal to
+    #   T̂_u + k * sqrt(Var_u)   (if n_samples_unstructured >= 50)
+    #   bootstrap default 60s   (otherwise)
+    # Snapshot semantics: subsequent EMA drift does NOT modify
+    # already-promoted blocks. Avoids retroactive churn under
+    # workload shifts.
+    ttl_at_promotion_ns: int = 0
+
+    # WIRES Phase C3: monotonic ns timestamp of the block's most
+    # recent access (cache hit OR initial fill). Bumped in
+    # ``BlockPool.touch()``. Used by the unstructured EMA estimator
+    # to compute prefix-reuse intervals: when a must-pool
+    # unstructured block is hit, ``interval = now - last_access_ns``
+    # is fed into T̂_u / Var_u BEFORE last_access_ns is bumped to
+    # ``now``. Demotion (rollback or TTL) does NOT clear this field.
+    last_access_ns: int = 0
 
     # WIRES Phase D: which promotion path put this block into the must
     # pool. Drives per-class TTL during the lazy sweep.
@@ -193,12 +215,21 @@ class KVCacheBlock:
     def reset_hash(self):
         """Reset the block hash when the block is evicted.
 
-        Also resets WIRES Phase D's per-block access counter, since the
-        slot is being recycled for new content; the previous content's
-        hit history is no longer meaningful.
+        Also resets WIRES Phase D/C3 per-block state, since the slot
+        is being recycled for new content; the previous content's
+        hit history / promotion / TTL snapshot are no longer
+        meaningful.
         """
         self._block_hash = None
         self._access_count = 0
+        # Phase C3: clear promotion snapshot — the next promotion
+        # starts a fresh TTL window for the new content.
+        self.last_promoted_ns = 0
+        self.ttl_at_promotion_ns = 0
+        # Note: last_access_ns is NOT reset here; the field tracks
+        # the slot's latest physical access regardless of content,
+        # and zero-after-allocation behaviour is preserved by the
+        # default field initialiser only on construction.
 
     def __repr__(self) -> str:
         # Use block_id instead of KVCacheBlock object to avoid calling __repr__
@@ -314,12 +345,21 @@ SUPPORTED_VICTIM_POLICIES = (VICTIM_POLICY_WIRES_THREE_POOL, VICTIM_POLICY_PURE_
 # Unstructured TTL is the cross-class fairness lever and is held until
 # the expert-brief design lands (see docs/v2/33 OQ-Fairness).
 _DEFAULT_STRUCTURED_TTL_MS = 300_000
-# v1 default: unstructured TTL = structured TTL. The full v1 fairness
-# design (docs/v2/32 §2.4 + §3.1, DL-14..DL-18) uses an EMA-driven
-# `T̂_u + k·ε_u` formula with α-shrinkage capacity boundary; that
-# estimator is a follow-up. For now both classes use the same
-# constant so Phase D can land + be GPU-verified independently.
-_DEFAULT_UNSTRUCTURED_TTL_MS = _DEFAULT_STRUCTURED_TTL_MS
+# Phase C3 (docs/v2/32 §2.4.1): bootstrap TTL applied to
+# unstructured-source promotions until the EMA estimator has at
+# least N_BOOTSTRAP samples. After that the estimator drives TTL
+# (snapshot at promotion: T̂_u + k * sqrt(Var_u)).
+_DEFAULT_UNSTRUCTURED_TTL_BOOTSTRAP_MS = 60_000
+_DEFAULT_UNSTRUCTURED_BOOTSTRAP_SAMPLES = 50
+# Phase C3 EMA smoothing constant (~last 20 samples weighted).
+_DEFAULT_UNSTRUCTURED_EMA_ALPHA = 0.05
+# Phase C3 buffer thickness `k`. Per docs/v2/32 §3.1.4 (Cantelli
+# correction): Pr(actual >= T̂ + k*ε) ≤ 1/(1+k²). With k=4 → ≤5.9%
+# TTL-induced miss rate.
+_DEFAULT_UNSTRUCTURED_K = 4.0
+# Phase C4 α-shrinkage floor; below this α, `must_pool_evicted`
+# fires (emergency capacity).
+_DEFAULT_OVERFLOW_SHRINK_FLOOR = 0.25
 
 # Phase D access-based promotion threshold (DL-OQ5 = 1).
 _DEFAULT_ACCESS_PROMOTION_THRESHOLD = 1
@@ -353,10 +393,31 @@ def _resolve_structured_ttl_ns_from_env() -> int:
     )
 
 
-def _resolve_unstructured_ttl_ns_from_env() -> int:
+def _resolve_unstructured_bootstrap_ttl_ns_from_env() -> int:
     return _resolve_ttl_ns_from_env(
-        "WIRES_KVCACHE_UNSTRUCTURED_TTL_MS", _DEFAULT_UNSTRUCTURED_TTL_MS
+        "WIRES_KVCACHE_UNSTRUCTURED_BOOTSTRAP_TTL_MS",
+        _DEFAULT_UNSTRUCTURED_TTL_BOOTSTRAP_MS,
     )
+
+
+def _resolve_float_from_env(env_name: str, default: float) -> float:
+    raw = os.environ.get(env_name)
+    if raw is None:
+        return default
+    try:
+        return float(raw)
+    except ValueError as e:
+        raise ValueError(f"{env_name} must be a float (got {raw!r})") from e
+
+
+def _resolve_int_from_env(env_name: str, default: int) -> int:
+    raw = os.environ.get(env_name)
+    if raw is None:
+        return default
+    try:
+        return int(raw)
+    except ValueError as e:
+        raise ValueError(f"{env_name} must be an integer (got {raw!r})") from e
 
 
 def _resolve_access_promotion_threshold_from_env() -> int:
@@ -446,8 +507,13 @@ class FreeKVCacheBlockQueue:
         blocks: list[KVCacheBlock],
         mode: str | None = None,
         structured_ttl_ns: int | None = None,
-        unstructured_ttl_ns: int | None = None,
+        unstructured_bootstrap_ttl_ns: int | None = None,
         access_promotion_threshold: int | None = None,
+        unstructured_k: float | None = None,
+        ema_alpha: float | None = None,
+        bootstrap_samples: int | None = None,
+        overflow_shrink_floor: float | None = None,
+        total_capacity: int | None = None,
     ) -> None:
         self.mode: str = mode if mode is not None else _resolve_victim_policy_from_env()
         if self.mode not in SUPPORTED_VICTIM_POLICIES:
@@ -460,16 +526,64 @@ class FreeKVCacheBlockQueue:
             if structured_ttl_ns is not None
             else _resolve_structured_ttl_ns_from_env()
         )
-        self._unstructured_ttl_ns: int = (
-            unstructured_ttl_ns
-            if unstructured_ttl_ns is not None
-            else _resolve_unstructured_ttl_ns_from_env()
+        self._unstructured_bootstrap_ttl_ns: int = (
+            unstructured_bootstrap_ttl_ns
+            if unstructured_bootstrap_ttl_ns is not None
+            else _resolve_unstructured_bootstrap_ttl_ns_from_env()
         )
         self.access_promotion_threshold: int = (
             access_promotion_threshold
             if access_promotion_threshold is not None
             else _resolve_access_promotion_threshold_from_env()
         )
+        # Phase C3: EMA estimator for unstructured prefix-reuse interval.
+        self._unstructured_k: float = (
+            unstructured_k
+            if unstructured_k is not None
+            else _resolve_float_from_env(
+                "WIRES_KVCACHE_UNSTRUCTURED_K", _DEFAULT_UNSTRUCTURED_K
+            )
+        )
+        self._ema_alpha: float = (
+            ema_alpha
+            if ema_alpha is not None
+            else _resolve_float_from_env(
+                "WIRES_KVCACHE_UNSTRUCTURED_EMA_ALPHA",
+                _DEFAULT_UNSTRUCTURED_EMA_ALPHA,
+            )
+        )
+        self._bootstrap_samples: int = (
+            bootstrap_samples
+            if bootstrap_samples is not None
+            else _resolve_int_from_env(
+                "WIRES_KVCACHE_UNSTRUCTURED_BOOTSTRAP_SAMPLES",
+                _DEFAULT_UNSTRUCTURED_BOOTSTRAP_SAMPLES,
+            )
+        )
+        # EMA running state. Start at 0 — until n_samples >=
+        # bootstrap_samples, _unstructured_ttl_at_promotion_ns()
+        # returns the bootstrap constant, NOT a function of these
+        # state values, so initial values don't gate snapshot
+        # quality. After bootstrap, EMA is built up purely from
+        # observed samples.
+        self._T_hat_u_ns: float = 0.0
+        self._var_u_ns2: float = 0.0
+        self._n_samples_unstructured: int = 0
+
+        # Phase C4: α-shrinkage capacity boundary.
+        self._overflow_shrink_floor: float = (
+            overflow_shrink_floor
+            if overflow_shrink_floor is not None
+            else _resolve_float_from_env(
+                "WIRES_KVCACHE_OVERFLOW_SHRINK_FLOOR",
+                _DEFAULT_OVERFLOW_SHRINK_FLOOR,
+            )
+        )
+        self._alpha_shrinkage: float = 1.0
+        # Total capacity B for α formula. If None, α-shrinkage is
+        # effectively disabled (α stays at 1.0). block_pool passes
+        # this in; tests can omit when not exercising α.
+        self._total_capacity: int | None = total_capacity
 
         self._pools: dict[str, _PoolList] = {
             name: _PoolList() for name in self.POOL_ORDER
@@ -484,8 +598,12 @@ class FreeKVCacheBlockQueue:
         for block in blocks:
             pool_name = self._pool_for_block(block)
             if pool_name == "must":
-                # Initial placement counts as promotion-time for TTL.
-                block.last_promoted_ns = now_ns
+                # Initial placement counts as promotion-time for TTL;
+                # respect block's source_class if set, else default
+                # to structured.
+                self._stamp_must_promotion(
+                    block, now_ns, block.source_class or "structured"
+                )
             self._pools[pool_name].append(block)
             self._pool_of[block.block_id] = pool_name
 
@@ -497,6 +615,87 @@ class FreeKVCacheBlockQueue:
         # WIRES Phase D telemetry: cumulative count of blocks promoted
         # may -> must via access threshold (called by block_pool.touch).
         self.access_promoted_count: int = 0
+        # WIRES Phase C3 telemetry: cumulative EMA samples fed; running
+        # estimator state read-only via T_hat_u_ns / sigma_u_ns props.
+        self.unstructured_ema_sample_count: int = 0
+
+    @property
+    def T_hat_u_ns(self) -> float:
+        """Current EMA estimate of unstructured prefix-reuse interval (ns)."""
+        return self._T_hat_u_ns
+
+    @property
+    def sigma_u_ns(self) -> float:
+        """Current EMA-derived stddev of unstructured prefix-reuse interval (ns)."""
+        # Var can drift slightly negative under floating-point noise.
+        return (max(self._var_u_ns2, 0.0)) ** 0.5
+
+    @property
+    def alpha_shrinkage(self) -> float:
+        """Current α-shrinkage value (1.0 = no shrinkage; α_floor = clamp)."""
+        return self._alpha_shrinkage
+
+    def _feed_unstructured_sample(self, interval_ns: int) -> None:
+        """Phase C3: update EMA with a new prefix-reuse interval sample.
+
+        Called from BlockPool.touch when a must-pool block with
+        source_class == 'unstructured' gets a cache hit. Bootstrap
+        defaults stay in effect until n_samples >= _bootstrap_samples.
+        """
+        if interval_ns <= 0:
+            return
+        a = self._ema_alpha
+        x = float(interval_ns)
+        if self._n_samples_unstructured == 0:
+            # First sample: seed estimator at observed value, var stays
+            # at bootstrap (still considered unconverged).
+            self._T_hat_u_ns = x
+        else:
+            self._T_hat_u_ns = (1.0 - a) * self._T_hat_u_ns + a * x
+        delta = x - self._T_hat_u_ns
+        self._var_u_ns2 = (1.0 - a) * self._var_u_ns2 + a * (delta * delta)
+        self._n_samples_unstructured += 1
+        self.unstructured_ema_sample_count += 1
+
+    def _unstructured_ttl_at_promotion_ns(self) -> int:
+        """Phase C3: snapshot value for ttl_at_promotion_ns at unstructured
+        may->must promotion time. Bootstrap default until enough samples."""
+        if self._n_samples_unstructured < self._bootstrap_samples:
+            return self._unstructured_bootstrap_ttl_ns
+        return int(self._T_hat_u_ns + self._unstructured_k * self.sigma_u_ns)
+
+    def _recompute_alpha(self) -> float:
+        """Phase C4: capacity-boundary shrinkage.
+
+        Per docs/v2/32 §2.4.2 (Q3 answer = no safety_margin):
+            N_must_target = B − len(may_pool) − in_use_count
+            α = clamp(N_must_target / max(len(must_pool), 1), α_floor, 1)
+
+        Uses observed values (Q1, Q5: no projection). When
+        ``total_capacity`` is None (test mode without block_pool),
+        skip and leave α at 1.0.
+        """
+        if self.mode == VICTIM_POLICY_PURE_LRU:
+            self._alpha_shrinkage = 1.0
+            return 1.0
+        if self._total_capacity is None:
+            return self._alpha_shrinkage
+        # in_use = total - num_free - 1 (-1 for null block, which is
+        # not in any free pool but isn't a real "user" of cache).
+        in_use_count = max(
+            0, self._total_capacity - self.num_free_blocks - 1
+        )
+        may_size = self._pools["may"].size
+        must_size = max(self._pools["must"].size, 1)
+        n_must_target = self._total_capacity - may_size - in_use_count
+        if n_must_target <= 0:
+            self._alpha_shrinkage = self._overflow_shrink_floor
+            return self._alpha_shrinkage
+        raw_alpha = n_must_target / must_size
+        self._alpha_shrinkage = min(
+            1.0, max(self._overflow_shrink_floor, raw_alpha)
+        )
+        return self._alpha_shrinkage
 
     def _pool_for_block(self, block: KVCacheBlock) -> str:
         """Resolve which pool ``block`` should land in given the active mode."""
@@ -547,45 +746,35 @@ class FreeKVCacheBlockQueue:
         """
         if self.mode == VICTIM_POLICY_PURE_LRU:
             return 0
-        # Per-class TTL: pick cutoff per block based on source_class
-        # (DL-8 + Phase D). When BOTH TTLs are 0, no sweep happens.
-        ttl_struct = self._structured_ttl_ns
-        ttl_unstruct = self._unstructured_ttl_ns
-        if ttl_struct <= 0 and ttl_unstruct <= 0:
-            return 0
+        # Phase C3 + C4 (docs/v2/32 §2.4): per-block deadline using
+        # ttl_at_promotion_ns snapshot scaled by α-shrinkage. Recompute
+        # α first (Q4 answer = every popleft_n).
+        alpha = self._recompute_alpha()
         must = self._pools["must"]
         if must.size == 0:
             return 0
         now_ns = time.monotonic_ns()
-        # Walking from the head: pool ordering is by promotion time
-        # WITHIN each source class — but with mixed source classes
-        # at the head, the strict "stop at first non-expired" trick
-        # doesn't hold (a structured block ahead of an unstructured
-        # one might have a longer TTL and not be expired, while the
-        # unstructured one behind it IS expired). For correctness we
-        # walk until we hit a block that's non-expired AND the
-        # remaining-pool TTL minimum couldn't have expired anything
-        # else either; pragmatically: walk while each successive head
-        # is expired by ITS class TTL, stop at first non-expired.
-        # Worst case: skipping past mixed-class non-expired blocks at
-        # the head delays demotion of expired blocks behind them by
-        # one popleft_n cycle. Acceptable; revisit if mixed-class
-        # head ordering becomes pathological.
+        # Walk from head; demote blocks where
+        # `now > promoted_at_ns + alpha * ttl_at_promotion_ns`.
+        # Mixed source classes at head: the strict "stop at first
+        # non-expired" trick doesn't strictly hold (structured may
+        # have longer TTL than the unstructured behind it), but
+        # pragmatically we stop at first non-expired — any expired
+        # blocks behind a non-expired head get caught next cycle.
+        # Worst case: 1-cycle demotion delay. Acceptable.
         demoted: list[KVCacheBlock] = []
         while must.size > 0:
             head = must.head.next_free_block
             if head is None or head is must.tail:
                 break
-            ttl_for_head = (
-                ttl_struct if head.source_class == "structured" else ttl_unstruct
-            )
-            if ttl_for_head <= 0:
-                # This class has TTL disabled — head can't be demoted.
-                # Per the design comment above, stop walking; later
-                # blocks of the OTHER class won't be reached this
-                # cycle. Acceptable.
+            ttl = head.ttl_at_promotion_ns
+            if ttl <= 0:
+                # No TTL set (block was never properly promoted via
+                # the new path); skip rather than demote. Could
+                # happen during transition / for legacy blocks.
                 break
-            if head.last_promoted_ns > (now_ns - ttl_for_head):
+            deadline_ns = head.last_promoted_ns + int(alpha * ttl)
+            if deadline_ns > now_ns:
                 break
             blk = must.popleft_one()
             assert blk is not None
@@ -646,14 +835,31 @@ class FreeKVCacheBlockQueue:
             self.must_pool_evicted_count += must_taken
         return ret
 
+    def _stamp_must_promotion(
+        self, block: KVCacheBlock, now_ns: int, source_class: str
+    ) -> None:
+        """Phase C3: stamp promoted_at + ttl_at_promotion + source_class
+        on a block as it enters the must pool."""
+        block.last_promoted_ns = now_ns
+        block.source_class = source_class
+        if source_class == "structured":
+            block.ttl_at_promotion_ns = self._structured_ttl_ns
+        else:
+            block.ttl_at_promotion_ns = self._unstructured_ttl_at_promotion_ns()
+
     # --- Insert / remove primitives ---------------------------------------
     def append(self, block: KVCacheBlock) -> None:
         """Append block to the pool that matches its current lifecycle_hint
-        (always the may pool in ``pure_lru`` mode). Stamps
-        ``last_promoted_ns`` when the destination is the must pool."""
+        (always the may pool in ``pure_lru`` mode). Stamps must-promotion
+        metadata when the destination is the must pool."""
         pool_name = self._pool_for_block(block)
         if pool_name == "must":
-            block.last_promoted_ns = time.monotonic_ns()
+            # Initial pool placement: source_class default 'structured'
+            # (block was placed straight into must — implies caller
+            # intentionally tagged it as structured-class).
+            self._stamp_must_promotion(
+                block, time.monotonic_ns(), block.source_class or "structured"
+            )
         self._pools[pool_name].append(block)
         self._pool_of[block.block_id] = pool_name
 
@@ -666,7 +872,9 @@ class FreeKVCacheBlockQueue:
         for b in blocks:
             pool_name = self._pool_for_block(b)
             if pool_name == "must":
-                b.last_promoted_ns = now_ns
+                self._stamp_must_promotion(
+                    b, now_ns, b.source_class or "structured"
+                )
             by_pool[pool_name].append(b)
             self._pool_of[b.block_id] = pool_name
         for name, group in by_pool.items():
@@ -728,18 +936,22 @@ class FreeKVCacheBlockQueue:
             self._pools[current_pool].remove(block)
             block.lifecycle_hint = new_hint
             if new_hint == "must":
-                # Promotion to must restarts the TTL clock and tags
-                # the block with the source class for per-class TTL.
-                block.last_promoted_ns = time.monotonic_ns()
-                block.source_class = source_class
+                # Promotion to must: stamp promoted_at +
+                # ttl_at_promotion + source_class (Phase C3).
+                self._stamp_must_promotion(
+                    block, time.monotonic_ns(), source_class
+                )
             self._pools[new_hint].append(block)
             self._pool_of[block.block_id] = new_hint
         else:
             # Block is in-use; just update the metadata. Pool placement
-            # will be resolved at next append() (which stamps
-            # last_promoted_ns if landing in must).
+            # will be resolved at next append() (which stamps the
+            # promotion metadata if landing in must).
             block.lifecycle_hint = new_hint
             if new_hint == "must":
+                # Stamp source_class now so next append() picks up
+                # the right ttl_at_promotion. (last_promoted_ns will
+                # be set by append's _stamp_must_promotion call.)
                 block.source_class = source_class
 
     # --- Phase D: access-based promotion ------------------------------------

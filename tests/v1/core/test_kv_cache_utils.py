@@ -910,34 +910,36 @@ def test_phase_d_access_promote_pure_lru_mode_noop():
     assert queue.access_promoted_count == 0
 
 
-def test_phase_d_per_class_ttl_structured_only_picks_structured_ttl():
-    """A structured-source block uses structured_ttl_ns; unstructured-source
-    block uses unstructured_ttl_ns. Independently configurable."""
-    # Build a queue with very short structured TTL and very long unstructured.
+def test_phase_d_per_class_ttl_structured_short_unstructured_long():
+    """Phase C3: ttl_at_promotion is snapshotted PER block based on its
+    source_class at promotion time. Structured block uses
+    structured_ttl_ns; unstructured uses bootstrap (n_samples < 50)."""
     blocks = [KVCacheBlock(block_id=i) for i in range(2)]
     queue = FreeKVCacheBlockQueue(
         blocks,
         mode=VICTIM_POLICY_WIRES_THREE_POOL,
-        structured_ttl_ns=1_000_000,         # 1 ms
-        unstructured_ttl_ns=10_000_000_000,  # 10 s
+        structured_ttl_ns=1_000_000,                    # 1 ms
+        unstructured_bootstrap_ttl_ns=10_000_000_000,   # 10 s bootstrap
     )
     # Promote block[0] structured, block[1] unstructured.
     queue.update_block_hint(blocks[0], "must", source_class="structured")
     queue.update_block_hint(blocks[1], "must", source_class="unstructured")
     assert blocks[0].source_class == "structured"
     assert blocks[1].source_class == "unstructured"
+    assert blocks[0].ttl_at_promotion_ns == 1_000_000  # structured constant
+    assert blocks[1].ttl_at_promotion_ns == 10_000_000_000  # bootstrap (no samples)
     assert queue.num_free_blocks_in_pool("must") == 2
 
-    # Backdate blocks so structured one is expired but unstructured isn't.
-    blocks[0].last_promoted_ns = 1  # ancient — expired by structured TTL (1ms)
+    # Backdate blocks[0] so it's expired by its 1ms TTL.
+    blocks[0].last_promoted_ns = 1  # ancient
     # blocks[1] keeps its fresh timestamp from update_block_hint.
 
-    # Sweep should demote ONLY the structured block.
+    # Sweep should demote ONLY the structured block (per-block deadline
+    # uses block's own ttl_at_promotion_ns).
     demoted = queue._sweep_ttl_must()
     assert demoted == 1
     assert queue.num_free_blocks_in_pool("must") == 1
     assert queue.num_free_blocks_in_pool("may") == 1
-    # The remaining must block is the unstructured one.
     must_remaining = queue._pools["must"].head.next_free_block
     assert must_remaining is blocks[1]
 
@@ -963,19 +965,17 @@ def test_phase_d_threshold_env_override(monkeypatch):
     assert queue.access_promotion_threshold == 5
 
 
-def test_phase_d_unstructured_ttl_env_default(monkeypatch):
-    monkeypatch.delenv("WIRES_KVCACHE_UNSTRUCTURED_TTL_MS", raising=False)
-    monkeypatch.delenv("WIRES_KVCACHE_STRUCTURED_TTL_MS", raising=False)
+def test_phase_c3_unstructured_bootstrap_ttl_env_default(monkeypatch):
+    monkeypatch.delenv("WIRES_KVCACHE_UNSTRUCTURED_BOOTSTRAP_TTL_MS", raising=False)
     queue = FreeKVCacheBlockQueue([])
-    # v1 default: equal to structured TTL.
-    assert queue._unstructured_ttl_ns == queue._structured_ttl_ns
-    assert queue._unstructured_ttl_ns == 300 * 1_000_000_000
+    # Bootstrap default = 60s (per docs/v2/32 §2.4.1 + Q answer).
+    assert queue._unstructured_bootstrap_ttl_ns == 60 * 1_000_000_000
 
 
-def test_phase_d_unstructured_ttl_env_override(monkeypatch):
-    monkeypatch.setenv("WIRES_KVCACHE_UNSTRUCTURED_TTL_MS", "60000")
+def test_phase_c3_unstructured_bootstrap_ttl_env_override(monkeypatch):
+    monkeypatch.setenv("WIRES_KVCACHE_UNSTRUCTURED_BOOTSTRAP_TTL_MS", "120000")
     queue = FreeKVCacheBlockQueue([])
-    assert queue._unstructured_ttl_ns == 60 * 1_000_000_000
+    assert queue._unstructured_bootstrap_ttl_ns == 120 * 1_000_000_000
 
 
 def test_phase_d_update_block_hint_invalid_source_class_raises():
@@ -983,6 +983,187 @@ def test_phase_d_update_block_hint_invalid_source_class_raises():
     queue = FreeKVCacheBlockQueue(blocks, mode=VICTIM_POLICY_WIRES_THREE_POOL)
     with pytest.raises(ValueError, match="source_class"):
         queue.update_block_hint(blocks[0], "must", source_class="bogus")
+
+
+# -- WIRES Phase C3: EMA estimator for unstructured prefix-reuse interval ----
+
+
+def test_phase_c3_ema_bootstrap_default_used_until_threshold():
+    """Until n_samples >= bootstrap_samples, ttl_at_promotion uses
+    bootstrap default (60s by default; configurable)."""
+    queue = FreeKVCacheBlockQueue(
+        [],
+        mode=VICTIM_POLICY_WIRES_THREE_POOL,
+        unstructured_bootstrap_ttl_ns=12_345_678,  # arbitrary
+        bootstrap_samples=3,
+    )
+    # Before any samples, snapshot returns bootstrap.
+    assert queue._unstructured_ttl_at_promotion_ns() == 12_345_678
+    # Feed 2 samples — still below threshold of 3.
+    queue._feed_unstructured_sample(1_000_000_000)
+    queue._feed_unstructured_sample(2_000_000_000)
+    assert queue._n_samples_unstructured == 2
+    assert queue._unstructured_ttl_at_promotion_ns() == 12_345_678  # still bootstrap
+    # 3rd sample crosses threshold.
+    queue._feed_unstructured_sample(1_500_000_000)
+    assert queue._n_samples_unstructured == 3
+    snap = queue._unstructured_ttl_at_promotion_ns()
+    # Should be T̂_u + k * sigma_u (positive value).
+    assert snap > 0
+    assert snap != 12_345_678  # left bootstrap
+
+
+def test_phase_c3_ema_estimator_converges_toward_input_mean():
+    """EMA T̂_u tracks input mean over enough samples."""
+    queue = FreeKVCacheBlockQueue(
+        [],
+        mode=VICTIM_POLICY_WIRES_THREE_POOL,
+        bootstrap_samples=1,
+        ema_alpha=0.5,  # fast convergence for test
+    )
+    # Feed constant 1000ns 50 times — T̂_u should converge to ~1000.
+    for _ in range(50):
+        queue._feed_unstructured_sample(1000)
+    # Allow some slack for floating-point and EMA convergence.
+    assert 950 <= queue.T_hat_u_ns <= 1050
+    # Var should be near zero (constant input).
+    assert queue.sigma_u_ns < 50
+
+
+def test_phase_c3_ema_first_sample_seeds_estimator():
+    """First sample seeds T̂_u directly (avoid slow climb from bootstrap)."""
+    queue = FreeKVCacheBlockQueue(
+        [],
+        mode=VICTIM_POLICY_WIRES_THREE_POOL,
+        unstructured_bootstrap_ttl_ns=60_000_000_000,  # 60s
+    )
+    queue._feed_unstructured_sample(5_000_000_000)  # 5s
+    assert queue.T_hat_u_ns == 5_000_000_000
+    assert queue._n_samples_unstructured == 1
+
+
+def test_phase_c3_unstructured_promotion_snapshots_estimator_value():
+    """update_block_hint(must, source=unstructured) snapshots T̂_u + k·ε at
+    promotion time, NOT a constant — and then doesn't change retroactively."""
+    blocks = [KVCacheBlock(block_id=i) for i in range(2)]
+    queue = FreeKVCacheBlockQueue(
+        blocks,
+        mode=VICTIM_POLICY_WIRES_THREE_POOL,
+        bootstrap_samples=1,
+        ema_alpha=1.0,  # any sample fully replaces estimator
+        unstructured_k=2.0,
+    )
+    # Feed an estimator value: T̂_u = 1000, Var = 0 → sigma = 0.
+    queue._feed_unstructured_sample(1000)
+    # Promote block[0] — snapshot should be T̂ + k*sigma = 1000 + 0 = 1000.
+    queue.update_block_hint(blocks[0], "must", source_class="unstructured")
+    assert blocks[0].ttl_at_promotion_ns == 1000
+    # Now feed wildly different sample to shift T̂_u.
+    queue._feed_unstructured_sample(1_000_000_000_000)
+    # Already-promoted block's snapshot is unchanged.
+    assert blocks[0].ttl_at_promotion_ns == 1000
+    # New promotion picks up the new value.
+    queue.update_block_hint(blocks[1], "must", source_class="unstructured")
+    assert blocks[1].ttl_at_promotion_ns >= 1_000_000_000_000
+
+
+# -- WIRES Phase C4: α-shrinkage capacity boundary ---------------------------
+
+
+def test_phase_c4_alpha_default_one_when_no_pressure():
+    """No capacity pressure → α stays at 1.0."""
+    blocks = [KVCacheBlock(block_id=i) for i in range(10)]
+    queue = FreeKVCacheBlockQueue(
+        blocks, mode=VICTIM_POLICY_WIRES_THREE_POOL, total_capacity=100
+    )
+    # 10 blocks in may, 90 capacity unused → tons of headroom.
+    alpha = queue._recompute_alpha()
+    assert alpha == 1.0
+
+
+def test_phase_c4_alpha_shrinks_under_must_pool_pressure():
+    """When must pool size exceeds N_must_target = B - may - in_use,
+    α drops below 1 to scale down deadlines."""
+    blocks = [KVCacheBlock(block_id=i) for i in range(50)]
+    for b in blocks:
+        b.lifecycle_hint = "must"
+    queue = FreeKVCacheBlockQueue(
+        blocks,
+        mode=VICTIM_POLICY_WIRES_THREE_POOL,
+        total_capacity=10,  # 10 capacity but 50 must blocks!
+        overflow_shrink_floor=0.1,
+    )
+    # in_use = 10 - 50 - 1 = -41 → clamped to 0.
+    # N_must_target = 10 - 0 - 0 = 10. must_size = 50.
+    # raw_alpha = 10/50 = 0.2 → above floor (0.1) → α = 0.2.
+    alpha = queue._recompute_alpha()
+    assert 0.1 < alpha < 1.0
+
+
+def test_phase_c4_alpha_clamped_at_floor():
+    """When N_must_target ≤ 0, α clamps to the floor."""
+    blocks = [KVCacheBlock(block_id=i) for i in range(20)]
+    for b in blocks:
+        b.lifecycle_hint = "may"
+    queue = FreeKVCacheBlockQueue(
+        blocks,
+        mode=VICTIM_POLICY_WIRES_THREE_POOL,
+        total_capacity=20,
+        overflow_shrink_floor=0.3,
+    )
+    # may=20, in_use = 20-20-1 = -1 clamped 0. N_must_target = 20-20-0 = 0
+    # → clamps to floor.
+    alpha = queue._recompute_alpha()
+    assert alpha == 0.3
+
+
+def test_phase_c4_sweep_uses_alpha_to_scale_deadline():
+    """A block whose unscaled TTL would NOT have expired but α-scaled
+    TTL HAS expired must be demoted.
+
+    To force α<1 we need must_pool_size > B - may_size - in_use, i.e.
+    must_size > total_capacity - 0 (no may, no real in_use in this
+    test). So set total_capacity LESS than the must pool size."""
+    blocks = [KVCacheBlock(block_id=i) for i in range(5)]
+    queue = FreeKVCacheBlockQueue(
+        blocks,
+        mode=VICTIM_POLICY_WIRES_THREE_POOL,
+        structured_ttl_ns=10_000_000_000,  # 10s
+        total_capacity=2,  # 5 in must vs B=2 → forces α=0.4
+        overflow_shrink_floor=0.0001,
+    )
+    for blk in blocks:
+        queue.update_block_hint(blk, "must", source_class="structured")
+    # α = 2 / 5 = 0.4 → scaled deadline = promoted_at + 0.4 * 10s = +4s.
+    # Backdate 5s to push past scaled deadline.
+    for blk in blocks:
+        blk.last_promoted_ns -= 5_000_000_000
+    demoted = queue._sweep_ttl_must()
+    assert demoted == 5
+    # α should reflect the pressure.
+    assert 0.3 < queue.alpha_shrinkage < 0.5
+
+
+def test_phase_c4_alpha_pure_lru_mode_always_one():
+    """pure_lru mode skips α-shrinkage entirely."""
+    blocks = [KVCacheBlock(block_id=i) for i in range(5)]
+    queue = FreeKVCacheBlockQueue(
+        blocks, mode=VICTIM_POLICY_PURE_LRU, total_capacity=2
+    )
+    alpha = queue._recompute_alpha()
+    assert alpha == 1.0
+
+
+def test_phase_c3_env_knobs(monkeypatch):
+    monkeypatch.setenv("WIRES_KVCACHE_UNSTRUCTURED_K", "2.5")
+    monkeypatch.setenv("WIRES_KVCACHE_UNSTRUCTURED_EMA_ALPHA", "0.1")
+    monkeypatch.setenv("WIRES_KVCACHE_UNSTRUCTURED_BOOTSTRAP_SAMPLES", "100")
+    monkeypatch.setenv("WIRES_KVCACHE_OVERFLOW_SHRINK_FLOOR", "0.5")
+    queue = FreeKVCacheBlockQueue([])
+    assert queue._unstructured_k == 2.5
+    assert queue._ema_alpha == 0.1
+    assert queue._bootstrap_samples == 100
+    assert queue._overflow_shrink_floor == 0.5
 
 
 def test_generate_block_hash_extra_keys():

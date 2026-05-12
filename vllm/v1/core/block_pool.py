@@ -165,7 +165,11 @@ class BlockPool:
         # list of free blocks (including eviction candidates when caching is
         # enabled). Mode dispatched via WIRES_KVCACHE_VICTIM_POLICY env
         # (default: wires_three_pool; see docs/v2/32 §2 + §2.7).
-        self.free_block_queue = FreeKVCacheBlockQueue(self.blocks)
+        # Phase C4: pass total capacity so the α-shrinkage formula
+        # (docs/v2/32 §2.4.2) has B available without callbacks.
+        self.free_block_queue = FreeKVCacheBlockQueue(
+            self.blocks, total_capacity=num_gpu_blocks
+        )
 
         # WIRES Phase B: register the queue's update_block_hint as the
         # callback used by SegmentRegistry.update_block_hints, so
@@ -450,7 +454,25 @@ class BlockPool:
                     record_cache_hit = None
                     record_retention = None
                 break
+        import time as _time
+        now_ns = _time.monotonic_ns()
         for block in blocks:
+            # WIRES Phase C3 (docs/v2/32 §2.4.1 + Q8 answer):
+            # If this block is in must-pool with source_class
+            # "unstructured", feed the EMA estimator with the
+            # interval BEFORE bumping last_access_ns.
+            if (
+                block.source_class == "unstructured"
+                and block.lifecycle_hint == "must"
+                and self.free_block_queue._pool_of.get(block.block_id) == "must"
+                and block.last_access_ns > 0
+            ):
+                interval = now_ns - block.last_access_ns
+                if interval > 0:
+                    self.free_block_queue._feed_unstructured_sample(interval)
+            # Bump last_access_ns BEFORE promotion (Phase D), so the
+            # next interval is measured from this hit forward.
+            block.last_access_ns = now_ns
             # WIRES Phase D: access-based promotion. Increment per-block
             # _access_count; if it crosses WIRES_KVCACHE_ACCESS_PROMOTION_THRESHOLD
             # (default 1), promote may -> must with source_class="unstructured".
