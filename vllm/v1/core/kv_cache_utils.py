@@ -5,6 +5,7 @@
 import copy
 import hashlib
 import os
+import time
 from collections import defaultdict
 from collections.abc import Callable, Iterable, Iterator, Sequence
 from dataclasses import dataclass, replace
@@ -126,6 +127,25 @@ class KVCacheBlock:
     # Whether the block is a null block that should never be cached.
     is_null: bool = False
 
+    # CONTINUUM TTL (per arxiv 2511.02230 "CacheTTL"): predictive lifetime
+    # for the contents of this block. The transport layer predicts a TTL
+    # from per-tool call-duration statistics and ships it as
+    # ``vllm_xargs.continuum_ttl_ms``; the request layer copies it onto
+    # blocks freshly allocated to that request. The free-queue eviction
+    # path prefers blocks whose TTL has expired regardless of LRU
+    # position, freeing them ahead of cold-but-valid LRU blocks.
+    #
+    #   continuum_ttl_ms == 0  -> no TTL (default, identical to upstream
+    #                             vllm; block follows pure LRU eviction)
+    #   continuum_ttl_ms  > 0  -> expires at ``ttl_set_at_ns + ttl_ms*1e6``
+    #                             measured against ``time.monotonic_ns()``
+    #
+    # ``ttl_set_at_ns`` is stamped at TTL-set time and refreshed on
+    # cache-hit (block_pool.touch) so the TTL means "evict if unused for
+    # this long" — matching the paper's freshness-on-use semantics.
+    continuum_ttl_ms: int = 0
+    ttl_set_at_ns: int = 0
+
     @property
     def block_hash(self) -> BlockHashWithGroupId | None:
         return self._block_hash
@@ -140,6 +160,12 @@ class KVCacheBlock:
     def reset_hash(self):
         """Reset the block hash when the block is evicted."""
         self._block_hash = None
+        # Continuum TTL is content-bound; clearing the slot for new
+        # content means the previous TTL no longer applies. Subsequent
+        # allocate_slots will set a new TTL if the new request supplies
+        # one.
+        self.continuum_ttl_ms = 0
+        self.ttl_set_at_ns = 0
 
     def __repr__(self) -> str:
         # Use block_id instead of KVCacheBlock object to avoid calling __repr__
@@ -207,12 +233,85 @@ class FreeKVCacheBlockQueue:
             self.fake_free_list_head.next_free_block = self.fake_free_list_tail
             self.fake_free_list_tail.prev_free_block = self.fake_free_list_head
 
+        # CONTINUUM TTL sweep telemetry. Cumulative across the lifetime
+        # of the queue. Surfaced for tests + debugging; not exposed via
+        # /metrics yet (intentional — paper-baseline-fidelity branch
+        # only adds the predictor consumer, no policy telemetry).
+        self.ttl_sweep_evicted_count: int = 0
+
+    # ------------------------------------------------------------------
+    # CONTINUUM TTL sweep (per arxiv 2511.02230 "CacheTTL")
+    # ------------------------------------------------------------------
+    # Called from popleft / popleft_n BEFORE normal LRU pick. Walks the
+    # entire queue once; any block with continuum_ttl_ms > 0 whose
+    # ``ttl_set_at_ns + ttl_ms*1e6`` is already in the past is
+    # detached and returned. Caller then either uses these blocks
+    # directly (if popping enough satisfies n) or returns them to be
+    # used after exhausted, in LRU order, before the head pick.
+    #
+    # Cost: O(num_free_blocks) per pop call. In the small-pool eviction
+    # regime this is fine; for very large free pools the sweep can be
+    # skipped entirely by leaving all blocks at the default TTL=0
+    # (i.e. when no transport sets continuum_ttl_ms). The early-exit
+    # check avoids the O(N) walk in the common no-TTL case.
+    # ------------------------------------------------------------------
+    def _harvest_expired_blocks(self, max_count: int) -> list["KVCacheBlock"]:
+        """Detach up to ``max_count`` expired-TTL blocks from the free
+        queue and return them. Preserves doubly-linked-list invariants.
+        Decrements ``num_free_blocks`` accordingly.
+
+        Returns an empty list when ``max_count == 0`` or when the queue
+        is empty. Blocks with ``continuum_ttl_ms == 0`` (default, no
+        TTL set) are skipped — they fall through to the LRU pick.
+        """
+        if max_count <= 0:
+            return []
+        head = self.fake_free_list_head.next_free_block
+        if head is None or head is self.fake_free_list_tail:
+            return []
+
+        now_ns = time.monotonic_ns()
+        harvested: list[KVCacheBlock] = []
+        curr = head
+        while (
+            curr is not None
+            and curr is not self.fake_free_list_tail
+            and len(harvested) < max_count
+        ):
+            nxt = curr.next_free_block
+            if curr.continuum_ttl_ms > 0:
+                deadline_ns = curr.ttl_set_at_ns + curr.continuum_ttl_ms * 1_000_000
+                if now_ns >= deadline_ns:
+                    # Detach in place (mirrors the manual detach in
+                    # popleft_n; avoids the num_free_blocks decrement
+                    # path of self.remove() so we batch the count
+                    # adjustment at the end).
+                    if curr.prev_free_block is not None:
+                        curr.prev_free_block.next_free_block = curr.next_free_block
+                    if curr.next_free_block is not None:
+                        curr.next_free_block.prev_free_block = curr.prev_free_block
+                    curr.prev_free_block = None
+                    curr.next_free_block = None
+                    harvested.append(curr)
+            curr = nxt
+
+        if harvested:
+            self.num_free_blocks -= len(harvested)
+            self.ttl_sweep_evicted_count += len(harvested)
+        return harvested
+
     def popleft(self) -> KVCacheBlock:
         """Pop the first free block and reduce num_free_blocks by 1.
 
         Returns:
             The first free block.
         """
+        # CONTINUUM TTL: prefer an expired-TTL block over the LRU head.
+        # No-op when no block has continuum_ttl_ms > 0 (default).
+        expired = self._harvest_expired_blocks(1)
+        if expired:
+            return expired[0]
+
         if (
             self.fake_free_list_head.next_free_block is self.fake_free_list_tail
             or self.fake_free_list_head.next_free_block is None
@@ -256,12 +355,20 @@ class FreeKVCacheBlockQueue:
         if n == 0:
             return []
         assert self.num_free_blocks >= n
-        self.num_free_blocks -= n
+
+        # CONTINUUM TTL: harvest up to n expired-TTL blocks first. No-op
+        # when no block has continuum_ttl_ms > 0 (default upstream
+        # behavior). Already detached + counted by _harvest_expired_blocks.
+        ret: list[KVCacheBlock] = self._harvest_expired_blocks(n)
+        remaining = n - len(ret)
+        if remaining == 0:
+            return ret
+
+        self.num_free_blocks -= remaining
 
         curr_block = self.fake_free_list_head.next_free_block
-        # Pop n blocks from the head of the list
-        ret = []
-        for _ in range(n):
+        # Pop the remaining blocks from the head of the list (LRU).
+        for _ in range(remaining):
             assert curr_block is not None
             ret.append(curr_block)
             last_block = curr_block

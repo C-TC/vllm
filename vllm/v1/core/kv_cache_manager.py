@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import itertools
+import time
 from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Literal, overload
@@ -407,6 +408,22 @@ class KVCacheManager:
             num_tokens_main_model,
             num_encoder_tokens,
         )
+
+        # CONTINUUM TTL (per arxiv 2511.02230 "CacheTTL"): propagate the
+        # request's predicted TTL onto every freshly-allocated block so
+        # the FreeKVCacheBlockQueue's TTL sweep can prefer them for
+        # eviction once the deadline passes. ``request.continuum_ttl_ms``
+        # is parsed from ``vllm_xargs.continuum_ttl_ms`` at Request
+        # construction. 0 (default) is a no-op — the field is already
+        # 0 on every block; subsequent eviction follows pure LRU
+        # exactly as in upstream vllm.
+        request_ttl_ms = getattr(request, "continuum_ttl_ms", 0)
+        if request_ttl_ms > 0:
+            now_ns = time.monotonic_ns()
+            for group_blocks in new_blocks:
+                for blk in group_blocks:
+                    blk.continuum_ttl_ms = request_ttl_ms
+                    blk.ttl_set_at_ns = now_ns
 
         # P/D: delay caching blocks if we have to recv from
         # remote. Update state for locally cached blocks.

@@ -2137,3 +2137,161 @@ def test_unify_hybrid_kv_cache_specs():
 
     with pytest.raises(ValueError):
         kv_cache_utils.unify_hybrid_kv_cache_specs(kv_cache_spec)
+
+
+# ---------------------------------------------------------------------------
+# CONTINUUM TTL (per arxiv 2511.02230 "CacheTTL")
+#
+# These tests cover the per-block TTL field on KVCacheBlock + the lazy TTL
+# sweep on FreeKVCacheBlockQueue.popleft / popleft_n. Default behavior
+# (continuum_ttl_ms == 0 on every block) MUST be byte-identical to upstream
+# vllm — that's the contract for the per-API baseline branch.
+# ---------------------------------------------------------------------------
+
+
+def test_kv_cache_block_continuum_ttl_default():
+    """KVCacheBlock TTL fields default to 0 (no TTL) — preserves upstream
+    vllm behavior for any path that doesn't set continuum_ttl_ms."""
+    block = KVCacheBlock(block_id=0)
+    assert block.continuum_ttl_ms == 0
+    assert block.ttl_set_at_ns == 0
+
+
+def test_kv_cache_block_reset_hash_clears_continuum_ttl():
+    """reset_hash must clear TTL too — the slot is being recycled for new
+    content, so the previous request's TTL no longer applies."""
+    block = KVCacheBlock(block_id=0)
+    block.continuum_ttl_ms = 5000
+    block.ttl_set_at_ns = 12345
+    block.reset_hash()
+    assert block.continuum_ttl_ms == 0
+    assert block.ttl_set_at_ns == 0
+
+
+def test_continuum_ttl_sweep_no_op_when_no_ttl_set():
+    """When no block carries a TTL (the default), popleft / popleft_n
+    behave exactly like upstream LRU. Telemetry counter stays at 0."""
+    blocks = [KVCacheBlock(block_id=i) for i in range(5)]
+    queue = FreeKVCacheBlockQueue(blocks)
+
+    # popleft picks the head (block 0), as before.
+    first = queue.popleft()
+    assert first is blocks[0]
+    assert queue.num_free_blocks == 4
+    assert queue.ttl_sweep_evicted_count == 0
+
+    # popleft_n(2) picks blocks 1, 2 in order.
+    got = queue.popleft_n(2)
+    assert got == [blocks[1], blocks[2]]
+    assert queue.num_free_blocks == 2
+    assert queue.ttl_sweep_evicted_count == 0
+
+
+def test_continuum_ttl_sweep_prefers_expired_block():
+    """A block with an already-expired TTL is preferred over the LRU
+    head, regardless of position in the queue. The youngest LRU block
+    (typically last to be evicted) is returned first when its TTL has
+    already passed."""
+    blocks = [KVCacheBlock(block_id=i) for i in range(5)]
+    queue = FreeKVCacheBlockQueue(blocks)
+
+    # Mark block 4 (the youngest LRU position) with an expired TTL:
+    # set_at = 0 ns, ttl = 1 ms => deadline at 1e6 ns, well past
+    # by the time popleft reads time.monotonic_ns().
+    blocks[4].continuum_ttl_ms = 1
+    blocks[4].ttl_set_at_ns = 0
+
+    first = queue.popleft()
+    assert first is blocks[4], (
+        "expected expired block to be picked over LRU head"
+    )
+    assert queue.num_free_blocks == 4
+    assert queue.ttl_sweep_evicted_count == 1
+
+    # Subsequent popleft falls through to the LRU head (block 0),
+    # since no other block has an expired TTL.
+    second = queue.popleft()
+    assert second is blocks[0]
+
+
+def test_continuum_ttl_sweep_skips_unexpired_block():
+    """A block with a future TTL is left in place; LRU head is picked
+    instead. This is the steady-state behavior when transports set
+    realistic TTLs on the order of seconds."""
+    blocks = [KVCacheBlock(block_id=i) for i in range(5)]
+    queue = FreeKVCacheBlockQueue(blocks)
+
+    # Block 2 has a TTL that won't expire for an hour.
+    import time as _t
+    blocks[2].continuum_ttl_ms = 60 * 60 * 1000
+    blocks[2].ttl_set_at_ns = _t.monotonic_ns()
+
+    first = queue.popleft()
+    assert first is blocks[0], "unexpired TTL block must not be touched"
+    assert queue.ttl_sweep_evicted_count == 0
+
+
+def test_continuum_ttl_sweep_popleft_n_mixes_expired_and_lru():
+    """When popleft_n requests more blocks than expired ones available,
+    expired blocks are returned first, then LRU fills the rest."""
+    blocks = [KVCacheBlock(block_id=i) for i in range(6)]
+    queue = FreeKVCacheBlockQueue(blocks)
+
+    # blocks 3 and 5 are expired; blocks 0, 1, 2, 4 follow LRU.
+    blocks[3].continuum_ttl_ms = 1
+    blocks[3].ttl_set_at_ns = 0
+    blocks[5].continuum_ttl_ms = 1
+    blocks[5].ttl_set_at_ns = 0
+
+    got = queue.popleft_n(4)
+    assert len(got) == 4
+    # Expired blocks come first (in queue traversal order: 3, then 5).
+    assert got[0] is blocks[3]
+    assert got[1] is blocks[5]
+    # LRU fills the rest from the head (block 0, then 1).
+    assert got[2] is blocks[0]
+    assert got[3] is blocks[1]
+    assert queue.num_free_blocks == 2
+    assert queue.ttl_sweep_evicted_count == 2
+
+
+def test_continuum_ttl_sweep_doesnt_corrupt_doubly_linked_list():
+    """After harvesting an expired block from the middle of the queue,
+    the remaining free list must still be traversable end-to-end."""
+    blocks = [KVCacheBlock(block_id=i) for i in range(5)]
+    queue = FreeKVCacheBlockQueue(blocks)
+
+    # Middle block (index 2) is expired.
+    blocks[2].continuum_ttl_ms = 1
+    blocks[2].ttl_set_at_ns = 0
+
+    expired = queue.popleft()
+    assert expired is blocks[2]
+
+    # Walk remaining blocks in order: 0, 1, 3, 4.
+    walk: list[int] = []
+    curr = queue.fake_free_list_head.next_free_block
+    while curr is not None and curr is not queue.fake_free_list_tail:
+        walk.append(curr.block_id)
+        curr = curr.next_free_block
+    assert walk == [0, 1, 3, 4]
+    assert queue.num_free_blocks == 4
+
+
+def test_continuum_ttl_sweep_telemetry_accumulates():
+    """The TTL eviction counter is monotonically increasing across calls."""
+    blocks = [KVCacheBlock(block_id=i) for i in range(6)]
+    queue = FreeKVCacheBlockQueue(blocks)
+
+    blocks[1].continuum_ttl_ms = 1
+    blocks[1].ttl_set_at_ns = 0
+    blocks[4].continuum_ttl_ms = 1
+    blocks[4].ttl_set_at_ns = 0
+
+    queue.popleft()
+    assert queue.ttl_sweep_evicted_count == 1
+    queue.popleft()
+    assert queue.ttl_sweep_evicted_count == 2
+    # Subsequent popleft has no expired blocks; counter stays.
+    queue.popleft()
+    assert queue.ttl_sweep_evicted_count == 2

@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import time
 from collections.abc import Iterable, Sequence
 from typing import Any
 
@@ -397,12 +398,22 @@ class BlockPool:
         Args:
             blocks: A list of blocks to touch.
         """
+        # CONTINUUM TTL (per arxiv 2511.02230 "CacheTTL"): refresh the
+        # TTL deadline on cache hit so the predicted lifetime models
+        # "evict if unused for this long" rather than "evict at this
+        # absolute moment". Matches the paper's freshness-on-use
+        # semantics for the predictor's per-tool S[f] table. Only blocks
+        # that already carry a TTL > 0 are refreshed; default-TTL blocks
+        # remain at 0 and the queue's TTL sweep stays a no-op for them.
+        now_ns = time.monotonic_ns()
         for block in blocks:
             # ref_cnt=0 means this block is in the free list (i.e. eviction
             # candidate), so remove it.
             if block.ref_cnt == 0 and not block.is_null:
                 self.free_block_queue.remove(block)
             block.ref_cnt += 1
+            if block.continuum_ttl_ms > 0:
+                block.ttl_set_at_ns = now_ns
             if self.metrics_collector:
                 self.metrics_collector.on_block_accessed(block)
 

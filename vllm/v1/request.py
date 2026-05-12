@@ -94,6 +94,16 @@ class Request:
         # P/D: Connector-specific KV transfer parameters.
         self.kv_transfer_params: dict[str, Any] | None = None
 
+        # CONTINUUM TTL (per arxiv 2511.02230 "CacheTTL"): predictive
+        # lifetime for the KV cache blocks freshly allocated to this
+        # request. Threaded from HTTP ``vllm_xargs.continuum_ttl_ms``
+        # via the OpenAI router (which copies vllm_xargs verbatim into
+        # ``SamplingParams.extra_args``). 0 (the default) means "no
+        # TTL" — block follows pure LRU eviction, identical to upstream
+        # vllm. Positive integer means "evict this block after ttl_ms
+        # of inactivity, regardless of LRU position".
+        self.continuum_ttl_ms: int = 0
+
         if pooling_params is not None:
             # Pooling models.
             self.max_tokens = 1
@@ -108,6 +118,9 @@ class Request:
                 self.kv_transfer_params = sampling_params.extra_args.get(
                     "kv_transfer_params"
                 )
+                ttl_raw = sampling_params.extra_args.get("continuum_ttl_ms")
+                if isinstance(ttl_raw, int) and ttl_raw > 0:
+                    self.continuum_ttl_ms = ttl_raw
         else:
             raise ValueError("sampling_params and pooling_params can't both be unset")
 
