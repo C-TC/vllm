@@ -519,6 +519,13 @@ class BlockPool:
         import time as _time
 
         now_ns = _time.monotonic_ns()
+        # M19/M20: flush any deferred hint flips so the per-block
+        # ``source_class`` snapshot read below reflects the latest
+        # promotion state. Without this, a block whose speculative
+        # promotion is sitting in the M19 pending dict would still
+        # report the old ``source_class`` and the M20 upgrade branch
+        # below would silently miss it.
+        self.free_block_queue._flush_pending_hint_flips()
         for block in blocks:
             # M20: speculative -> unstructured class upgrade. A cache
             # hit on a block currently classed as "speculative" confirms

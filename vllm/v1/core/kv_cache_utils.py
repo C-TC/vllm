@@ -182,16 +182,33 @@ class KVCacheBlock:
     # ``now``. Demotion (rollback or TTL) does NOT clear this field.
     last_access_ns: int = 0
 
-    # WIRES Phase D: which promotion path put this block into the must
-    # pool. Drives per-class TTL during the lazy sweep.
+    # WIRES Phase D / M20: which promotion path put this block into the
+    # must pool. Drives per-class TTL during the lazy sweep.
     #   "structured"   — explicit CFG-driven promotion via
     #                    update_segment_lifecycle_hint (driver/monitor
-    #                    knows the segment will recur). Caller MUST opt
-    #                    in by passing source_class="structured".
+    #                    knows the segment will recur). TTL =
+    #                    _structured_ttl_ns (default 5min, env
+    #                    WIRES_KVCACHE_STRUCTURED_TTL_MS).
     #   "unstructured" — access-based promotion via block_pool.touch()
     #                    once _access_count crosses the threshold (the
     #                    natural LRU path, paper §2.3). This is the
-    #                    DEFAULT — most blocks reach must this way.
+    #                    DEFAULT, most blocks reach must this way.
+    #                    TTL = _unstructured_ttl_at_promotion_ns()
+    #                    (EMA-derived snapshot, bootstrap default 60s).
+    #   "speculative"  — proactive may->must promotion driven by a
+    #                    runner hint that anticipates future reuse
+    #                    (paper §3.2 future-work extension; doc 32 §4
+    #                    OQ6 lists the candidate patterns). Carries a
+    #                    much shorter TTL backstop (_speculative_ttl_ns,
+    #                    default 30s, env
+    #                    WIRES_KVCACHE_SPECULATIVE_TTL_MS) so a wrong
+    #                    speculation only wastes the must slot for a
+    #                    bounded window. Class is TEMPORARY: on the
+    #                    first cache hit, BlockPool.touch() upgrades
+    #                    the block to "unstructured" and re-stamps it
+    #                    with the EMA-based TTL (M20: speculation
+    #                    confirmed -> behave like a normal access-
+    #                    promoted block).
     # Refreshed each time the block is promoted; demotion does not
     # clear it (so a block re-promoted via access continues to use
     # the unstructured TTL).
@@ -545,6 +562,15 @@ _DEFAULT_STRUCTURED_TTL_MS = 300_000
 # least N_BOOTSTRAP samples. After that the estimator drives TTL
 # (snapshot at promotion: T̂_u + k * sqrt(Var_u)).
 _DEFAULT_UNSTRUCTURED_TTL_BOOTSTRAP_MS = 60_000
+# M20 (paper §3.2 future-work extension; CODE_MISMATCH_NOTES.md M20):
+# speculative-source TTL backstop, default 30s. Speculative blocks are
+# proactively promoted from may to must by a runner hint that
+# anticipates future reuse; a much shorter TTL than structured (5min)
+# or unstructured-bootstrap (60s) bounds the cost of a misprediction
+# while still giving the speculated reuse a reasonable window. Class
+# upgrades to "unstructured" on the first cache hit, after which the
+# normal EMA-derived TTL takes over.
+_DEFAULT_SPECULATIVE_TTL_MS = 30_000
 _DEFAULT_UNSTRUCTURED_BOOTSTRAP_SAMPLES = 50
 # Phase C3 EMA smoothing constant (~last 20 samples weighted).
 _DEFAULT_UNSTRUCTURED_EMA_ALPHA = 0.05
@@ -613,6 +639,19 @@ def _resolve_unstructured_bootstrap_ttl_ns_from_env() -> int:
     return _resolve_ttl_ns_from_env(
         "WIRES_KVCACHE_UNSTRUCTURED_BOOTSTRAP_TTL_MS",
         _DEFAULT_UNSTRUCTURED_TTL_BOOTSTRAP_MS,
+    )
+
+
+def _resolve_speculative_ttl_ns_from_env() -> int:
+    """M20: resolve ``WIRES_KVCACHE_SPECULATIVE_TTL_MS`` env var to ns.
+
+    Default 30s. A value of 0 disables the speculative TTL sweep
+    (speculative blocks then live in must until force-evicted by
+    ``popleft_n`` step 3 or upgraded to unstructured by
+    ``BlockPool.touch()`` on first reuse).
+    """
+    return _resolve_ttl_ns_from_env(
+        "WIRES_KVCACHE_SPECULATIVE_TTL_MS", _DEFAULT_SPECULATIVE_TTL_MS
     )
 
 
@@ -722,6 +761,7 @@ class FreeKVCacheBlockQueue:
         mode: str | None = None,
         structured_ttl_ns: int | None = None,
         unstructured_bootstrap_ttl_ns: int | None = None,
+        speculative_ttl_ns: int | None = None,
         access_promotion_threshold: int | None = None,
         unstructured_k: float | None = None,
         ema_alpha: float | None = None,
@@ -745,6 +785,13 @@ class FreeKVCacheBlockQueue:
             unstructured_bootstrap_ttl_ns
             if unstructured_bootstrap_ttl_ns is not None
             else _resolve_unstructured_bootstrap_ttl_ns_from_env()
+        )
+        # M20: speculative-source TTL backstop (default 30s). See
+        # CODE_MISMATCH_NOTES.md M20 for design rationale.
+        self._speculative_ttl_ns: int = (
+            speculative_ttl_ns
+            if speculative_ttl_ns is not None
+            else _resolve_speculative_ttl_ns_from_env()
         )
         self.access_promotion_threshold: int = (
             access_promotion_threshold
@@ -883,6 +930,22 @@ class FreeKVCacheBlockQueue:
         # gives the runner / metrics scrape full visibility into the
         # adaptive-k loop.
         self.p_h_ema_sample_count: int = 0
+        # M20 telemetry (speculative source class):
+        #   speculation_promotion_count: total speculative may->must
+        #     promotions (incremented when a block enters the must pool
+        #     with source_class == "speculative").
+        #   speculation_hit_count: speculative blocks that got reused
+        #     (cache-hit) before TTL fired (incremented in
+        #     BlockPool.touch() when the speculative -> unstructured
+        #     class upgrade happens).
+        #   speculation_miss_count: speculative blocks demoted by the
+        #     TTL sweep without ever being hit (incremented in
+        #     _sweep_ttl_must when the demoted block has source_class ==
+        #     "speculative").
+        # Derived hit rate via the ``speculation_hit_rate`` property.
+        self.speculation_promotion_count: int = 0
+        self.speculation_hit_count: int = 0
+        self.speculation_miss_count: int = 0
 
         # M19 (CODE_MISMATCH_NOTES.md): engine-side lazy hint flips.
         # Per-block pending pool moves are coalesced here and applied
@@ -959,6 +1022,20 @@ class FreeKVCacheBlockQueue:
         if self._unstructured_k_override is not None:
             return self._unstructured_k_override
         return self._derive_k_from_ph(self._p_h_hat)
+
+    @property
+    def speculation_hit_rate(self) -> float | None:
+        """M20: derived metric, hits / promotions for speculative blocks.
+
+        Returns ``None`` when no speculative promotions have happened
+        (avoid 0/0 noise in the cache_stats surface). When the rate
+        falls below ~50% the speculation pattern probably isn't
+        worthwhile per the v1 simplification rule (paper §3.2 future
+        work / CODE_MISMATCH_NOTES.md M20).
+        """
+        if self.speculation_promotion_count <= 0:
+            return None
+        return self.speculation_hit_count / self.speculation_promotion_count
 
     @staticmethod
     def _derive_k_from_ph(p_h: float) -> float:
@@ -1214,6 +1291,14 @@ class FreeKVCacheBlockQueue:
             blk = must.popleft_one()
             assert blk is not None
             blk.lifecycle_hint = "may"
+            # M20: speculative block aged out without ever being hit;
+            # this is the "speculation miss via TTL fallback" path.
+            # (Hits are counted in BlockPool.touch() via the class
+            # upgrade; reactive may/no demotes go through
+            # update_block_hint and are explicitly NOT counted as
+            # misses per the spec.)
+            if blk.source_class == "speculative":
+                self.speculation_miss_count += 1
             demoted.append(blk)
             self._pool_of[blk.block_id] = "may"
         if demoted:
@@ -1370,17 +1455,27 @@ class FreeKVCacheBlockQueue:
     def _stamp_must_promotion(
         self, block: KVCacheBlock, now_ns: int, source_class: str
     ) -> None:
-        """Phase C3: stamp promoted_at + ttl_at_promotion + source_class
-        on a block as it enters the must pool.
+        """Phase C3 / M20: stamp promoted_at + ttl_at_promotion +
+        source_class on a block as it enters the must pool.
 
         M14: also resets ``_must_hit_count`` so the indicator that
         feeds p̂_h reflects only hits during this must-residency.
+
+        M20: when ``source_class == "speculative"``, picks the short
+        speculative TTL backstop (default 30s) and bumps
+        ``speculation_promotion_count``. The class is temporary; on the
+        first cache hit ``BlockPool.touch()`` upgrades it to
+        ``"unstructured"`` (and counts the hit on
+        ``speculation_hit_count``).
         """
         block.last_promoted_ns = now_ns
         block.source_class = source_class
         block._must_hit_count = 0
         if source_class == "structured":
             block.ttl_at_promotion_ns = self._structured_ttl_ns
+        elif source_class == "speculative":
+            block.ttl_at_promotion_ns = self._speculative_ttl_ns
+            self.speculation_promotion_count += 1
         else:
             block.ttl_at_promotion_ns = self._unstructured_ttl_at_promotion_ns()
 
@@ -1471,10 +1566,10 @@ class FreeKVCacheBlockQueue:
         """
         if new_hint not in self._pools:
             new_hint = "may"
-        if source_class not in ("structured", "unstructured"):
+        if source_class not in ("structured", "unstructured", "speculative"):
             raise ValueError(
-                f"source_class must be 'structured' or 'unstructured' "
-                f"(got {source_class!r})"
+                f"source_class must be 'structured', 'unstructured', or "
+                f"'speculative' (got {source_class!r})"
             )
         if block.lifecycle_hint == new_hint:
             return
