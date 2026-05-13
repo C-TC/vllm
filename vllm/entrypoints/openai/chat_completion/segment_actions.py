@@ -361,13 +361,37 @@ def _validate_segment_prepare(action: dict[str, Any]) -> dict[str, Any] | None:
     return None
 
 
+_VALID_LIFECYCLE_HINTS = ("must", "may", "no")
+
+
 def _validate_segment_refresh(action: dict[str, Any]) -> dict[str, Any] | None:
     """Validate a segment_refresh wire action.
 
     Refresh adds a required ``family_id`` (cross-instance dedup key) and
-    accepts an optional ``would_evict_without_refresh: bool`` (engine
-    records it but does not gate on it; the decision was already made
-    runner-side).
+    accepts:
+
+    * an optional ``would_evict_without_refresh: bool`` (engine records
+      it but does not gate on it; the decision was already made
+      runner-side);
+    * an optional ``lifecycle_hint`` field, one of ``"must"``,
+      ``"may"``, ``"no"`` (M9 merge: when non-null this also flips the
+      lifecycle hint on every block currently tagged with this
+      ``segment_id``, replacing the legacy
+      ``/v1/coopt/segment_lifecycle_update`` endpoint).
+
+    M9 merge: ``prompt_token_ids`` is OPTIONAL (it used to be required).
+    Two valid call shapes:
+
+    1. Touch-only / touch + hint: ``prompt_token_ids`` present
+       (non-empty list[int]); refresh re-MRUs the prefix lines via the
+       prewarm hook, and (if ``lifecycle_hint`` is set) ALSO flips
+       block hints by ``segment_id``. This is the legacy
+       ``segment_refresh`` plus the new merged hint update.
+    2. Hint-only (no LRU touch): ``prompt_token_ids`` absent or empty
+       AND ``lifecycle_hint`` is non-null. Engine skips the prewarm
+       and just flips block hints. This subsumes the legacy
+       ``segment_lifecycle_update`` endpoint, including the
+       loop-anchor-must-promotion path that has no token ids at hand.
     """
 
     kind = _action_kind_of(action)
@@ -414,22 +438,54 @@ def _validate_segment_refresh(action: dict[str, Any]) -> dict[str, Any] | None:
             action_kind=SEGMENT_REFRESH_ACTION_KIND,
             field_name="model",
         )
+    # M9: prompt_token_ids is now optional; when present, must be a
+    # list[int]. When absent/empty, lifecycle_hint must be non-null
+    # (hint-only mode).
     prompt_token_ids = action.get("prompt_token_ids")
-    if not isinstance(prompt_token_ids, list) or not all(
-        isinstance(tok, int) for tok in prompt_token_ids
-    ):
-        return _missing_field_response(
-            action=action,
-            action_kind=SEGMENT_REFRESH_ACTION_KIND,
-            field_name="prompt_token_ids",
-        )
-    if not prompt_token_ids:
+    has_token_ids = (
+        isinstance(prompt_token_ids, list)
+        and len(prompt_token_ids) > 0
+        and all(isinstance(tok, int) for tok in prompt_token_ids)
+    )
+    if prompt_token_ids is not None:
+        if not isinstance(prompt_token_ids, list) or not all(
+            isinstance(tok, int) for tok in prompt_token_ids
+        ):
+            return _missing_field_response(
+                action=action,
+                action_kind=SEGMENT_REFRESH_ACTION_KIND,
+                field_name="prompt_token_ids",
+            )
+        if len(prompt_token_ids) == 0:
+            return {
+                "action_id": _optional_str(action.get("action_id")),
+                "action_kind": SEGMENT_REFRESH_ACTION_KIND,
+                "accepted": False,
+                "lifecycle_status": "rejected",
+                "reject_reason": "empty_prompt_token_ids",
+                "engine_wire_status": "rejected",
+                "prewarm_status": "not_attempted",
+            }
+    lifecycle_hint = action.get("lifecycle_hint")
+    if lifecycle_hint is not None and lifecycle_hint not in _VALID_LIFECYCLE_HINTS:
         return {
             "action_id": _optional_str(action.get("action_id")),
             "action_kind": SEGMENT_REFRESH_ACTION_KIND,
             "accepted": False,
             "lifecycle_status": "rejected",
-            "reject_reason": "empty_prompt_token_ids",
+            "reject_reason": "invalid_lifecycle_hint",
+            "engine_wire_status": "rejected",
+            "prewarm_status": "not_attempted",
+        }
+    # Hint-only mode requires lifecycle_hint to be set; touch-only
+    # mode requires prompt_token_ids. At least one must produce work.
+    if not has_token_ids and lifecycle_hint is None:
+        return {
+            "action_id": _optional_str(action.get("action_id")),
+            "action_kind": SEGMENT_REFRESH_ACTION_KIND,
+            "accepted": False,
+            "lifecycle_status": "rejected",
+            "reject_reason": "missing_prompt_token_ids_or_lifecycle_hint",
             "engine_wire_status": "rejected",
             "prewarm_status": "not_attempted",
         }
@@ -721,8 +777,9 @@ class SegmentRegistry:
         self._entries_by_segment_id: dict[str, SegmentEntry] = {}
         # WIRES Phase E2 step 3 — segment_id -> list of currently-tagged
         # KVCacheBlocks. Populated by tag_blocks_with_segment_id; queried
-        # by the /v1/coopt/segment_lifecycle_update endpoint when the
-        # monitor downgrades the per-segment hint after a CFG event.
+        # by the merged /v1/coopt/segment_refresh endpoint (M9: via the
+        # body's lifecycle_hint field) when the monitor downgrades the
+        # per-segment hint after a CFG event.
         # Strong refs (KVCacheBlock uses slots so weakref isn't free);
         # entries are pruned lazily when their _segment_id no longer
         # matches (block reused for a different segment).
@@ -1286,21 +1343,78 @@ async def submit_segment_refresh_action(
             request_action=action,
         )
         return rejection
-    prefill_status, prefill_token_count = await _maybe_submit_segment_prewarm(
-        action,
-        chat_handler=chat_handler,
-        refresh=True,
-    )
-    # Refresh always reports the dedicated retouched marker on success
-    # to make telemetry distinguishable from the prepare path even if
-    # the underlying chat-handler hook returns a generic value.
-    if prefill_status in {"prewarm_submitted", "prewarm_completed"}:
-        prefill_status = _REFRESH_PREWARM_STATUS_RETOUCHED
+    # M9 merge: detect mode from validated payload.
+    raw_token_ids = action.get("prompt_token_ids")
+    has_token_ids = isinstance(raw_token_ids, list) and len(raw_token_ids) > 0
+    lifecycle_hint = action.get("lifecycle_hint")
+    if has_token_ids:
+        prefill_status, prefill_token_count = await _maybe_submit_segment_prewarm(
+            action,
+            chat_handler=chat_handler,
+            refresh=True,
+        )
+        # Refresh always reports the dedicated retouched marker on
+        # success to make telemetry distinguishable from the prepare
+        # path even if the underlying chat-handler hook returns a
+        # generic value.
+        if prefill_status in {"prewarm_submitted", "prewarm_completed"}:
+            prefill_status = _REFRESH_PREWARM_STATUS_RETOUCHED
+    else:
+        # Hint-only mode (M9): no LRU touch, just flip block hints.
+        # Mark prefill as not-attempted so telemetry distinguishes the
+        # two modes; the registry still tracks the refresh event.
+        prefill_status = "hint_only"
+        prefill_token_count = 0
     response = _registry.submit_refresh(
         action,
         prefill_status=prefill_status,
         prefill_token_count=prefill_token_count,
     )
+    # M9 merge: when lifecycle_hint is non-null, also flip block hints
+    # by segment_id (subsumes the legacy /v1/coopt/segment_lifecycle_update
+    # endpoint).
+    if isinstance(lifecycle_hint, str) and lifecycle_hint in _VALID_LIFECYCLE_HINTS:
+        segment_id = _optional_str(action.get("segment_id"))
+        # M3 (paper §3.5): extract optional cross-caller aggregation
+        # fields from the refresh action body so the engine can key
+        # per-caller hint contributions on (runner_id, instance_id).
+        # Backward-compat: missing/empty falls through to the engine's
+        # default ``"default"`` runner + ``_anon`` instance slot.
+        # M3 ``literal_no``: when true, ``new_hint="no"`` records as a
+        # literal "evict ASAP" contribution rather than dropping the
+        # caller's slot from the live set. Defaults False.
+        raw_runner_id = action.get("runner_id")
+        runner_id = (
+            raw_runner_id
+            if isinstance(raw_runner_id, str) and raw_runner_id
+            else None
+        )
+        raw_instance_id = action.get("instance_id")
+        instance_id = (
+            raw_instance_id
+            if isinstance(raw_instance_id, str) and raw_instance_id
+            else None
+        )
+        literal_no = bool(action.get("literal_no") or False)
+        hint_result = update_segment_lifecycle_hint(
+            segment_id,
+            lifecycle_hint,
+            runner_id=runner_id,
+            instance_id=instance_id,
+            literal_no=literal_no,
+        )
+        # Surface the hint-update result on the response so callers can
+        # observe both effects in one call. Field names are scoped under
+        # ``hint_update_*`` to avoid colliding with the refresh fields.
+        response["hint_update_applied_hint"] = lifecycle_hint
+        response["hint_update_updated"] = int(hint_result.get("updated") or 0)
+        response["hint_update_skipped"] = int(hint_result.get("skipped") or 0)
+        response["hint_update_reject_reason"] = hint_result.get("reject_reason")
+    else:
+        response["hint_update_applied_hint"] = None
+        response["hint_update_updated"] = 0
+        response["hint_update_skipped"] = 0
+        response["hint_update_reject_reason"] = None
     _emit_segment_telemetry(
         action_id=_optional_str(response.get("action_id")),
         action_kind=SEGMENT_REFRESH_ACTION_KIND,
@@ -1370,9 +1484,9 @@ def tag_blocks_with_segment_id(blocks: Any, segment_id: str | None) -> None:
 
     Also registers each tagged block in the global
     ``segment_id -> blocks`` reverse map used by Phase E2 step 3's
-    ``/v1/coopt/segment_lifecycle_update`` endpoint to find blocks by
-    segment_id (e.g., when the workflow monitor downgrades must -> no
-    after a loop exit).
+    merged ``POST /v1/coopt/segment_refresh`` endpoint
+    (M9: ``lifecycle_hint`` field) to find blocks by segment_id (e.g.,
+    when the workflow monitor downgrades must -> no after a loop exit).
 
     Best-effort: silently ignores blocks that don't have the attribute
     (prevents type coupling to KVCacheBlock from this layer).
@@ -1438,10 +1552,12 @@ def update_segment_lifecycle_hint(
 ) -> dict[str, Any]:
     """Phase E2 step 3 + M3 — flip the lifecycle_hint on tagged blocks.
 
-    The workflow monitor calls this after a CFG event narrows the
-    segment's future consumer set (e.g., loop exit → "no", or loop
-    continuation → "must"). The new hint propagates to all currently-
-    tagged blocks for that segment_id; subsequent
+    The workflow monitor (M9: now via the merged
+    ``POST /v1/coopt/segment_refresh`` endpoint with
+    ``lifecycle_hint`` set in the body) calls this after a CFG event
+    narrows the segment's future consumer set (e.g., loop exit → "no",
+    or loop continuation → "must"). The new hint propagates to all
+    currently-tagged blocks for that segment_id; subsequent
     ``FreeKVCacheBlockQueue.popleft_n`` calls honor it via the
     3-priority traversal (no → may → must).
 
@@ -1755,91 +1871,44 @@ async def http_get_segment_telemetry(segment_id: str) -> JSONResponse:
 
 @router.post("/v1/coopt/segment_lifecycle_update")
 async def http_segment_lifecycle_update(raw_request: Request) -> JSONResponse:
-    """WIRES Phase E2 step 3 — flip a segment's lifecycle hint at runtime.
+    """M9 (paper/CODE_MISMATCH_NOTES.md): MERGED into segment_refresh.
 
-    Body: ``{"segment_id": str, "new_hint": "must" | "may" | "no"}``.
-    Looks up all KVCacheBlocks the segment_prepare prefill helper
-    tagged with ``segment_id`` and updates their ``lifecycle_hint``.
-    The next ``FreeKVCacheBlockQueue.popleft_n`` honors the new hint
-    via the 3-priority traversal (no -> may -> must).
+    The legacy
+    ``POST /v1/coopt/segment_lifecycle_update {segment_id, new_hint}``
+    endpoint is removed: per the paper §3.4 unified
+    ``segment_refresh`` action (LRU touch + lifecycle hint update),
+    callers must POST ``/v1/coopt/segment_refresh`` with
+    ``lifecycle_hint`` set in the body. The merged endpoint accepts a
+    "hint-only" mode (no ``prompt_token_ids``) so callers that have
+    no token ids at hand (e.g. loop-anchor must-promotion at loop
+    entry) can still flip block hints without performing an LRU touch.
 
-    Returned: ``{"updated": int, "skipped": int, "reject_reason":
-    str | None}``. Empty body / unknown segment / bad hint → 400.
-
-    Workflow monitor calls this after a CFG event (loop exit, branch
-    arm taken) narrows or expands the segment's future consumer set.
+    Returns HTTP 410 Gone with a structured error body so legacy
+    callers fail loudly with a clear migration message rather than
+    silently 404'ing or sending hint updates that never apply.
     """
 
     if not workflow_coopt_actions_enabled():
         return _disabled_response()
-    try:
-        payload = await raw_request.json()
-    except Exception:  # noqa: BLE001
-        return _bad_payload_response("invalid_json")
-    if not isinstance(payload, dict):
-        return _bad_payload_response("expected_object")
-    segment_id = payload.get("segment_id")
-    new_hint = payload.get("new_hint")
-    # M3: extract optional ``(runner_id, instance_id)`` tuple so the
-    # engine can aggregate per-caller hint contributions across
-    # concurrent referencers — and so that independent runners that
-    # do not coordinate the ``instance_id`` namespace stay isolated
-    # (a "no" from runner A's instance "X" must NOT yank runner B's
-    # instance "X" out of the live set).
-    #
-    # Backward-compat: missing/empty/non-string ``runner_id`` falls
-    # through to the ``"default"`` runner; missing/empty/non-string
-    # ``instance_id`` falls through to the synthetic ``_anon`` slot.
-    # Single-tenant callers that pre-date M3 (no runner_id, no
-    # instance_id) therefore land in ``("default", "_anon")`` —
-    # last-write-wins, identical to pre-M3 behavior.
-    raw_runner_id = payload.get("runner_id")
-    runner_id = (
-        raw_runner_id
-        if isinstance(raw_runner_id, str) and raw_runner_id
-        else None
+    # M9 (paper/CODE_MISMATCH_NOTES.md): legacy /v1/coopt/segment_lifecycle_update
+    # endpoint REMOVED — its behavior is subsumed by /v1/coopt/segment_refresh
+    # with ``lifecycle_hint`` in the body (hint-only mode). Return HTTP 410
+    # Gone with redirect message so legacy clients fail loudly. The M3
+    # runner_id / instance_id / literal_no extraction that previously lived
+    # here now lives in the segment_refresh handler (see _validate_segment_refresh
+    # + submit_segment_refresh_action).
+    return JSONResponse(
+        content={
+            "error": (
+                "merged into segment_refresh; pass lifecycle_hint in the "
+                "POST /v1/coopt/segment_refresh body"
+            ),
+            "redirect_to": "/v1/coopt/segment_refresh",
+            "redirect_body_field": "lifecycle_hint",
+            "removed_at": "M9",
+            "engine_wire_status": "gone",
+            "lifecycle_status": "rejected",
+            "reject_reason": "endpoint_merged_m9",
+        },
+        status_code=410,
     )
-    raw_instance_id = payload.get("instance_id")
-    instance_id = (
-        raw_instance_id
-        if isinstance(raw_instance_id, str) and raw_instance_id
-        else None
-    )
-    # Optional ``literal_no`` flag: when true, ``new_hint="no"`` is
-    # recorded as a literal "evict ASAP" contribution rather than
-    # removing the slot from the live set. Defaults to False so
-    # the runner-side "instance completed, drop my contribution"
-    # idiom (segment_lifecycle_update with new_hint=no) works without
-    # explicitly opting in.
-    literal_no = bool(payload.get("literal_no") or False)
-    result = update_segment_lifecycle_hint(
-        segment_id,
-        new_hint,
-        runner_id=runner_id,
-        instance_id=instance_id,
-        literal_no=literal_no,
-    )
-    # Status policy: success or "soft no-op" → 200; structurally bad
-    # request → 400.
-    # - updated > 0                    → 200 (work happened)
-    # - reject_reason in {              → 200 (caller's payload was
-    #     "no_blocks_for_segment",       valid; the engine just had
-    #     "all_stale",                   nothing to act on. Speculative
-    #   }                                promotions like docs/v2/32 §4
-    #                                    OQ6 #1 issue these on may
-    #                                    segments that haven't been
-    #                                    prepared yet — that's a
-    #                                    soft no-op, not an error.)
-    # - reject_reason in {              → 400 (malformed request)
-    #     "segment_id_missing",
-    #     "invalid_hint",
-    #   }
-    reject = result.get("reject_reason")
-    if result.get("updated", 0) > 0 or reject in {
-        "no_blocks_for_segment",
-        "all_stale",
-    }:
-        status_code = 200
-    else:
-        status_code = 400
-    return JSONResponse(content=result, status_code=status_code)

@@ -408,26 +408,108 @@ def test_telemetry_records_cache_hit(monkeypatch, tmp_path) -> None:
     assert refresh_record.engine_segment_evict_count == 0
 
 
-def test_segment_lifecycle_update_flips_block_hints(monkeypatch, tmp_path) -> None:
-    """Phase E2 step 3 — POST /v1/coopt/segment_lifecycle_update flips
-    the lifecycle_hint on every block currently tagged with the segment.
+# ---------------------------------------------------------------------------
+# M9 (paper/CODE_MISMATCH_NOTES.md): merged segment_refresh + lifecycle_hint
+#
+# These tests cover three call shapes for the merged endpoint:
+#
+# 1. Touch-only refresh: prompt_token_ids present, lifecycle_hint absent.
+#    LRU touch via prefill; no block hint flip. Mirrors the legacy
+#    segment_refresh contract.
+# 2. Touch + hint update: both present. LRU touch AND flips block hints
+#    by segment_id.
+# 3. Hint-only: prompt_token_ids absent, lifecycle_hint present. No
+#    LRU touch; just flips block hints. Subsumes the legacy
+#    /v1/coopt/segment_lifecycle_update endpoint, including loop-anchor
+#    must-promotion at loop entry that has no token ids at hand.
+#
+# Plus the 410 Gone redirect on the legacy endpoint URL.
+# ---------------------------------------------------------------------------
 
-    Self-heals on stale tags (block reused for a different segment).
+
+def _hint_only_refresh_action(
+    *, action_id: str = "segr:hint:1", lifecycle_hint: str = "must"
+) -> dict[str, object]:
+    """Build a hint-only segment_refresh payload (no prompt_token_ids).
+
+    Mirrors the loop-anchor-must-promotion call site in v2/api.py:
+    the runner has a segment_id but no token ids at the moment the
+    promotion fires (token ids are owned by the prepare flow).
     """
 
-    client, _handler = _make_app(monkeypatch, tmp_path)
+    return {
+        "action_kind": SEGMENT_REFRESH_ACTION_KIND,
+        "action_id": action_id,
+        "segment_id": "seg-abc",
+        "family_id": "fam-1",
+        "parent_segment_id": None,
+        "token_hash": _TOKEN_HASH,
+        "model": "test-model",
+        "lifecycle_status": "created",
+        "lifecycle_hint": lifecycle_hint,
+        "would_evict_without_refresh": False,
+        "ttl_ms": 30000,
+    }
 
-    # Register a segment (so the registry has it; tag_blocks needs it)
+
+def test_m9_segment_refresh_without_hint_does_lru_touch_only(
+    monkeypatch, tmp_path
+) -> None:
+    """M9 refresh shape #1: prompt_token_ids present + lifecycle_hint absent.
+
+    Verifies that a refresh without ``lifecycle_hint`` performs the LRU
+    touch (prefill via the chat handler) AND records hint_update_*
+    fields with the not-applied sentinel values, so consumers can tell
+    no block hints were flipped.
+    """
+
+    client, handler = _make_app(monkeypatch, tmp_path)
+
+    # Prepare first so the (family_id, token_hash) entry exists.
     prepare_resp = client.post(
         "/v1/coopt/segment_prepare", json=_segment_prepare_action()
     )
     assert prepare_resp.status_code == 200
 
+    refresh_resp = client.post(
+        "/v1/coopt/segment_refresh", json=_segment_refresh_action()
+    )
+    assert refresh_resp.status_code == 200
+    body = refresh_resp.json()
+    assert body["accepted"] is True
+    # Touch happened (prewarm submitted -> retouched marker).
+    assert body["prefill_status"] == "retouched"
+    assert body["prefill_token_count"] == len(_TOKEN_IDS)
+    # No hint update because lifecycle_hint is absent.
+    assert body["hint_update_applied_hint"] is None
+    assert body["hint_update_updated"] == 0
+    assert body["hint_update_skipped"] == 0
+    assert body["hint_update_reject_reason"] is None
+    # Engine-side prewarm was invoked.
+    assert len(handler.refresh_submissions) == 1
+
+
+def test_m9_segment_refresh_with_hint_does_touch_and_flip(
+    monkeypatch, tmp_path
+) -> None:
+    """M9 refresh shape #2: prompt_token_ids + lifecycle_hint both present.
+
+    Verifies that a refresh with ``lifecycle_hint`` set performs BOTH
+    the LRU touch AND flips block hints by segment_id. Replaces the
+    legacy two-call sequence (refresh, then segment_lifecycle_update).
+    """
+
     from vllm.entrypoints.openai.chat_completion.segment_actions import (
         tag_blocks_with_segment_id,
     )
 
-    # Create three fake blocks (just dataclass-like objects)
+    client, handler = _make_app(monkeypatch, tmp_path)
+
+    prepare_resp = client.post(
+        "/v1/coopt/segment_prepare", json=_segment_prepare_action()
+    )
+    assert prepare_resp.status_code == 200
+
     class _FakeBlock:
         __slots__ = ("_segment_id", "lifecycle_hint")
 
@@ -435,81 +517,220 @@ def test_segment_lifecycle_update_flips_block_hints(monkeypatch, tmp_path) -> No
             self._segment_id = None
             self.lifecycle_hint = "may"
 
-    blk_a = _FakeBlock()
-    blk_b = _FakeBlock()
-    blk_c = _FakeBlock()
-    tag_blocks_with_segment_id([blk_a, blk_b, blk_c], "seg-abc")
-    assert blk_a._segment_id == "seg-abc"
+    blk_a, blk_b = _FakeBlock(), _FakeBlock()
+    tag_blocks_with_segment_id([blk_a, blk_b], "seg-abc")
 
-    # Update hint via HTTP endpoint
+    action = _segment_refresh_action()
+    action["lifecycle_hint"] = "must"
+    refresh_resp = client.post("/v1/coopt/segment_refresh", json=action)
+    assert refresh_resp.status_code == 200
+    body = refresh_resp.json()
+    assert body["accepted"] is True
+    # Touch happened.
+    assert body["prefill_status"] == "retouched"
+    # Hint flip happened too.
+    assert body["hint_update_applied_hint"] == "must"
+    assert body["hint_update_updated"] == 2
+    assert body["hint_update_skipped"] == 0
+    assert body["hint_update_reject_reason"] is None
+    assert blk_a.lifecycle_hint == "must"
+    assert blk_b.lifecycle_hint == "must"
+    # The chat handler's prewarm hook was invoked exactly once (touch
+    # piece), not twice.
+    assert len(handler.refresh_submissions) == 1
+
+
+def test_m9_segment_refresh_hint_only_skips_prewarm(
+    monkeypatch, tmp_path
+) -> None:
+    """M9 refresh shape #3: lifecycle_hint without prompt_token_ids.
+
+    Subsumes the legacy /v1/coopt/segment_lifecycle_update endpoint:
+    when the loop-anchor must-promotion fires at loop entry, the
+    runner has a segment_id but no token ids. The merged endpoint
+    accepts that shape and just flips block hints (no prewarm).
+    """
+
+    from vllm.entrypoints.openai.chat_completion.segment_actions import (
+        tag_blocks_with_segment_id,
+    )
+
+    client, handler = _make_app(monkeypatch, tmp_path)
+
+    # Prepare so the segment is registered (sole purpose: lets us tag
+    # blocks; the prepare also primes (family_id, token_hash) for the
+    # hint-only refresh's registry lookup).
+    prepare_resp = client.post(
+        "/v1/coopt/segment_prepare", json=_segment_prepare_action()
+    )
+    assert prepare_resp.status_code == 200
+
+    class _FakeBlock:
+        __slots__ = ("_segment_id", "lifecycle_hint")
+
+        def __init__(self):
+            self._segment_id = None
+            self.lifecycle_hint = "may"
+
+    blk_a, blk_b, blk_c = _FakeBlock(), _FakeBlock(), _FakeBlock()
+    tag_blocks_with_segment_id([blk_a, blk_b, blk_c], "seg-abc")
+
+    refresh_resp = client.post(
+        "/v1/coopt/segment_refresh",
+        json=_hint_only_refresh_action(lifecycle_hint="must"),
+    )
+    assert refresh_resp.status_code == 200, refresh_resp.text
+    body = refresh_resp.json()
+    assert body["accepted"] is True
+    # Hint-only mode marker on prefill_status — no LRU touch.
+    assert body["prefill_status"] == "hint_only"
+    assert body["prefill_token_count"] == 0
+    # Hint flip happened.
+    assert body["hint_update_applied_hint"] == "must"
+    assert body["hint_update_updated"] == 3
+    for blk in (blk_a, blk_b, blk_c):
+        assert blk.lifecycle_hint == "must"
+    # Crucially: engine-side prewarm hook was NOT invoked (no token ids).
+    assert len(handler.refresh_submissions) == 0
+
+
+def test_m9_segment_refresh_hint_only_unknown_segment_is_soft_noop(
+    monkeypatch, tmp_path
+) -> None:
+    """Hint-only mode targeting an un-tagged segment: 200, hint_update_updated=0.
+
+    Mirrors the legacy endpoint's soft-no-op semantics for speculative
+    promotions (docs/v2/32 §4 OQ6 #1) that target may segments that
+    haven't had blocks tagged yet.
+    """
+
+    client, _handler = _make_app(monkeypatch, tmp_path)
+
+    # Don't tag any blocks; just send a hint-only refresh.
+    action = _hint_only_refresh_action(lifecycle_hint="no")
+    action["segment_id"] = "unknown-seg"
+    # family_id is required so we can find / create the registry entry;
+    # but no blocks are tagged, so the hint update is a soft no-op.
+    refresh_resp = client.post("/v1/coopt/segment_refresh", json=action)
+    assert refresh_resp.status_code == 200, refresh_resp.text
+    body = refresh_resp.json()
+    assert body["accepted"] is True
+    assert body["prefill_status"] == "hint_only"
+    assert body["hint_update_applied_hint"] == "no"
+    assert body["hint_update_updated"] == 0
+    assert body["hint_update_reject_reason"] in {
+        "no_blocks_for_segment",
+        "all_stale",
+    }
+
+
+def test_m9_segment_refresh_rejects_invalid_lifecycle_hint(
+    monkeypatch, tmp_path
+) -> None:
+    """An unknown ``lifecycle_hint`` value must yield 400 invalid_lifecycle_hint."""
+
+    client, _handler = _make_app(monkeypatch, tmp_path)
+
+    action = _segment_refresh_action()
+    action["lifecycle_hint"] = "INVALID"  # not in must|may|no
+    resp = client.post("/v1/coopt/segment_refresh", json=action)
+    assert resp.status_code == 400, resp.text
+    body = resp.json()
+    assert body["accepted"] is False
+    assert body["reject_reason"] == "invalid_lifecycle_hint"
+
+
+def test_m9_segment_refresh_rejects_neither_token_ids_nor_hint(
+    monkeypatch, tmp_path
+) -> None:
+    """A refresh that lacks BOTH prompt_token_ids and lifecycle_hint is malformed."""
+
+    client, _handler = _make_app(monkeypatch, tmp_path)
+
+    action = _hint_only_refresh_action()
+    action.pop("lifecycle_hint")  # leave nothing to do
+    resp = client.post("/v1/coopt/segment_refresh", json=action)
+    assert resp.status_code == 400, resp.text
+    assert (
+        resp.json()["reject_reason"]
+        == "missing_prompt_token_ids_or_lifecycle_hint"
+    )
+
+
+def test_m9_legacy_segment_lifecycle_update_returns_410_gone(
+    monkeypatch, tmp_path
+) -> None:
+    """The legacy /v1/coopt/segment_lifecycle_update endpoint is removed.
+
+    Returns HTTP 410 Gone with a structured error body so callers using
+    the old path fail loudly with a clear migration message rather than
+    silently 404'ing or sending hint updates that never apply.
+    """
+
+    client, _handler = _make_app(monkeypatch, tmp_path)
     resp = client.post(
         "/v1/coopt/segment_lifecycle_update",
         json={"segment_id": "seg-abc", "new_hint": "no"},
     )
-    assert resp.status_code == 200, resp.text
+    assert resp.status_code == 410, resp.text
     body = resp.json()
-    assert body["updated"] == 3
-    assert body["skipped"] == 0
-    assert body["reject_reason"] is None
-
-    assert blk_a.lifecycle_hint == "no"
-    assert blk_b.lifecycle_hint == "no"
-    assert blk_c.lifecycle_hint == "no"
+    assert "merged into segment_refresh" in body["error"]
+    assert body["redirect_to"] == "/v1/coopt/segment_refresh"
+    assert body["redirect_body_field"] == "lifecycle_hint"
+    assert body["removed_at"] == "M9"
+    assert body["reject_reason"] == "endpoint_merged_m9"
 
 
-def test_segment_lifecycle_update_routes_through_block_pool_queue(
+def test_m9_segment_refresh_hint_routes_through_block_pool_queue(
     monkeypatch, tmp_path
 ) -> None:
-    """WIRES Phase B: when block_pool registers update_block_hint as the
-    updater, segment_lifecycle_update flips block hints AND moves them
-    between pools in the 3-pool queue (docs/v2/32 §2.3 + §2.7).
+    """WIRES Phase B (preserved across M9): when block_pool registers
+    update_block_hint as the updater, the merged segment_refresh endpoint
+    flips block hints AND moves them between pools in the 3-pool queue
+    (docs/v2/32 §2.3 + §2.7).
     """
 
-    from vllm.v1.core.kv_cache_utils import (
-        VICTIM_POLICY_WIRES_THREE_POOL,
-        FreeKVCacheBlockQueue,
-        KVCacheBlock,
-    )
     from vllm.entrypoints.openai.chat_completion.segment_actions import (
         reset_segment_registry_for_tests,
         set_block_hint_updater,
         tag_blocks_with_segment_id,
     )
+    from vllm.v1.core.kv_cache_utils import (
+        VICTIM_POLICY_WIRES_THREE_POOL,
+        FreeKVCacheBlockQueue,
+        KVCacheBlock,
+    )
 
     client, _handler = _make_app(monkeypatch, tmp_path)
     prepare_resp = client.post(
         "/v1/coopt/segment_prepare",
-        json=_segment_prepare_action(action_id="phase-b-wire-prepare"),
+        json=_segment_prepare_action(action_id="m9-wire-prepare"),
     )
     assert prepare_resp.status_code == 200
 
-    # Use a unique segment_id so this test doesn't collide with other
-    # tests that tag blocks under "seg-abc" against the module-level
-    # SegmentRegistry singleton.
-    seg_id = "seg-phaseb-wire"
+    seg_id = "seg-m9-wire"
 
-    # Construct a real 3-pool queue and wire it up.
     real_blocks = [KVCacheBlock(block_id=i) for i in range(3)]
     queue = FreeKVCacheBlockQueue(
         real_blocks, mode=VICTIM_POLICY_WIRES_THREE_POOL
     )
     set_block_hint_updater(queue.update_block_hint)
     try:
-        # All three start in the may pool (default hint).
         assert queue.num_free_blocks_in_pool("may") == 3
         assert queue.num_free_blocks_in_pool("must") == 0
 
         tag_blocks_with_segment_id(real_blocks, seg_id)
 
-        # Promote the segment to "must" via the HTTP endpoint.
-        resp = client.post(
-            "/v1/coopt/segment_lifecycle_update",
-            json={"segment_id": seg_id, "new_hint": "must"},
+        # Promote via the merged refresh endpoint, hint-only mode.
+        action = _hint_only_refresh_action(
+            action_id="m9-wire-promote",
+            lifecycle_hint="must",
         )
+        action["segment_id"] = seg_id
+        resp = client.post("/v1/coopt/segment_refresh", json=action)
         assert resp.status_code == 200, resp.text
-        assert resp.json()["updated"] == 3
+        assert resp.json()["hint_update_updated"] == 3
 
-        # All three blocks should now live in the must pool.
         assert queue.num_free_blocks_in_pool("may") == 0
         assert queue.num_free_blocks_in_pool("must") == 3
         for blk in real_blocks:
@@ -519,20 +740,22 @@ def test_segment_lifecycle_update_routes_through_block_pool_queue(
         reset_segment_registry_for_tests()
 
 
-def test_segment_lifecycle_update_self_heals_stale_tag(
+def test_m9_segment_refresh_hint_only_self_heals_stale_tag(
     monkeypatch, tmp_path
 ) -> None:
-    """A block whose ``_segment_id`` was reassigned mid-flight is skipped."""
+    """A block whose ``_segment_id`` was reassigned mid-flight is skipped
+    by the merged refresh endpoint (preserved Phase E2 step 3 invariant).
+    """
+
+    from vllm.entrypoints.openai.chat_completion.segment_actions import (
+        tag_blocks_with_segment_id,
+    )
 
     client, _handler = _make_app(monkeypatch, tmp_path)
     prepare_resp = client.post(
         "/v1/coopt/segment_prepare", json=_segment_prepare_action()
     )
     assert prepare_resp.status_code == 200
-
-    from vllm.entrypoints.openai.chat_completion.segment_actions import (
-        tag_blocks_with_segment_id,
-    )
 
     class _FakeBlock:
         __slots__ = ("_segment_id", "lifecycle_hint")
@@ -541,69 +764,17 @@ def test_segment_lifecycle_update_self_heals_stale_tag(
             self._segment_id = None
             self.lifecycle_hint = "may"
 
-    blk_a = _FakeBlock()
-    blk_b = _FakeBlock()
+    blk_a, blk_b = _FakeBlock(), _FakeBlock()
     tag_blocks_with_segment_id([blk_a, blk_b], "seg-abc")
-    # Simulate eviction + reuse: blk_b gets retagged for a different segment
-    blk_b._segment_id = "seg-other"
+    blk_b._segment_id = "seg-other"  # simulate eviction + reuse
 
     resp = client.post(
-        "/v1/coopt/segment_lifecycle_update",
-        json={"segment_id": "seg-abc", "new_hint": "must"},
+        "/v1/coopt/segment_refresh",
+        json=_hint_only_refresh_action(lifecycle_hint="must"),
     )
     assert resp.status_code == 200
     body = resp.json()
-    assert body["updated"] == 1  # only blk_a
-    assert body["skipped"] == 1  # blk_b stale
+    assert body["hint_update_updated"] == 1
+    assert body["hint_update_skipped"] == 1
     assert blk_a.lifecycle_hint == "must"
-    assert blk_b.lifecycle_hint == "may"  # untouched
-
-
-def test_segment_lifecycle_update_rejects_invalid_hint(
-    monkeypatch, tmp_path
-) -> None:
-    client, _handler = _make_app(monkeypatch, tmp_path)
-    resp = client.post(
-        "/v1/coopt/segment_lifecycle_update",
-        json={"segment_id": "seg-abc", "new_hint": "INVALID"},
-    )
-    assert resp.status_code == 400
-    body = resp.json()
-    assert body["reject_reason"] == "invalid_hint"
-
-
-def test_segment_lifecycle_update_unknown_segment_is_soft_noop(
-    monkeypatch, tmp_path
-) -> None:
-    """Unknown segment_id is a SOFT no-op (200), not an error (400).
-
-    Speculative promotions (docs/v2/32 §4 OQ6 #1) target may segments
-    that haven't been prepared yet — the engine has no blocks tagged
-    for those, so update_block_hints returns updated=0 with
-    reject_reason='no_blocks_for_segment'. That's a valid response,
-    not a payload error; surfacing it as 400 spams the operator log
-    and trips per-request error metrics.
-    """
-    client, _handler = _make_app(monkeypatch, tmp_path)
-    resp = client.post(
-        "/v1/coopt/segment_lifecycle_update",
-        json={"segment_id": "unknown-seg", "new_hint": "no"},
-    )
-    assert resp.status_code == 200
-    body = resp.json()
-    assert body["updated"] == 0
-    assert body["reject_reason"] in ("no_blocks_for_segment", "all_stale")
-
-
-def test_segment_lifecycle_update_rejects_missing_segment_id(
-    monkeypatch, tmp_path
-) -> None:
-    """Missing segment_id is a structural error (400)."""
-    client, _handler = _make_app(monkeypatch, tmp_path)
-    resp = client.post(
-        "/v1/coopt/segment_lifecycle_update",
-        json={"new_hint": "no"},  # no segment_id
-    )
-    assert resp.status_code == 400
-    body = resp.json()
-    assert body["reject_reason"] == "segment_id_missing"
+    assert blk_b.lifecycle_hint == "may"
