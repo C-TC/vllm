@@ -74,6 +74,10 @@ from vllm.v1.request import Request, RequestStatus, StreamingUpdate
 from vllm.v1.spec_decode.metrics import SpecDecodingStats
 from vllm.v1.structured_output import StructuredOutputManager
 from vllm.v1.utils import record_function_or_nullcontext
+from vllm.v1.wires_engine_telemetry import (
+    emit_request_lifecycle as _wires_emit_request_lifecycle,
+)
+from vllm.v1.wires_telemetry import is_enabled as _wires_telemetry_enabled
 
 logger = init_logger(__name__)
 
@@ -898,6 +902,16 @@ class Scheduler(SchedulerInterface):
                     request.record_event(
                         EngineCoreEventType.SCHEDULED, scheduled_timestamp
                     )
+                # T-45.4 (docs/v2/45 §3.1): capture the first SCHEDULED
+                # monotonic ts for the E1 row. Subsequent re-schedules
+                # (preemption -> re-running) do not overwrite — the
+                # first scheduled time is the meaningful one. One
+                # attribute write, conditioned on telemetry being on.
+                if (
+                    _wires_telemetry_enabled()
+                    and request._telemetry_ts_scheduled_mono is None
+                ):
+                    request._telemetry_ts_scheduled_mono = scheduled_timestamp
                 if request.status == RequestStatus.WAITING:
                     scheduled_new_reqs.append(request)
                 elif request.status == RequestStatus.PREEMPTED:
@@ -1891,6 +1905,17 @@ class Scheduler(SchedulerInterface):
         # a request is still being prefilled, we expect the model runner
         # to return empty token ids for the request.
         stopped = False
+        # T-45.4 (docs/v2/45 §3.1): capture monotonic first-token ts on
+        # the engine-core side for the E1 row. The check is one
+        # ``is None`` after the first call so the cost is one branch
+        # per output-token batch (NOT per token), gated on telemetry
+        # being enabled.
+        if (
+            new_token_ids
+            and request._telemetry_ts_first_token_mono is None
+            and _wires_telemetry_enabled()
+        ):
+            request._telemetry_ts_first_token_mono = time.monotonic()
         for num_new, output_token_id in enumerate(new_token_ids, 1):
             request.append_output_token_ids(output_token_id)
 
@@ -2113,7 +2138,76 @@ class Scheduler(SchedulerInterface):
                 ),
             }
 
+        # T-45.4 (docs/v2/45 §3.1): emit one E1 row per finished request.
+        # Hot-path cost when WIRES_TELEMETRY_ENABLED is unset: one
+        # attribute read inside ``_wires_emit_request_lifecycle``. When
+        # enabled: one ``time.time()``, one ``time.monotonic()`` (used
+        # to convert the engine's internal monotonic event timestamps
+        # to wall clock), one dict construction, one
+        # ``deque.append`` under the writer's lock. Failure is
+        # swallowed inside the helper.
+        if _wires_telemetry_enabled():
+            self._wires_emit_e1(request)
+
         return kv_xfer_params
+
+    def _wires_emit_e1(self, request: Request) -> None:
+        """Emit the E1 per-request lifecycle row.
+
+        Carved out of ``_free_request`` so the cold-path math sits in
+        one place and the hot caller stays a clean
+        ``if enabled: emit()``. Wall-clock conversion uses the
+        ``mono = wall - offset`` trick: one ``time.time()`` + one
+        ``time.monotonic()`` per finish (rare path).
+        """
+        wall_now = time.time()
+        mono_now = time.monotonic()
+        offset = wall_now - mono_now
+
+        sched_mono = request._telemetry_ts_scheduled_mono
+        first_tok_mono = request._telemetry_ts_first_token_mono
+        ts_scheduled = sched_mono + offset if sched_mono is not None else None
+        ts_first_token = first_tok_mono + offset if first_tok_mono is not None else None
+
+        finish_status = request.status
+        # Map the granular RequestStatus enum down to the small
+        # paper-§3.1 enum (ok / error / aborted / ignored). Anything
+        # not explicitly an error/abort/ignored is treated as ok
+        # (covers FINISHED_STOPPED, FINISHED_LENGTH_CAPPED,
+        # FINISHED_REPETITION — those are normal terminations).
+        if finish_status == RequestStatus.FINISHED_ERROR:
+            status_str = "error"
+        elif finish_status == RequestStatus.FINISHED_ABORTED:
+            status_str = "aborted"
+        elif finish_status == RequestStatus.FINISHED_IGNORED:
+            status_str = "ignored"
+        else:
+            status_str = "ok"
+
+        # cached_token_count: best-effort from the engine's own
+        # counter. ``num_cached_tokens`` is initialised to -1 (never
+        # filled) for requests that finished before any prefill ran;
+        # normalise to 0 so the JSONL stays integer-typed.
+        cached = request.num_cached_tokens
+        if cached is None or cached < 0:
+            cached = 0
+        prompt_tokens = request.num_prompt_tokens
+        output_tokens = request.num_output_tokens
+
+        _wires_emit_request_lifecycle(
+            vllm_request_id=request.request_id,
+            ts_arrived=request.arrival_time,
+            ts_scheduled=ts_scheduled,
+            ts_first_token=ts_first_token,
+            ts_finished=wall_now,
+            prompt_token_count=prompt_tokens,
+            cached_token_count=cached,
+            output_token_count=output_tokens,
+            blocks_allocated=request.num_blocks_allocated_total,
+            blocks_cache_hit=request.num_blocks_cache_hit_total,
+            evicts_caused=request.num_evicts_caused_total,
+            status=status_str,
+        )
 
     def _workflow_release_consumed_prepared_prefix(
         self,

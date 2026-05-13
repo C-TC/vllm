@@ -16,12 +16,14 @@ from vllm.v1.core.kv_cache_utils import KVCacheBlock
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.metrics.stats import PrefixCacheStats
 from vllm.v1.request import Request
+from vllm.v1.wires_engine_telemetry import (
+    begin_request_alloc,
+    end_request_alloc,
+)
 
 logger = init_logger(__name__)
 
-_WORKFLOW_PREFIX_PREPARE_MAX_OUTSTANDING_ENV = (
-    "WORKFLOW_PREFIX_PREPARE_MAX_OUTSTANDING"
-)
+_WORKFLOW_PREFIX_PREPARE_MAX_OUTSTANDING_ENV = "WORKFLOW_PREFIX_PREPARE_MAX_OUTSTANDING"
 _DEFAULT_WORKFLOW_PREFIX_LEASE_MAX_OUTSTANDING = 128
 
 
@@ -465,25 +467,34 @@ class KVCacheManager:
             # Cannot allocate new blocks
             return None
 
-        if (
-            new_computed_block_list is not self.empty_kv_cache_blocks.blocks
-            or num_external_computed_tokens > 0
-        ):
-            # Append the new computed blocks to the request blocks until now to
-            # avoid the case where the new blocks cannot be allocated.
-            self.coordinator.allocate_new_computed_blocks(
-                request_id=request.request_id,
-                new_computed_blocks=new_computed_block_list,
-                num_local_computed_tokens=num_local_computed_tokens,
-                num_external_computed_tokens=num_external_computed_tokens,
-            )
+        # T-45.4 (docs/v2/45 §3.1): mark this request as the current
+        # allocate-side request so eviction telemetry on the popleft
+        # path attributes ``evicts_caused`` back to it. Cleared in the
+        # ``finally`` block below so an exception during allocate does
+        # not leak the slot to the next request.
+        begin_request_alloc(request)
+        try:
+            if (
+                new_computed_block_list is not self.empty_kv_cache_blocks.blocks
+                or num_external_computed_tokens > 0
+            ):
+                # Append the new computed blocks to the request blocks until now
+                # to avoid the case where the new blocks cannot be allocated.
+                self.coordinator.allocate_new_computed_blocks(
+                    request_id=request.request_id,
+                    new_computed_blocks=new_computed_block_list,
+                    num_local_computed_tokens=num_local_computed_tokens,
+                    num_external_computed_tokens=num_external_computed_tokens,
+                )
 
-        new_blocks = self.coordinator.allocate_new_blocks(
-            request.request_id,
-            num_tokens_need_slot,
-            num_tokens_main_model,
-            num_encoder_tokens,
-        )
+            new_blocks = self.coordinator.allocate_new_blocks(
+                request.request_id,
+                num_tokens_need_slot,
+                num_tokens_main_model,
+                num_encoder_tokens,
+            )
+        finally:
+            end_request_alloc()
 
         # WIRES Phase E2 step 2: propagate the request's lifecycle hint
         # to the freshly-allocated blocks so subsequent eviction (via
@@ -534,9 +545,21 @@ class KVCacheManager:
                 tag_blocks_with_segment_id = None
             if tag_blocks_with_segment_id is not None:
                 for group_blocks in new_blocks:
-                    tag_blocks_with_segment_id(
-                        list(group_blocks), request_segment_id
-                    )
+                    tag_blocks_with_segment_id(list(group_blocks), request_segment_id)
+
+        # T-45.4 (docs/v2/45 §3.1): per-request E1 tallies. Counts the
+        # freshly-allocated and prefix-cache-hit blocks across all
+        # KV-cache groups for this allocate. ``new_computed_block_list``
+        # is the prefix-hit set (one list per group); ``new_blocks`` is
+        # the freshly-allocated set. Assignment is one int add per
+        # group, no per-block work.
+        try:
+            new_alloc_count = sum(len(group) for group in new_blocks)
+            cache_hit_count = sum(len(group) for group in new_computed_block_list)
+            request.num_blocks_allocated_total += new_alloc_count
+            request.num_blocks_cache_hit_total += cache_hit_count
+        except AttributeError:  # pragma: no cover - defensive (legacy req types)
+            pass
 
         # P/D: delay caching blocks if we have to recv from
         # remote. Update state for locally cached blocks.
@@ -612,9 +635,11 @@ class KVCacheManager:
                 full_block_count=0,
                 ttl_ms=ttl_ms,
             )
-        if len(self._workflow_prepared_prefix_leases) >= (
-            _workflow_prefix_lease_max_outstanding()
-        ) and action_id not in self._workflow_prepared_prefix_leases:
+        if (
+            len(self._workflow_prepared_prefix_leases)
+            >= (_workflow_prefix_lease_max_outstanding())
+            and action_id not in self._workflow_prepared_prefix_leases
+        ):
             return _workflow_lease_result(
                 "lease_failed",
                 "lease_capacity_exceeded",

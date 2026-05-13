@@ -26,6 +26,7 @@ from vllm.v1.core.kv_cache_utils import (
     maybe_convert_block_hash,
 )
 from vllm.v1.request import Request
+from vllm.v1.wires_engine_telemetry import note_evict_for_current_request
 
 logger = init_logger(__name__)
 
@@ -187,9 +188,7 @@ class BlockPool:
             queue = self.free_block_queue
 
             def _structured_hint_updater(blk, new_hint):
-                queue.update_block_hint(
-                    blk, new_hint, source_class="structured"
-                )
+                queue.update_block_hint(blk, new_hint, source_class="structured")
 
             segment_actions.set_block_hint_updater(_structured_hint_updater)
         except ImportError:
@@ -421,6 +420,14 @@ class BlockPool:
             except Exception:  # noqa: BLE001 - telemetry must never break serving
                 pass
 
+        # T-45.4 (docs/v2/45 §3.1): attribute this eviction to whichever
+        # request's allocate path is currently on the stack so the E1
+        # ``evicts_caused`` field counts pressure caused by THIS
+        # request, not unrelated background activity. The helper
+        # short-circuits to a no-op when no allocate is on the stack
+        # (one attribute read + branch).
+        note_evict_for_current_request()
+
         block.reset_hash()
 
         if self.enable_kv_cache_events:
@@ -465,6 +472,7 @@ class BlockPool:
                     record_retention = None
                 break
         import time as _time
+
         now_ns = _time.monotonic_ns()
         for block in blocks:
             # WIRES Phase C3 (docs/v2/32 §2.4.1 + Q8 answer):
@@ -487,10 +495,7 @@ class BlockPool:
             # free-pool and in-use hits — an in-use must block being
             # touched again is itself an in-must hit). Reset to zero
             # by `_stamp_must_promotion` on each fresh promotion.
-            if (
-                block.source_class == "structured"
-                and block.lifecycle_hint == "must"
-            ):
+            if block.source_class == "structured" and block.lifecycle_hint == "must":
                 block._must_hit_count += 1
             # Bump last_access_ns BEFORE promotion (Phase D), so the
             # next interval is measured from this hit forward.

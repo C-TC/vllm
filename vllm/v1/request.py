@@ -150,9 +150,7 @@ class Request:
                 hint_raw = sampling_params.extra_args.get("lifecycle_hint")
                 if hint_raw in ("must", "may", "no"):
                     self.lifecycle_hint = hint_raw
-                segment_id_raw = sampling_params.extra_args.get(
-                    "workflow_segment_id"
-                )
+                segment_id_raw = sampling_params.extra_args.get("workflow_segment_id")
                 if isinstance(segment_id_raw, str) and segment_id_raw:
                     self.segment_id = segment_id_raw
                 # M13: parse per-segment hints (chat completion may carry
@@ -194,6 +192,33 @@ class Request:
             if self.prompt_token_ids is not None
             else [0] * self.num_prompt_tokens
         )
+
+        # T-45.4 (docs/v2/45 §3.1): per-request tallies for the E1
+        # engine_telemetry/requests.jsonl row emitted at finish. Each
+        # field is bumped by exactly one call site:
+        #   - ``num_blocks_allocated_total`` += new_blocks each
+        #     ``KVCacheManager.allocate_slots`` call for this request
+        #     (counts the freshly-allocated, not cache-hit, blocks).
+        #   - ``num_blocks_cache_hit_total`` += blocks satisfied by
+        #     prefix-cache match each allocate (i.e. taken from
+        #     ``new_computed_blocks``).
+        #   - ``num_evicts_caused_total`` += blocks the allocate path
+        #     forced out of the free pool to satisfy this request.
+        # Defaults are zero so non-WIRES requests cost nothing extra
+        # (one int store at first allocate, never thereafter).
+        self.num_blocks_allocated_total: int = 0
+        self.num_blocks_cache_hit_total: int = 0
+        self.num_evicts_caused_total: int = 0
+
+        # T-45.4: monotonic timestamps captured at scheduler events.
+        # Stored as monotonic so we don't pay an extra ``time.time()``
+        # syscall on the hot scheduler tick; ``_free_request`` converts
+        # to wall clock once (one ``time.time()`` + one
+        # ``time.monotonic()`` per finish, an already-cold path) using
+        # the offset trick. ``None`` means the event has not happened
+        # yet (e.g. request errored before scheduling).
+        self._telemetry_ts_scheduled_mono: float | None = None
+        self._telemetry_ts_first_token_mono: float | None = None
 
         # Used in async scheduling.
         self.num_output_placeholders = 0
