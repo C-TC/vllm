@@ -46,6 +46,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import time
 from collections import OrderedDict
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -60,6 +61,17 @@ from vllm.entrypoints.openai.chat_completion.workflow_actions import (
 )
 from vllm.entrypoints.openai.chat_completion.workflow_test_hook import (
     record_workflow_segment_action,
+)
+from vllm.v1.wires_engine_telemetry import (
+    ACTION_OUTCOME_NOOP_ALREADY_PRESENT,
+    ACTION_OUTCOME_PREPARED,
+    ACTION_OUTCOME_REJECTED_BAD_INPUT,
+    ACTION_OUTCOME_REJECTED_DEDUP,
+    ENDPOINT_SEGMENT_PREPARE,
+    ENDPOINT_SEGMENT_REFRESH,
+)
+from vllm.v1.wires_engine_telemetry import (
+    emit_action as _wires_emit_action,
 )
 
 __all__ = [
@@ -570,9 +582,7 @@ class SegmentEntry:
     # ``instance_id`` fall back to the synthetic ``"_anon"`` slot, so
     # legacy "last-write-wins" callers (single-tenant: one default
     # runner, no instance ids) keep working unchanged.
-    live_hints_by_caller: dict[tuple[str, str], str] = field(
-        default_factory=dict
-    )
+    live_hints_by_caller: dict[tuple[str, str], str] = field(default_factory=dict)
     extra: dict[str, Any] = field(default_factory=dict)
 
     # M3: cross-instance hint aggregation.
@@ -593,9 +603,7 @@ class SegmentEntry:
     _ANONYMOUS_INSTANCE_ID = "_anon"
 
     @staticmethod
-    def _caller_key(
-        runner_id: str | None, instance_id: str | None
-    ) -> tuple[str, str]:
+    def _caller_key(runner_id: str | None, instance_id: str | None) -> tuple[str, str]:
         """Project ``(runner_id, instance_id)`` to the canonical caller key.
 
         Empty / non-string fields fall through to the default
@@ -766,9 +774,7 @@ class SegmentRegistry:
 
     def __init__(self) -> None:
         self._lock = Lock()
-        self._entries_by_key: OrderedDict[
-            tuple[str, str], SegmentEntry
-        ] = OrderedDict()
+        self._entries_by_key: OrderedDict[tuple[str, str], SegmentEntry] = OrderedDict()
         self._entries_by_action_id: dict[str, SegmentEntry] = {}
         # WIRES Phase E4 — secondary segment_id -> entry index used by
         # block-pool hooks (touch / eviction). The (family_id, token_hash)
@@ -939,10 +945,7 @@ class SegmentRegistry:
             if entry is None:
                 return {"updated": False, "reject_reason": "unknown_action_id"}
             entry.prefill_status = prefill_status
-            if (
-                isinstance(prefill_token_count, int)
-                and prefill_token_count >= 0
-            ):
+            if isinstance(prefill_token_count, int) and prefill_token_count >= 0:
                 entry.prefill_token_count = prefill_token_count
             return {
                 "updated": True,
@@ -1078,9 +1081,7 @@ class SegmentRegistry:
         result["live_referencer_count"] = live_count
         return result
 
-    def update_block_hints(
-        self, segment_id: str, new_hint: str
-    ) -> dict[str, Any]:
+    def update_block_hints(self, segment_id: str, new_hint: str) -> dict[str, Any]:
         """WIRES Phase E2 step 3 — flip lifecycle_hint on tagged blocks.
 
         Walks the registered blocks for ``segment_id``, validates each
@@ -1215,15 +1216,15 @@ class SegmentRegistry:
         while len(self._entries_by_key) > max_outstanding:
             _evicted_key, evicted_entry = self._entries_by_key.popitem(last=False)
             self._entries_by_action_id.pop(evicted_entry.action_id, None)
-            if evicted_entry.segment_id:
-                # Only drop the secondary index entry if it still maps to
-                # this exact entry (a later submit_prepare for the same
-                # segment_id would have superseded it).
-                if (
-                    self._entries_by_segment_id.get(evicted_entry.segment_id)
-                    is evicted_entry
-                ):
-                    self._entries_by_segment_id.pop(evicted_entry.segment_id, None)
+            # Only drop the secondary index entry if it still maps to
+            # this exact entry (a later submit_prepare for the same
+            # segment_id would have superseded it).
+            if (
+                evicted_entry.segment_id
+                and self._entries_by_segment_id.get(evicted_entry.segment_id)
+                is evicted_entry
+            ):
+                self._entries_by_segment_id.pop(evicted_entry.segment_id, None)
 
 
 _registry = SegmentRegistry()
@@ -1290,11 +1291,84 @@ async def _maybe_submit_segment_prewarm(
 # ----- Public entry points ------------------------------------------------
 
 
+def _e2_decide_outcome(
+    *,
+    rejected: bool,
+    reject_reason: str | None,
+    prefill_status: str,
+) -> str:
+    """Map handler exit state to the E2 ``outcome`` enum (proposal §3.2).
+
+    The four enum values are:
+    * ``rejected_bad_input`` — validator returned a rejection.
+    * ``rejected_dedup`` — registry-level dedup signalled by the
+      ``reject_reason`` payload (``duplicate_*`` family).
+    * ``noop_already_present`` — accepted, but no actual prefill was
+      attempted (registry already had a hot entry; in M9 hint-only
+      refresh this is also the normal path).
+    * ``prepared`` — prefill / re-touch actually fired.
+    """
+    if rejected and reject_reason and reject_reason.startswith("duplicate"):
+        return ACTION_OUTCOME_REJECTED_DEDUP
+    if rejected:
+        return ACTION_OUTCOME_REJECTED_BAD_INPUT
+    if prefill_status in {
+        "prewarm_submitted",
+        "prewarm_completed",
+        _REFRESH_PREWARM_STATUS_RETOUCHED,
+    }:
+        return ACTION_OUTCOME_PREPARED
+    # not_attempted / hint_only / prefill_only_unavailable / etc.
+    return ACTION_OUTCOME_NOOP_ALREADY_PRESENT
+
+
+def _e2_emit(
+    *,
+    endpoint: str,
+    action: dict[str, Any],
+    response: dict[str, Any] | None,
+    rejection: dict[str, Any] | None,
+    prefill_status: str,
+    prefill_token_count: int,
+    started_at: float,
+) -> None:
+    """Build + push one E2 row. Pure cold-path: only fires after a
+    ``/v1/coopt/segment_*`` POST handler has returned."""
+    elapsed_ms = (time.monotonic() - started_at) * 1000.0
+    rejected = rejection is not None
+    reject_reason = (
+        _optional_str(rejection.get("reject_reason")) if rejection is not None else None
+    )
+    outcome = _e2_decide_outcome(
+        rejected=rejected,
+        reject_reason=reject_reason,
+        prefill_status=prefill_status,
+    )
+    scope_key = _optional_str(action.get("segment_id"))
+    if outcome == ACTION_OUTCOME_PREPARED:
+        blocks_newly_written = prefill_token_count
+        blocks_already_present = 0
+    else:
+        blocks_newly_written = 0
+        blocks_already_present = prefill_token_count
+    blocks_touched = blocks_newly_written + blocks_already_present
+    _wires_emit_action(
+        endpoint=endpoint,
+        scope_key=scope_key,
+        blocks_touched=blocks_touched,
+        blocks_already_present=blocks_already_present,
+        blocks_newly_written=blocks_newly_written,
+        outcome=outcome,
+        elapsed_ms=elapsed_ms,
+    )
+
+
 async def submit_segment_prepare_action(
     action: dict[str, Any],
     *,
     chat_handler: Any | None,
 ) -> dict[str, Any]:
+    started_at = time.monotonic()
     rejection = _validate_segment_prepare(action)
     if rejection is not None:
         _emit_segment_telemetry(
@@ -1304,6 +1378,15 @@ async def submit_segment_prepare_action(
             reject_reason=_optional_str(rejection.get("reject_reason")),
             response=None,
             request_action=action,
+        )
+        _e2_emit(
+            endpoint=ENDPOINT_SEGMENT_PREPARE,
+            action=action,
+            response=None,
+            rejection=rejection,
+            prefill_status="not_attempted",
+            prefill_token_count=0,
+            started_at=started_at,
         )
         return rejection
     prefill_status, prefill_token_count = await _maybe_submit_segment_prewarm(
@@ -1324,6 +1407,15 @@ async def submit_segment_prepare_action(
         response=response,
         request_action=action,
     )
+    _e2_emit(
+        endpoint=ENDPOINT_SEGMENT_PREPARE,
+        action=action,
+        response=response,
+        rejection=None,
+        prefill_status=prefill_status,
+        prefill_token_count=prefill_token_count,
+        started_at=started_at,
+    )
     return response
 
 
@@ -1332,6 +1424,7 @@ async def submit_segment_refresh_action(
     *,
     chat_handler: Any | None,
 ) -> dict[str, Any]:
+    started_at = time.monotonic()
     rejection = _validate_segment_refresh(action)
     if rejection is not None:
         _emit_segment_telemetry(
@@ -1341,6 +1434,15 @@ async def submit_segment_refresh_action(
             reject_reason=_optional_str(rejection.get("reject_reason")),
             response=None,
             request_action=action,
+        )
+        _e2_emit(
+            endpoint=ENDPOINT_SEGMENT_REFRESH,
+            action=action,
+            response=None,
+            rejection=rejection,
+            prefill_status="not_attempted",
+            prefill_token_count=0,
+            started_at=started_at,
         )
         return rejection
     # M9 merge: detect mode from validated payload.
@@ -1385,9 +1487,7 @@ async def submit_segment_refresh_action(
         # caller's slot from the live set. Defaults False.
         raw_runner_id = action.get("runner_id")
         runner_id = (
-            raw_runner_id
-            if isinstance(raw_runner_id, str) and raw_runner_id
-            else None
+            raw_runner_id if isinstance(raw_runner_id, str) and raw_runner_id else None
         )
         raw_instance_id = action.get("instance_id")
         instance_id = (
@@ -1422,6 +1522,15 @@ async def submit_segment_refresh_action(
         reject_reason=None,
         response=response,
         request_action=action,
+    )
+    _e2_emit(
+        endpoint=ENDPOINT_SEGMENT_REFRESH,
+        action=action,
+        response=response,
+        rejection=None,
+        prefill_status=prefill_status,
+        prefill_token_count=prefill_token_count,
+        started_at=started_at,
     )
     return response
 
@@ -1656,9 +1765,7 @@ def release_segment_instance_contribution(
                 "effective_hint": "may",
                 "live_referencer_count": 0,
             }
-        effective = entry.release_instance_contribution(
-            runner_id, instance_id
-        )
+        effective = entry.release_instance_contribution(runner_id, instance_id)
         live_count = len(entry.live_hints_by_caller)
     result = _registry.update_block_hints(segment_id, effective)
     result["effective_hint"] = effective
@@ -1706,9 +1813,7 @@ def _emit_segment_telemetry(
         segment_observed_consumers=_optional_int(
             response_view.get("observed_consumers")
         ),
-        segment_lifecycle_status=_optional_str(
-            request_action.get("lifecycle_status")
-        ),
+        segment_lifecycle_status=_optional_str(request_action.get("lifecycle_status")),
         segment_status=_optional_str(response_view.get("status")),
         segment_would_evict_without_refresh=_optional_bool(
             request_action.get("would_evict_without_refresh")
@@ -1770,9 +1875,7 @@ async def http_submit_segment_prepare(raw_request: Request) -> JSONResponse:
     if not isinstance(payload, dict):
         return _bad_payload_response("expected_object")
     chat_handler = getattr(raw_request.app.state, "openai_serving_chat", None)
-    response = await submit_segment_prepare_action(
-        payload, chat_handler=chat_handler
-    )
+    response = await submit_segment_prepare_action(payload, chat_handler=chat_handler)
     status_code = 200 if response.get("accepted") is True else 400
     return JSONResponse(content=response, status_code=status_code)
 
@@ -1788,9 +1891,7 @@ async def http_submit_segment_refresh(raw_request: Request) -> JSONResponse:
     if not isinstance(payload, dict):
         return _bad_payload_response("expected_object")
     chat_handler = getattr(raw_request.app.state, "openai_serving_chat", None)
-    response = await submit_segment_refresh_action(
-        payload, chat_handler=chat_handler
-    )
+    response = await submit_segment_refresh_action(payload, chat_handler=chat_handler)
     status_code = 200 if response.get("accepted") is True else 400
     return JSONResponse(content=response, status_code=status_code)
 
