@@ -694,8 +694,16 @@ def test_m9_segment_refresh_hint_routes_through_block_pool_queue(
 ) -> None:
     """WIRES Phase B (preserved across M9): when block_pool registers
     update_block_hint as the updater, the merged segment_refresh endpoint
-    flips block hints AND moves them between pools in the 3-pool queue
+    flips block hints AND queues the pool moves in the 3-pool queue
     (docs/v2/32 §2.3 + §2.7).
+
+    M19 (paper/CODE_MISMATCH_NOTES.md M19): pool moves are now deferred
+    via ``_pending_hint_flips`` and flushed at the next cache op entry
+    (popleft_n / cache_full_blocks / free_blocks / get_all_free_blocks /
+    BlockPool.touch). This test calls the refresh endpoint then forces a
+    flush before observing pool placement, so the assertion still pins
+    the post-flush invariant (every block lands in the right pool with
+    the right hint) without coupling to the M19-deferred timing.
     """
 
     from vllm.entrypoints.openai.chat_completion.segment_actions import (
@@ -738,6 +746,11 @@ def test_m9_segment_refresh_hint_routes_through_block_pool_queue(
         resp = client.post("/v1/coopt/segment_refresh", json=action)
         assert resp.status_code == 200, resp.text
         assert resp.json()["hint_update_updated"] == 3
+
+        # M19 lazy-flip: hint metadata updates eagerly but the actual
+        # pool move is deferred. Force the flush so the post-flush
+        # invariant (must=3, may=0) is observable here.
+        queue._flush_pending_hint_flips()
 
         assert queue.num_free_blocks_in_pool("may") == 0
         assert queue.num_free_blocks_in_pool("must") == 3
