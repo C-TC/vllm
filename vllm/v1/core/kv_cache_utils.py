@@ -30,6 +30,15 @@ from vllm.v1.kv_cache_interface import (
 )
 from vllm.v1.request import Request
 from vllm.v1.utils import tensor_data
+from vllm.v1.wires_engine_telemetry import (
+    EVICT_REASON_LRU_PRESSURE,
+    EVICT_REASON_MUST_PRESSURE_BACKSTOP,
+    EVICT_REASON_TTL_EXPIRED,
+)
+from vllm.v1.wires_engine_telemetry import (
+    emit_eviction as _wires_emit_eviction,
+)
+from vllm.v1.wires_telemetry import is_enabled as _wires_telemetry_enabled
 
 # BlockHash represents the hash of a single KV-cache block used for
 # prefix caching.  Treating it as a distinct type from `bytes` helps
@@ -218,6 +227,36 @@ class KVCacheBlock:
     # short-circuit when this is None, so non-WIRES request paths pay
     # zero telemetry cost.
     _segment_id: str | None = None
+
+    # T-45.7 (docs/v2/45 §3.4): writer attribution. Each time this
+    # block is filled (chat completion prefill, segment_prepare
+    # prefill, segment_refresh prefill, prefix_prepare prefill) the
+    # caller stamps these three fields via
+    # ``wires_engine_telemetry.stamp_block_writer``. The E4 cache_source
+    # decision walks them at allocate time:
+    #
+    #   _last_writer_kind:   one of WRITER_KIND_* enum values
+    #                        (chat_completion / segment_prepare /
+    #                        segment_refresh / prefix_prepare); None
+    #                        means "block has never been filled"
+    #                        => cold_prefill.
+    #   _last_writer_ts:     wall-clock epoch of the fill. Used with
+    #                        WIRES_TELEMETRY_PRE_PREPARED_WINDOW_S to
+    #                        decide pre_prepared vs peer_cached.
+    #   _last_writer_request_id:
+    #                        for chat_completion, the ``vllm_request_id``
+    #                        (chatcmpl-...) of the request that wrote
+    #                        the block. Used to distinguish self_hit
+    #                        from peer_cached. For action-driven fills
+    #                        carries the action endpoint string
+    #                        (segment_prepare / etc.) so it's always
+    #                        deterministic.
+    #
+    # All three default to None / 0.0 so non-WIRES blocks (e.g.
+    # baseline lanes' fills) pay no construction cost beyond the slot.
+    _last_writer_kind: str | None = None
+    _last_writer_ts: float = 0.0
+    _last_writer_request_id: str | None = None
 
     @property
     def block_hash(self) -> BlockHashWithGroupId | None:
@@ -423,9 +462,7 @@ def _resolve_ttl_ns_from_env(env_name: str, default_ms: int) -> int:
     try:
         ms = int(raw)
     except ValueError as e:
-        raise ValueError(
-            f"{env_name} must be an integer (got {raw!r})"
-        ) from e
+        raise ValueError(f"{env_name} must be an integer (got {raw!r})") from e
     if ms < 0:
         raise ValueError(f"{env_name} must be >= 0 (got {ms})")
     return ms * 1_000_000
@@ -479,13 +516,11 @@ def _resolve_access_promotion_threshold_from_env() -> int:
         threshold = int(raw)
     except ValueError as e:
         raise ValueError(
-            f"WIRES_KVCACHE_ACCESS_PROMOTION_THRESHOLD must be an integer "
-            f"(got {raw!r})"
+            f"WIRES_KVCACHE_ACCESS_PROMOTION_THRESHOLD must be an integer (got {raw!r})"
         ) from e
     if threshold < 0:
         raise ValueError(
-            f"WIRES_KVCACHE_ACCESS_PROMOTION_THRESHOLD must be >= 0 "
-            f"(got {threshold})"
+            f"WIRES_KVCACHE_ACCESS_PROMOTION_THRESHOLD must be >= 0 (got {threshold})"
         )
     return threshold
 
@@ -649,9 +684,7 @@ class FreeKVCacheBlockQueue:
             else _resolve_float_from_env("WIRES_PH_INIT", _DEFAULT_PH_INIT)
         )
         if not 0.0 < ph_init_resolved < 1.0:
-            raise ValueError(
-                f"ph_init must be in (0, 1), got {ph_init_resolved}"
-            )
+            raise ValueError(f"ph_init must be in (0, 1), got {ph_init_resolved}")
         halflife_resolved: int = (
             ph_ema_halflife
             if ph_ema_halflife is not None
@@ -660,9 +693,7 @@ class FreeKVCacheBlockQueue:
             )
         )
         if halflife_resolved < 1:
-            raise ValueError(
-                f"ph_ema_halflife must be >= 1, got {halflife_resolved}"
-            )
+            raise ValueError(f"ph_ema_halflife must be >= 1, got {halflife_resolved}")
         self._p_h_init: float = ph_init_resolved
         self._p_h_hat: float = ph_init_resolved
         self._p_h_ema_halflife: int = halflife_resolved
@@ -697,9 +728,7 @@ class FreeKVCacheBlockQueue:
                 # (M16 cleanup: the default flipped from "structured" to
                 # match paper §2.3 — explicit CFG promotion is the
                 # special case, access-based is the dominant path).
-                self._stamp_must_promotion(
-                    block, now_ns, block.source_class
-                )
+                self._stamp_must_promotion(block, now_ns, block.source_class)
             self._pools[pool_name].append(block)
             self._pool_of[block.block_id] = pool_name
 
@@ -820,9 +849,7 @@ class FreeKVCacheBlockQueue:
         """
         if self._n_samples_unstructured < self._bootstrap_samples:
             return self._unstructured_bootstrap_ttl_ns
-        return int(
-            self._T_hat_u_ns + self.unstructured_k_current * self.sigma_u_ns
-        )
+        return int(self._T_hat_u_ns + self.unstructured_k_current * self.sigma_u_ns)
 
     def _pool_for_block(self, block: KVCacheBlock) -> str:
         """Resolve which pool ``block`` should land in given the active mode."""
@@ -848,7 +875,9 @@ class FreeKVCacheBlockQueue:
     # --- Aggregate state --------------------------------------------------
     @property
     def num_free_blocks(self) -> int:
-        return self._pools["no"].size + self._pools["may"].size + self._pools["must"].size
+        return (
+            self._pools["no"].size + self._pools["may"].size + self._pools["must"].size
+        )
 
     def num_free_blocks_in_pool(self, pool: str) -> int:
         return self._pools[pool].size
@@ -912,6 +941,31 @@ class FreeKVCacheBlockQueue:
         if demoted:
             self._pools["may"].prepend_many(demoted)
             self.ttl_demoted_count += len(demoted)
+            # T-45.6 (docs/v2/45 §3.3): emit one E3 row per ttl-demoted
+            # block. ``pool_at_evict="must"`` because the block was
+            # IN must when the demote fired; ``must_pool_evicted``
+            # falls out of that comparison in the emitter so the
+            # paper §3 invariant grep still works. ``ttl_at_demote_ms``
+            # is the snapshot the block was promoted with.
+            if _wires_telemetry_enabled():
+                ts_now = time.time()
+                for blk in demoted:
+                    _wires_emit_eviction(
+                        block_id=blk.block_id,
+                        scope_key=blk._segment_id,
+                        pool_at_evict="must",
+                        source_class=blk.source_class,
+                        hint=blk.lifecycle_hint,
+                        reason=EVICT_REASON_TTL_EXPIRED,
+                        ttl_at_demote_ms=(
+                            blk.ttl_at_promotion_ns / 1_000_000.0
+                            if blk.ttl_at_promotion_ns > 0
+                            else None
+                        ),
+                        must_hit_count=blk._must_hit_count,
+                        ref_count_at_evict=blk.ref_cnt,
+                        ts_epoch=ts_now,
+                    )
         return len(demoted)
 
     def popleft(self) -> KVCacheBlock:
@@ -941,6 +995,13 @@ class FreeKVCacheBlockQueue:
 
         ret: list[KVCacheBlock] = []
         must_taken = 0
+        # T-45.6 (docs/v2/45 §3.3): track per-pool pop ranges so we
+        # can emit one E3 row per popped block at the end. We emit
+        # AFTER all pops complete to avoid serialising the hot
+        # eviction loop on telemetry; emission still happens inline
+        # on the same thread (no IPC) but we keep the deque/lock
+        # taps clustered.
+        pool_taken: list[tuple[str, KVCacheBlock]] = []
         for name in self.POOL_ORDER:
             pool = self._pools[name]
             while pool.size > 0 and len(ret) < n:
@@ -948,6 +1009,8 @@ class FreeKVCacheBlockQueue:
                 assert blk is not None
                 self._pool_of.pop(blk.block_id, None)
                 ret.append(blk)
+                if _wires_telemetry_enabled():
+                    pool_taken.append((name, blk))
                 if name == "must":
                     must_taken += 1
             if len(ret) == n:
@@ -961,6 +1024,42 @@ class FreeKVCacheBlockQueue:
 
         if must_taken > 0:
             self.must_pool_evicted_count += must_taken
+            # Critical-path WARN log per the proposal: must-pool eviction
+            # is a paper §3 invariant violation. Emit a single warning
+            # per popleft_n call (NOT per block) so the log doesn't
+            # drown a sweep — the JSONL row carries the per-block
+            # detail, the log carries the alert.
+            logger.warning(
+                "wires telemetry: must-pool eviction backstop fired "
+                "(must_taken=%d, n=%d, must_pool_evicted_count=%d)",
+                must_taken,
+                n,
+                self.must_pool_evicted_count,
+            )
+
+        if pool_taken:
+            ts_now = time.time()
+            for pool_name, blk in pool_taken:
+                _wires_emit_eviction(
+                    block_id=blk.block_id,
+                    scope_key=blk._segment_id,
+                    pool_at_evict=pool_name,
+                    source_class=blk.source_class,
+                    hint=blk.lifecycle_hint,
+                    reason=(
+                        EVICT_REASON_MUST_PRESSURE_BACKSTOP
+                        if pool_name == "must"
+                        else EVICT_REASON_LRU_PRESSURE
+                    ),
+                    ttl_at_demote_ms=(
+                        blk.ttl_at_promotion_ns / 1_000_000.0
+                        if blk.ttl_at_promotion_ns > 0
+                        else None
+                    ),
+                    must_hit_count=blk._must_hit_count,
+                    ref_count_at_evict=blk.ref_cnt,
+                    ts_epoch=ts_now,
+                )
         return ret
 
     def _stamp_must_promotion(
@@ -990,9 +1089,7 @@ class FreeKVCacheBlockQueue:
         ``update_block_hint`` BEFORE this re-append fires."""
         pool_name = self._pool_for_block(block)
         if pool_name == "must":
-            self._stamp_must_promotion(
-                block, time.monotonic_ns(), block.source_class
-            )
+            self._stamp_must_promotion(block, time.monotonic_ns(), block.source_class)
         self._pools[pool_name].append(block)
         self._pool_of[block.block_id] = pool_name
 
@@ -1005,9 +1102,7 @@ class FreeKVCacheBlockQueue:
         for b in blocks:
             pool_name = self._pool_for_block(b)
             if pool_name == "must":
-                self._stamp_must_promotion(
-                    b, now_ns, b.source_class
-                )
+                self._stamp_must_promotion(b, now_ns, b.source_class)
             by_pool[pool_name].append(b)
             self._pool_of[b.block_id] = pool_name
         for name, group in by_pool.items():
@@ -1089,9 +1184,7 @@ class FreeKVCacheBlockQueue:
             if new_hint == "must":
                 # Promotion to must: stamp promoted_at +
                 # ttl_at_promotion + source_class (Phase C3).
-                self._stamp_must_promotion(
-                    block, time.monotonic_ns(), source_class
-                )
+                self._stamp_must_promotion(block, time.monotonic_ns(), source_class)
             self._pools[new_hint].append(block)
             self._pool_of[block.block_id] = new_hint
         else:

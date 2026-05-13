@@ -18,8 +18,13 @@ from vllm.v1.metrics.stats import PrefixCacheStats
 from vllm.v1.request import Request
 from vllm.v1.wires_engine_telemetry import (
     begin_request_alloc,
+    decide_cache_source,
     end_request_alloc,
 )
+from vllm.v1.wires_engine_telemetry import (
+    emit_segment_touch as _wires_emit_segment_touch,
+)
+from vllm.v1.wires_telemetry import is_enabled as _wires_telemetry_enabled
 
 logger = init_logger(__name__)
 
@@ -561,6 +566,20 @@ class KVCacheManager:
         except AttributeError:  # pragma: no cover - defensive (legacy req types)
             pass
 
+        # T-45.7 (docs/v2/45 §3.4): emit one E4 row per segment that
+        # this allocate touched. Walks both the cache-hit set
+        # (``new_computed_block_list``) and the freshly-allocated set
+        # (``new_blocks``); groups blocks by their tagged
+        # ``_segment_id`` (set by segment_prepare's
+        # tag_blocks_with_segment_id). Non-WIRES allocates touch zero
+        # tagged blocks, so this loop short-circuits to nothing.
+        if _wires_telemetry_enabled():
+            self._wires_emit_e4_segment_touches(
+                request,
+                new_computed_block_list,
+                new_blocks,
+            )
+
         # P/D: delay caching blocks if we have to recv from
         # remote. Update state for locally cached blocks.
         if not self.enable_caching or delay_cache_blocks:
@@ -578,6 +597,74 @@ class KVCacheManager:
         self.coordinator.cache_blocks(request, num_tokens_to_cache)
 
         return self.create_kv_cache_blocks(new_blocks)
+
+    def _wires_emit_e4_segment_touches(
+        self,
+        request: Request,
+        new_computed_block_list,
+        new_blocks,
+    ) -> None:
+        """Emit E4 ``segment_touches`` rows for this allocate
+        (T-45.7, docs/v2/45 §3.4).
+
+        Walks every block this allocate touched (cache-hit + freshly
+        allocated), groups by ``_segment_id`` (the scope_key), and
+        emits one row per distinct segment with the dominant
+        ``cache_source`` over its blocks. Cold path relative to the
+        decode loop; only fires when telemetry is enabled (caller
+        already gated).
+        """
+        # Group all touched blocks by their segment id. Ungrouped
+        # blocks (segment_id is None) are not part of any tracked
+        # segment and therefore not emitted — they show up in the E1
+        # ``blocks_*`` totals already.
+        by_seg: dict[str, list] = {}
+        for group in new_computed_block_list:
+            for blk in group:
+                seg_id = getattr(blk, "_segment_id", None)
+                if isinstance(seg_id, str) and seg_id:
+                    by_seg.setdefault(seg_id, []).append(blk)
+        for group in new_blocks:
+            for blk in group:
+                seg_id = getattr(blk, "_segment_id", None)
+                if isinstance(seg_id, str) and seg_id:
+                    by_seg.setdefault(seg_id, []).append(blk)
+        if not by_seg:
+            return
+        ts_now = time.time()
+        req_id = getattr(request, "request_id", None)
+        # ``segment_index`` is the position of this segment in a
+        # request's scope-key sequence. We don't carry the runner's
+        # index here; emit 0 for now and let the offline aggregator
+        # join with the runner-side S3 stream which DOES carry
+        # ordering. Spec §3.4 lists it as a field; populating it
+        # honestly would require runner ↔ engine coupling we
+        # explicitly designed out.
+        for idx, (scope_key, blocks_for_seg) in enumerate(by_seg.items()):
+            cache_source = decide_cache_source(blocks_for_seg, req_id, now_epoch=ts_now)
+            # Pick the modal hint + source_class across the segment's
+            # blocks (single block = trivial). Cheap counter scan.
+            hint_counts: dict[str, int] = {}
+            sclass_counts: dict[str, int] = {}
+            for blk in blocks_for_seg:
+                hint_counts[blk.lifecycle_hint] = (
+                    hint_counts.get(blk.lifecycle_hint, 0) + 1
+                )
+                sclass_counts[blk.source_class] = (
+                    sclass_counts.get(blk.source_class, 0) + 1
+                )
+            modal_hint = max(hint_counts, key=hint_counts.get)
+            modal_sclass = max(sclass_counts, key=sclass_counts.get)
+            _wires_emit_segment_touch(
+                vllm_request_id=req_id,
+                scope_key=scope_key,
+                segment_index=idx,
+                block_count=len(blocks_for_seg),
+                cache_source=cache_source,
+                lifecycle_hint=modal_hint,
+                source_class=modal_sclass,
+                ts_epoch=ts_now,
+            )
 
     def free(self, request: Request) -> None:
         """Free the blocks allocated for the request.

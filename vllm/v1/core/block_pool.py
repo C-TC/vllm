@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import time
 from collections.abc import Iterable, Sequence
 from typing import Any
 
@@ -26,7 +27,13 @@ from vllm.v1.core.kv_cache_utils import (
     maybe_convert_block_hash,
 )
 from vllm.v1.request import Request
-from vllm.v1.wires_engine_telemetry import note_evict_for_current_request
+from vllm.v1.wires_engine_telemetry import (
+    WRITER_KIND_CHAT_COMPLETION,
+    WRITER_KIND_SEGMENT_PREPARE,
+    note_evict_for_current_request,
+    stamp_block_writer,
+)
+from vllm.v1.wires_telemetry import is_enabled as _wires_telemetry_enabled
 
 logger = init_logger(__name__)
 
@@ -282,6 +289,24 @@ class BlockPool:
         new_hashes: list[ExternalBlockHash] | None = (
             [] if self.enable_kv_cache_events else None
         )
+        # T-45.7 (docs/v2/45 §3.4): mark this fill so the E4
+        # cache_source decision can later distinguish peer_cached /
+        # self_hit (chat completion) from pre_prepared (segment_prepare
+        # / segment_refresh prewarm). Hidden prewarm requests carry a
+        # ``segment_id`` (set by ``_maybe_submit_segment_prewarm``);
+        # those are stamped as ``segment_prepare``. All other fills
+        # are normal chat completions. Resolve once outside the loop;
+        # when telemetry is disabled we skip the stamp entirely.
+        wires_telem_on = _wires_telemetry_enabled()
+        wires_now = time.time() if wires_telem_on else 0.0
+        wires_req_id = request.request_id if wires_telem_on else None
+        wires_kind = (
+            WRITER_KIND_SEGMENT_PREPARE
+            if wires_telem_on
+            and isinstance(getattr(request, "segment_id", None), str)
+            and request.segment_id
+            else WRITER_KIND_CHAT_COMPLETION
+        )
         for i, blk in enumerate(new_full_blocks):
             # Some blocks may be null blocks when enabling sparse attention like
             # sliding window attention, or Mamba models with prefix-caching in
@@ -297,6 +322,13 @@ class BlockPool:
             )
             blk.block_hash = block_hash_with_group_id
             self.cached_block_hash_to_block.insert(block_hash_with_group_id, blk)
+            if wires_telem_on:
+                stamp_block_writer(
+                    blk,
+                    kind=wires_kind,
+                    ts_epoch=wires_now,
+                    request_id=wires_req_id,
+                )
             if new_hashes is not None:
                 new_hashes.append(maybe_convert_block_hash(block_hash))
 
