@@ -348,7 +348,13 @@ class _PoolList:
         """Insert blocks at the LRU end (front). Used by the TTL sweep
         to drop demoted-from-must blocks at the front of the may pool
         so they evict before may's existing entries (next-to-evict
-        semantics). See docs/v2/32 §2.4."""
+        semantics). See docs/v2/32 §2.4.
+
+        DEPRECATED for the M17 sweep path; kept for backward compat
+        with any caller that genuinely wants LRU-end prepend.
+        ``insert_by_last_access`` / ``merge_sorted_by_last_access`` are
+        the access-time-correct replacements.
+        """
         if not blocks:
             return
         first = self.head.next_free_block
@@ -362,6 +368,97 @@ class _PoolList:
         prev.next_free_block = first
         first.prev_free_block = prev
         self.size += len(blocks)
+
+    # M17 (CODE_MISMATCH_NOTES.md): last_access_ns-correct insertion.
+    # ``head`` is the LRU end (pop direction); ``tail`` is the MRU end.
+    # The pool invariant for the two helpers below is
+    # ``head.next.last_access_ns <= ... <= tail.prev.last_access_ns``
+    # (sorted ascending by access time). Used by the TTL sweep
+    # (batched merge) and by the lazy-flush single-block move so
+    # demoted blocks land at the LRU position corresponding to their
+    # actual recent-access pattern, instead of always at the LRU end
+    # (prepend_many) or MRU end (append). See docs/v2/32 §2.3
+    # ("Demotion (must -> may): insert at LRU-correct position in may
+    # pool by the block's `last_access_ns`").
+    def insert_by_last_access(self, block: "KVCacheBlock") -> int:
+        """Insert ``block`` at the position that keeps the pool sorted
+        ascending by ``last_access_ns`` (LRU at head, MRU at tail).
+
+        Walk from the MRU end (tail) backwards; the first cursor whose
+        ``last_access_ns <= block.last_access_ns`` is the insertion
+        predecessor. O(n) worst case; in practice short walks dominate
+        because demoted blocks tend to be older than typical may
+        entries (LRU-end target). Returns the number of cursor steps
+        walked (used by ``FreeKVCacheBlockQueue`` for walk-depth
+        telemetry per the M17 spec).
+        """
+        target = block.last_access_ns
+        cursor = self.tail.prev_free_block
+        assert cursor is not None
+        steps = 0
+        while cursor is not self.head and cursor.last_access_ns > target:
+            steps += 1
+            prev = cursor.prev_free_block
+            assert prev is not None
+            cursor = prev
+        # Insert AFTER cursor (cursor is either the head sentinel or a
+        # block whose last_access_ns <= block.last_access_ns).
+        nxt = cursor.next_free_block
+        assert nxt is not None
+        block.prev_free_block = cursor
+        block.next_free_block = nxt
+        cursor.next_free_block = block
+        nxt.prev_free_block = block
+        self.size += 1
+        return steps
+
+    def merge_sorted_by_last_access(
+        self, blocks_sorted_asc: list["KVCacheBlock"]
+    ) -> int:
+        """Merge a list of blocks (already sorted ascending by
+        ``last_access_ns``) into the pool, preserving the
+        sorted-by-access-time invariant. Two-pointer merge against the
+        existing pool walking from head -> tail; O(k + n_existing)
+        where k = len(blocks_sorted_asc), n_existing = self.size.
+
+        Returns the cumulative cursor-walk distance used (each
+        existing block stepped over counts as one step). The TTL sweep
+        and any other batched demote path should use this rather than
+        looping over ``insert_by_last_access`` to avoid the O(k * n)
+        worst case of repeated single-block walks.
+        """
+        if not blocks_sorted_asc:
+            return 0
+        # Walk pool from head; each new block is spliced in at the
+        # first cursor whose last_access_ns > new_block.last_access_ns
+        # (which preserves the ascending order). cursor starts at the
+        # block AFTER head; we hold prev = head and step prev <- cursor
+        # for each cursor we pass.
+        steps = 0
+        prev = self.head
+        cursor = self.head.next_free_block
+        assert cursor is not None
+        for new_block in blocks_sorted_asc:
+            target = new_block.last_access_ns
+            # Advance cursor past every existing block whose
+            # last_access_ns <= target (those belong before the new
+            # block to keep the pool ascending).
+            while cursor is not self.tail and cursor.last_access_ns <= target:
+                steps += 1
+                prev = cursor
+                cursor = cursor.next_free_block
+                assert cursor is not None
+            # Splice new_block between prev and cursor.
+            new_block.prev_free_block = prev
+            new_block.next_free_block = cursor
+            prev.next_free_block = new_block
+            cursor.prev_free_block = new_block
+            # The new block becomes the predecessor for the next
+            # incoming block; cursor stays pointing at the next
+            # existing entry (or tail).
+            prev = new_block
+        self.size += len(blocks_sorted_asc)
+        return steps
 
     def remove(self, block: "KVCacheBlock") -> None:
         prev = block.prev_free_block
@@ -775,6 +872,23 @@ class FreeKVCacheBlockQueue:
         # deferral is overhead-only.
         self.lazy_flush_total_blocks: int = 0
 
+        # M17 (CODE_MISMATCH_NOTES.md): walk-depth telemetry for the
+        # last_access_ns-correct insertion path. Each call to
+        # ``_PoolList.insert_by_last_access`` /
+        # ``_PoolList.merge_sorted_by_last_access`` returns its cursor
+        # step count; the FreeKVCacheBlockQueue accumulates the total
+        # plus a coarse histogram so we can monitor whether the O(n)
+        # walk is acceptable in practice. If the >=1000 bucket grows
+        # under load, that's the trigger to switch to a sortedcontainers
+        # SortedKeyList or a bucket-by-timestamp scheme.
+        #   buckets[0]: walks  < 10 steps
+        #   buckets[1]: walks  < 100 steps
+        #   buckets[2]: walks  < 1000 steps
+        #   buckets[3]: walks >= 1000 steps
+        self.lru_insert_walk_steps_total: int = 0
+        self.lru_insert_count: int = 0
+        self.lru_insert_walk_depth_buckets: list[int] = [0, 0, 0, 0]
+
     @property
     def T_hat_u_ns(self) -> float:
         """Current EMA estimate of unstructured prefix-reuse interval (ns)."""
@@ -916,10 +1030,43 @@ class FreeKVCacheBlockQueue:
         self._pools[current_pool].remove(block)
         if new_hint == "must":
             # Promotion to must: stamp promoted_at + ttl_at_promotion +
-            # source_class (Phase C3).
+            # source_class (Phase C3). The MRU-end append for must is
+            # appropriate (newly promoted -> freshest), so we keep the
+            # tail-append here. M17's LRU-position fix targets the
+            # demote (must -> may) and the runner-driven non-must
+            # transitions where access-time ordering matters for the
+            # LRU eviction class.
             self._stamp_must_promotion(block, time.monotonic_ns(), source_class)
-        self._pools[new_hint].append(block)
+            self._pools[new_hint].append(block)
+        else:
+            # M17: demote (or sideways move) into the no/may pool;
+            # insert at the LRU-position correct for this block's
+            # actual recent-access pattern.
+            steps = self._pools[new_hint].insert_by_last_access(block)
+            self._record_lru_insert_walk(steps)
         self._pool_of[block.block_id] = new_hint
+
+    def _record_lru_insert_walk(self, steps: int) -> None:
+        """M17: bump the walk-depth telemetry counters for one LRU-
+        position insertion (single-block) or one batched merge step.
+
+        ``steps`` is the cursor-walk distance returned by
+        ``_PoolList.insert_by_last_access`` /
+        ``_PoolList.merge_sorted_by_last_access``. The bucket
+        boundaries are <10 / <100 / <1000 / >=1000 to give a coarse
+        sense of the walk-depth distribution without dragging in
+        per-insert histogram libraries.
+        """
+        self.lru_insert_count += 1
+        self.lru_insert_walk_steps_total += steps
+        if steps < 10:
+            self.lru_insert_walk_depth_buckets[0] += 1
+        elif steps < 100:
+            self.lru_insert_walk_depth_buckets[1] += 1
+        elif steps < 1000:
+            self.lru_insert_walk_depth_buckets[2] += 1
+        else:
+            self.lru_insert_walk_depth_buckets[3] += 1
 
     def _flush_pending_hint_flips(self) -> int:
         """Apply all deferred hint flips. Called at the entry of any
@@ -1032,7 +1179,21 @@ class FreeKVCacheBlockQueue:
             demoted.append(blk)
             self._pool_of[blk.block_id] = "may"
         if demoted:
-            self._pools["may"].prepend_many(demoted)
+            # M17: demoted blocks were popped from the must pool head
+            # in promotion-time order, which correlates with (but is
+            # not strictly equal to) last_access_ns order. Sort
+            # explicitly so the two-pointer merge below preserves the
+            # may pool's ascending invariant. Sort cost is O(k log k)
+            # where k = len(demoted); merge is O(k + n_may). Combined
+            # this stays well below the per-insert O(k * n_may) we'd
+            # see if we looped insert_by_last_access.
+            demoted.sort(key=lambda b: b.last_access_ns)
+            steps = self._pools["may"].merge_sorted_by_last_access(demoted)
+            # Telemetry: count this as one logical "insert" event with
+            # the cumulative cursor walk distance. Treating it as one
+            # event (rather than k events) keeps the bucket histogram
+            # aligned with the per-call cost the caller pays.
+            self._record_lru_insert_walk(steps)
             self.ttl_demoted_count += len(demoted)
             # T-45.6 (docs/v2/45 §3.3): emit one E3 row per ttl-demoted
             # block. ``pool_at_evict="must"`` because the block was
