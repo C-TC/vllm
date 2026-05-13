@@ -75,6 +75,7 @@ __all__ = [
     "record_segment_eviction",
     "tag_blocks_with_segment_id",
     "update_segment_lifecycle_hint",
+    "release_segment_instance_contribution",
     "mark_segment_prepare_prefilled",
     "set_block_hint_updater",
 ]
@@ -496,7 +497,113 @@ class SegmentEntry:
     cache_hit_count: int = 0
     retention_count: int = 0
     evict_count_by_hint: dict[str, int] = field(default_factory=dict)
+    # M3 (paper §3 + §3.5 cross-instance hint aggregation): per-instance
+    # hint contributions for this segment. Multiple concurrent workflow
+    # instances may share the same segment (system prompt, retrieved
+    # context). Each instance reports its own raw lifecycle hint via
+    # /v1/coopt/segment_lifecycle_update; the registry aggregates them
+    # into the effective block hint by ``max(must, may, no)`` priority
+    # before pushing through to the block_pool. Empty dict => no live
+    # referencer => default ``"may"``. Anonymous (legacy) callers that
+    # do not carry an instance_id share the synthetic ``"_anon"`` slot,
+    # so legacy "last-write-wins" callers keep working unchanged.
+    live_hints_by_instance: dict[str, str] = field(default_factory=dict)
     extra: dict[str, Any] = field(default_factory=dict)
+
+    # M3: cross-instance hint aggregation.
+    # Priority order: ``must`` > ``may`` > ``no``. ``no`` is the
+    # lowest-priority observable hint; an empty live-hint dict means
+    # no referencer is alive and the effective hint defaults to
+    # ``"may"`` (matches the block-pool default).
+    _HINT_PRIORITY = {"no": 0, "may": 1, "must": 2}
+    # Synthetic instance_id used by legacy callers that pass no
+    # instance_id through the wire. All such calls share the same slot,
+    # so the aggregation reduces to last-write-wins for them.
+    _ANONYMOUS_INSTANCE_ID = "_anon"
+
+    def record_instance_hint(
+        self, instance_id: str | None, new_hint: str | None
+    ) -> str:
+        """Record one instance's contribution and return the effective hint.
+
+        ``instance_id is None`` (or empty) is treated as the synthetic
+        ``_anon`` slot — preserves last-write-wins behavior for callers
+        that pre-date M3 and do not carry an instance_id.
+
+        ``new_hint == "no"`` is treated as "this instance no longer
+        needs the segment alive": the contribution is REMOVED from the
+        live set rather than recorded as ``no``. This matches the
+        runner-side "explicit demote on instance completion" pattern.
+        Note: if all live referencers explicitly demote to ``no``, the
+        effective hint snaps to the empty-set default ``may`` rather
+        than the literal ``no`` (because each instance dropping out
+        means it stops contributing, not that it actively demands
+        eviction). Callers that DO want the literal ``no`` (e.g. loop
+        exit promotes-to-no on an in-flight block) should call
+        ``set_instance_hint_literal`` instead.
+        """
+
+        slot = (
+            instance_id
+            if isinstance(instance_id, str) and instance_id
+            else SegmentEntry._ANONYMOUS_INSTANCE_ID
+        )
+        if new_hint == "no":
+            self.live_hints_by_instance.pop(slot, None)
+        elif new_hint in ("must", "may"):
+            self.live_hints_by_instance[slot] = new_hint
+        else:
+            # Unknown hint: do not mutate the live set, just return
+            # the current effective hint so the caller can decide.
+            pass
+        return self.compute_effective_hint()
+
+    def set_instance_hint_literal(
+        self, instance_id: str | None, new_hint: str | None
+    ) -> str:
+        """Variant of ``record_instance_hint`` that records ``no`` as a
+        literal contribution rather than removing the slot. Used for the
+        loop-exit "promote to no" path where the caller wants the block
+        evicted ASAP regardless of other live referencers.
+        """
+
+        slot = (
+            instance_id
+            if isinstance(instance_id, str) and instance_id
+            else SegmentEntry._ANONYMOUS_INSTANCE_ID
+        )
+        if new_hint in ("must", "may", "no"):
+            self.live_hints_by_instance[slot] = new_hint
+        return self.compute_effective_hint()
+
+    def release_instance_contribution(
+        self, instance_id: str | None
+    ) -> str:
+        """Remove ``instance_id`` from the live-hint set (e.g. on
+        instance completion) and return the new effective hint."""
+
+        slot = (
+            instance_id
+            if isinstance(instance_id, str) and instance_id
+            else SegmentEntry._ANONYMOUS_INSTANCE_ID
+        )
+        self.live_hints_by_instance.pop(slot, None)
+        return self.compute_effective_hint()
+
+    def compute_effective_hint(self) -> str:
+        """Return ``max(live_hints_by_instance.values())`` by priority.
+
+        Empty live set => default ``"may"`` (matches the block-pool
+        default lifecycle_hint and the "no live referencer => no
+        active claim" semantic).
+        """
+
+        if not self.live_hints_by_instance:
+            return "may"
+        return max(
+            self.live_hints_by_instance.values(),
+            key=lambda h: SegmentEntry._HINT_PRIORITY.get(h, -1),
+        )
 
     def expire_if_due(self) -> None:
         if self.status in {_SEGMENT_STATUS_EVICTED, _SEGMENT_STATUS_EXPIRED}:
@@ -533,6 +640,13 @@ class SegmentEntry:
             "retention_count": self.retention_count,
             "evict_count_by_hint": dict(self.evict_count_by_hint),
             "prewarm_status": self.prefill_status,
+            # M3: cross-instance hint aggregation telemetry. Exposes
+            # the live referencer count and the effective hint so
+            # callers can verify the engine is doing the max-priority
+            # combine rather than last-write-wins.
+            "live_referencer_count": len(self.live_hints_by_instance),
+            "effective_lifecycle_hint": self.compute_effective_hint(),
+            "live_hints_by_instance": dict(self.live_hints_by_instance),
         }
 
 
@@ -764,6 +878,88 @@ class SegmentRegistry:
             if all(b is not block for b in blocks):
                 blocks.append(block)
 
+    def apply_per_instance_hint(
+        self,
+        segment_id: str,
+        instance_id: str | None,
+        new_hint: str,
+        *,
+        literal_no: bool = False,
+    ) -> dict[str, Any]:
+        """M3: record one instance's per-segment hint and push the
+        max-priority effective hint through to the block_pool.
+
+        This is the entry point that enforces paper §3 / §3.5's
+        "engine's cache policy reconciles hints from all sources":
+        the engine aggregates per-instance contributions from
+        multiple workflow instances (and any unrelated engine
+        clients that pass distinct ``instance_id`` values) into a
+        single effective hint per segment, then flips block
+        ``lifecycle_hint`` to that effective value.
+
+        Semantics
+        ---------
+        - ``new_hint == "no"`` AND ``literal_no=False`` (default):
+          remove this instance's contribution from the live set. The
+          new effective hint is computed across the remaining
+          referencers; if none remain, defaults to ``"may"``.
+        - ``new_hint == "no"`` AND ``literal_no=True``: record the
+          literal ``no`` contribution. Useful for the loop-exit
+          "force eviction" path where one instance wants the block
+          gone even though others may still reference it.
+        - ``new_hint in {"must", "may"}``: record the contribution.
+          Effective hint becomes ``max(must, may, no)`` over all
+          live contributions, by priority ``must > may > no``.
+
+        ``instance_id is None`` is treated as the synthetic ``_anon``
+        slot, matching the legacy "no instance id" last-write-wins
+        behavior.
+
+        Returns the same shape as ``update_block_hints``, plus
+        ``effective_hint`` and ``live_referencer_count`` for
+        observability.
+        """
+
+        if not isinstance(segment_id, str) or not segment_id:
+            return {
+                "updated": 0,
+                "skipped": 0,
+                "reject_reason": "segment_id_missing",
+            }
+        if new_hint not in ("must", "may", "no"):
+            return {
+                "updated": 0,
+                "skipped": 0,
+                "reject_reason": "invalid_hint",
+            }
+        with self._lock:
+            entry = self._entry_by_segment_id_locked(segment_id)
+            if entry is not None:
+                if literal_no and new_hint == "no":
+                    effective = entry.set_instance_hint_literal(
+                        instance_id, "no"
+                    )
+                else:
+                    effective = entry.record_instance_hint(
+                        instance_id, new_hint
+                    )
+                live_count = len(entry.live_hints_by_instance)
+            else:
+                # No registry entry yet (e.g. a hint update arrived for
+                # a segment that was never registered via
+                # segment_prepare). Fall back to treating the input as
+                # the effective hint directly so legacy single-source
+                # behavior is preserved.
+                effective = new_hint
+                live_count = 0
+        # Push the effective hint to the block_pool. Reuses the
+        # existing single-hint path so the 3-priority free-queue
+        # plumbing kicks in unchanged.
+        result = self.update_block_hints(segment_id, effective)
+        result["effective_hint"] = effective
+        result["live_referencer_count"] = live_count
+        return result
+
     def update_block_hints(
         self, segment_id: str, new_hint: str
     ) -> dict[str, Any]:
@@ -773,6 +969,13 @@ class SegmentRegistry:
         is still tagged with the same id (self-heals stale entries),
         and updates ``block.lifecycle_hint = new_hint``. Returns a
         small status dict for the HTTP endpoint.
+
+        NOTE (M3): this is the LOW-LEVEL block-flip primitive. Callers
+        with a per-instance hint should go through
+        ``apply_per_instance_hint`` instead so the engine performs the
+        cross-instance max-priority aggregation. This method remains
+        public for legacy callers and tests that have already computed
+        the effective hint.
 
         Stale blocks (``_segment_id`` no longer matches — e.g., evicted
         and reused) are removed from the reverse map.
@@ -1165,9 +1368,13 @@ def mark_segment_prepare_prefilled(
 
 
 def update_segment_lifecycle_hint(
-    segment_id: str | None, new_hint: str | None
+    segment_id: str | None,
+    new_hint: str | None,
+    *,
+    instance_id: str | None = None,
+    literal_no: bool = False,
 ) -> dict[str, Any]:
-    """Phase E2 step 3 — flip the lifecycle_hint on every tagged block.
+    """Phase E2 step 3 + M3 — flip the lifecycle_hint on tagged blocks.
 
     The workflow monitor calls this after a CFG event narrows the
     segment's future consumer set (e.g., loop exit → "no", or loop
@@ -1176,21 +1383,93 @@ def update_segment_lifecycle_hint(
     ``FreeKVCacheBlockQueue.popleft_n`` calls honor it via the
     3-priority traversal (no → may → must).
 
+    M3 (paper §3 / §3.5 cross-instance aggregation): when
+    ``instance_id`` is provided, the engine records this as ONE
+    instance's contribution and re-derives the effective block hint as
+    ``max(must, may, no)`` over all currently-live referencers of the
+    segment. Two instances each calling with hints ``must`` and ``may``
+    resolve to ``must``; if the must-instance later demotes to
+    ``may``, the effective stays ``may`` (combined over both); if ALL
+    instances drop their contribution (call with ``new_hint="no"`` and
+    the default ``literal_no=False``), the segment's effective hint
+    defaults to ``"may"``.
+
+    When ``instance_id`` is ``None`` (legacy callers, no
+    cross-instance context), behavior reduces to the original
+    last-write-wins via the synthetic ``_anon`` slot.
+
+    ``literal_no``: if true, ``new_hint="no"`` is recorded as a LITERAL
+    ``no`` contribution rather than removing the slot. Use for the
+    loop-exit "force eviction" case where one instance wants the block
+    evicted ASAP regardless of other live referencers.
+
     Self-healing on stale tags: if a block's ``_segment_id`` no longer
     matches (e.g., evicted and reused), it is silently skipped and
     removed from the registry's reverse map.
 
     Returns a small status dict: ``{updated: int, skipped: int,
-    reject_reason: str | None}``. ``reject_reason`` is set if the
-    segment_id is unknown or new_hint is invalid; ``updated``/``skipped``
-    are zero in those cases.
+    reject_reason: str | None, effective_hint: str,
+    live_referencer_count: int}``. ``reject_reason`` is set if the
+    segment_id is unknown or new_hint is invalid;
+    ``updated``/``skipped`` are zero in those cases.
+    ``effective_hint`` and ``live_referencer_count`` are present on
+    every accepted call and let observability tools see what the
+    engine actually decided after aggregation.
     """
 
     if not isinstance(segment_id, str) or not segment_id:
-        return {"updated": 0, "skipped": 0, "reject_reason": "segment_id_missing"}
+        return {
+            "updated": 0,
+            "skipped": 0,
+            "reject_reason": "segment_id_missing",
+        }
     if new_hint not in ("must", "may", "no"):
-        return {"updated": 0, "skipped": 0, "reject_reason": "invalid_hint"}
-    return _registry.update_block_hints(segment_id, new_hint)
+        return {
+            "updated": 0,
+            "skipped": 0,
+            "reject_reason": "invalid_hint",
+        }
+    return _registry.apply_per_instance_hint(
+        segment_id,
+        instance_id,
+        new_hint,
+        literal_no=literal_no,
+    )
+
+
+def release_segment_instance_contribution(
+    segment_id: str | None, instance_id: str | None
+) -> dict[str, Any]:
+    """M3: explicitly drop one instance's contribution from a segment's
+    live-hint set (e.g., when the instance completes / crashes /
+    is cancelled). Re-derives the effective hint and pushes it through
+    to the block_pool.
+
+    Idempotent: dropping an unknown instance_id is a no-op that just
+    returns the current effective hint."""
+
+    if not isinstance(segment_id, str) or not segment_id:
+        return {
+            "updated": 0,
+            "skipped": 0,
+            "reject_reason": "segment_id_missing",
+        }
+    with _registry._lock:  # noqa: SLF001
+        entry = _registry._entry_by_segment_id_locked(segment_id)  # noqa: SLF001
+        if entry is None:
+            return {
+                "updated": 0,
+                "skipped": 0,
+                "reject_reason": "segment_not_found",
+                "effective_hint": "may",
+                "live_referencer_count": 0,
+            }
+        effective = entry.release_instance_contribution(instance_id)
+        live_count = len(entry.live_hints_by_instance)
+    result = _registry.update_block_hints(segment_id, effective)
+    result["effective_hint"] = effective
+    result["live_referencer_count"] = live_count
+    return result
 
 
 # ----- Telemetry ----------------------------------------------------------
@@ -1423,7 +1702,29 @@ async def http_segment_lifecycle_update(raw_request: Request) -> JSONResponse:
         return _bad_payload_response("expected_object")
     segment_id = payload.get("segment_id")
     new_hint = payload.get("new_hint")
-    result = update_segment_lifecycle_hint(segment_id, new_hint)
+    # M3: extract optional instance_id so the engine can aggregate
+    # per-instance hint contributions across concurrent referencers.
+    # Backward-compat: missing/empty/non-string instance_id falls
+    # through to the synthetic ``_anon`` slot (last-write-wins).
+    raw_instance_id = payload.get("instance_id")
+    instance_id = (
+        raw_instance_id
+        if isinstance(raw_instance_id, str) and raw_instance_id
+        else None
+    )
+    # Optional ``literal_no`` flag: when true, ``new_hint="no"`` is
+    # recorded as a literal "evict ASAP" contribution rather than
+    # removing the slot from the live set. Defaults to False so
+    # the runner-side "instance completed, drop my contribution"
+    # idiom (segment_lifecycle_update with new_hint=no) works without
+    # explicitly opting in.
+    literal_no = bool(payload.get("literal_no") or False)
+    result = update_segment_lifecycle_hint(
+        segment_id,
+        new_hint,
+        instance_id=instance_id,
+        literal_no=literal_no,
+    )
     # Status policy: success or "soft no-op" → 200; structurally bad
     # request → 400.
     # - updated > 0                    → 200 (work happened)
