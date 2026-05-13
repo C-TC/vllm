@@ -470,6 +470,18 @@ class BlockPool:
                 interval = now_ns - block.last_access_ns
                 if interval > 0:
                     self.free_block_queue._feed_unstructured_sample(interval)
+            # M14: bump per-must-residency hit tally on hinted blocks
+            # so the runner-driven demote sample point can produce
+            # `1[hit at least once in must]` for p̂_h. Tallies hits on
+            # blocks whose lifecycle_hint is "must" (covers both
+            # free-pool and in-use hits — an in-use must block being
+            # touched again is itself an in-must hit). Reset to zero
+            # by `_stamp_must_promotion` on each fresh promotion.
+            if (
+                block.source_class == "structured"
+                and block.lifecycle_hint == "must"
+            ):
+                block._must_hit_count += 1
             # Bump last_access_ns BEFORE promotion (Phase D), so the
             # next interval is measured from this hit forward.
             block.last_access_ns = now_ns

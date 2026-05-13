@@ -192,6 +192,20 @@ class KVCacheBlock:
     # a slot recycled for a different cache entry starts fresh.
     _access_count: int = 0
 
+    # M14 (paper §3.6): per-block tally of cache hits that landed
+    # while the block was residing in the must pool, scoped to the
+    # block's CURRENT must-residency. Reset to 0 at every promotion
+    # into must (`_stamp_must_promotion`) so each must-residency
+    # starts fresh; bumped in `block_pool.touch()` whenever a hit
+    # arrives on a block currently in the must pool.
+    #
+    # The runner-driven hinted-demote sample point reads this field
+    # to derive the indicator `1[block hit at least once in must]`
+    # that feeds `p̂_h`. Demotes induced by the constant T_h backstop
+    # (`_sweep_ttl_must`) do NOT sample, so this field is only
+    # consulted on the runner-driven path.
+    _must_hit_count: int = 0
+
     # WIRES Phase E4: per-block segment id used by the block-pool
     # touch / eviction hooks to attribute cache events back to the
     # SegmentRegistry. ``None`` for non-WIRES blocks (the vast
@@ -222,6 +236,9 @@ class KVCacheBlock:
         """
         self._block_hash = None
         self._access_count = 0
+        # M14: clear must-residency hit tally (the previous content's
+        # in-must hits are no longer meaningful for the new content).
+        self._must_hit_count = 0
         # Phase C3: clear promotion snapshot — the next promotion
         # starts a fresh TTL window for the new content.
         self.last_promoted_ns = 0
@@ -356,9 +373,35 @@ _DEFAULT_UNSTRUCTURED_EMA_ALPHA = 0.05
 # Phase C3 buffer thickness `k`. Per docs/v2/32 §3.1.4 (Cantelli
 # correction): Pr(actual >= T̂ + k*ε) ≤ 1/(1+k²). With k=4 → ≤5.9%
 # TTL-induced miss rate.
+#
+# M14 (paper §3.6, post-2026-05-13 rewrite): `k` is normally derived
+# adaptively from `p̂_h` (engine-observed EMA of hinted-block survival)
+# via `k = sqrt(p̂_h / (1 − p̂_h))` clamped to `[_K_MIN, _K_MAX]`. The
+# WIRES_KVCACHE_UNSTRUCTURED_K env var, when set, overrides the
+# derivation entirely (legacy fixed-k mode for A/B comparison). The
+# default below is unused once adaptive k is active; it only takes
+# effect via the env override.
 _DEFAULT_UNSTRUCTURED_K = 4.0
+_K_MIN = 1.0
+_K_MAX = 10.0
+# M14: initial p̂_h before any samples are observed. 0.5 → k = 1
+# (the floor), giving conservative-but-nontrivial vanilla TTLs out
+# of the gate. After WIRES_PH_EMA_HALFLIFE samples the EMA reflects
+# observed behaviour.
+_DEFAULT_PH_INIT = 0.5
+# M14: EMA half-life in samples. After N = halflife samples of a
+# constant indicator, the EMA reaches halfway between the initial
+# value and the new constant. Translates to smoothing constant
+# alpha_ema = 1 − 0.5**(1/N).
+_DEFAULT_PH_EMA_HALFLIFE = 100
 # Phase C4 α-shrinkage floor; below this α, `must_pool_evicted`
 # fires (emergency capacity).
+#
+# M16 scope (paper §3.6, post-2026-05-13 rewrite): α-shrinkage is no
+# longer claimed as a fairness mechanism; the docs/v2/32 DL-22 reframe
+# scopes it to the vanilla-side advance-demote (engineering control
+# only). Hinted (structured-class) blocks now skip α scaling entirely
+# in `_sweep_ttl_must` so the constant T_h backstop is never shortened.
 _DEFAULT_OVERFLOW_SHRINK_FLOOR = 0.25
 
 # Phase D access-based promotion threshold (DL-OQ5 = 1).
@@ -514,6 +557,8 @@ class FreeKVCacheBlockQueue:
         bootstrap_samples: int | None = None,
         overflow_shrink_floor: float | None = None,
         total_capacity: int | None = None,
+        ph_init: float | None = None,
+        ph_ema_halflife: int | None = None,
     ) -> None:
         self.mode: str = mode if mode is not None else _resolve_victim_policy_from_env()
         if self.mode not in SUPPORTED_VICTIM_POLICIES:
@@ -536,14 +581,36 @@ class FreeKVCacheBlockQueue:
             if access_promotion_threshold is not None
             else _resolve_access_promotion_threshold_from_env()
         )
-        # Phase C3: EMA estimator for unstructured prefix-reuse interval.
-        self._unstructured_k: float = (
-            unstructured_k
-            if unstructured_k is not None
-            else _resolve_float_from_env(
+        # Phase C3 / M14: buffer thickness `k`.
+        #
+        # Resolution order (first match wins):
+        #   1. Explicit constructor kwarg `unstructured_k` — overrides
+        #      everything (used by tests / callers that want a fixed k).
+        #   2. WIRES_KVCACHE_UNSTRUCTURED_K env var — legacy fixed-k
+        #      override, kept for A/B comparison against adaptive k.
+        #   3. Adaptive: derived per-call from `p̂_h` via
+        #      `k = sqrt(p̂_h / (1 − p̂_h))` clamped to [_K_MIN, _K_MAX].
+        #
+        # `_unstructured_k_override` is the resolved fixed value when
+        # cases 1 or 2 apply; `None` means adaptive. `_unstructured_k`
+        # (legacy attribute name kept for back-compat with tests that
+        # read it directly) mirrors the *currently effective* `k`,
+        # refreshed each time `_feed_p_h_sample` runs.
+        env_k_raw = os.environ.get("WIRES_KVCACHE_UNSTRUCTURED_K")
+        if unstructured_k is not None:
+            self._unstructured_k_override: float | None = float(unstructured_k)
+        elif env_k_raw is not None:
+            self._unstructured_k_override = _resolve_float_from_env(
                 "WIRES_KVCACHE_UNSTRUCTURED_K", _DEFAULT_UNSTRUCTURED_K
             )
-        )
+        else:
+            self._unstructured_k_override = None
+        # Mirror of the currently effective k (telemetry).
+        if self._unstructured_k_override is not None:
+            self._unstructured_k: float = self._unstructured_k_override
+        else:
+            # Initial value; refreshed below once p̂_h init lands.
+            self._unstructured_k = _K_MIN
         self._ema_alpha: float = (
             ema_alpha
             if ema_alpha is not None
@@ -569,6 +636,43 @@ class FreeKVCacheBlockQueue:
         self._T_hat_u_ns: float = 0.0
         self._var_u_ns2: float = 0.0
         self._n_samples_unstructured: int = 0
+
+        # M14: p̂_h EMA — engine-observed survival rate of hinted
+        # blocks under runner control. Sampled exactly once per
+        # runner-driven hinted-must demote (`update_block_hint` with
+        # new_hint != "must" on a structured-class must block); the
+        # T_h backstop sweep does NOT sample (its demotes signal
+        # monitor failure, not survival).
+        ph_init_resolved: float = (
+            ph_init
+            if ph_init is not None
+            else _resolve_float_from_env("WIRES_PH_INIT", _DEFAULT_PH_INIT)
+        )
+        if not 0.0 < ph_init_resolved < 1.0:
+            raise ValueError(
+                f"ph_init must be in (0, 1), got {ph_init_resolved}"
+            )
+        halflife_resolved: int = (
+            ph_ema_halflife
+            if ph_ema_halflife is not None
+            else _resolve_int_from_env(
+                "WIRES_PH_EMA_HALFLIFE", _DEFAULT_PH_EMA_HALFLIFE
+            )
+        )
+        if halflife_resolved < 1:
+            raise ValueError(
+                f"ph_ema_halflife must be >= 1, got {halflife_resolved}"
+            )
+        self._p_h_init: float = ph_init_resolved
+        self._p_h_hat: float = ph_init_resolved
+        self._p_h_ema_halflife: int = halflife_resolved
+        # alpha = 1 − 0.5**(1/halflife): after `halflife` samples of
+        # a constant indicator, EMA is halfway from init to that value.
+        self._p_h_ema_alpha: float = 1.0 - (0.5 ** (1.0 / halflife_resolved))
+        self._n_samples_p_h: int = 0
+        # Refresh adaptive `k` to reflect the current p̂_h at init.
+        if self._unstructured_k_override is None:
+            self._unstructured_k = self._derive_k_from_ph(self._p_h_hat)
 
         # Phase C4: α-shrinkage capacity boundary.
         self._overflow_shrink_floor: float = (
@@ -618,6 +722,11 @@ class FreeKVCacheBlockQueue:
         # WIRES Phase C3 telemetry: cumulative EMA samples fed; running
         # estimator state read-only via T_hat_u_ns / sigma_u_ns props.
         self.unstructured_ema_sample_count: int = 0
+        # M14 telemetry: cumulative count of hinted-demote samples fed
+        # into p̂_h. Together with `p_h_hat` and `unstructured_k_current`
+        # gives the runner / metrics scrape full visibility into the
+        # adaptive-k loop.
+        self.p_h_ema_sample_count: int = 0
 
     @property
     def T_hat_u_ns(self) -> float:
@@ -632,8 +741,71 @@ class FreeKVCacheBlockQueue:
 
     @property
     def alpha_shrinkage(self) -> float:
-        """Current α-shrinkage value (1.0 = no shrinkage; α_floor = clamp)."""
+        """Current α-shrinkage value (1.0 = no shrinkage; α_floor = clamp).
+
+        M16: α now applies to vanilla (unstructured-class) blocks only;
+        hinted (structured-class) blocks skip α scaling in
+        `_sweep_ttl_must` so their constant T_h backstop is never
+        shortened. The value reported here is the raw recompute output;
+        consumers can still observe pressure independent of class.
+        """
         return self._alpha_shrinkage
+
+    # --- M14: p̂_h EMA + adaptive k ---------------------------------------
+    @property
+    def p_h_hat(self) -> float:
+        """Current EMA estimate of hinted-block survival rate (paper §3.6).
+
+        Sampled exactly once per runner-driven hinted-must demote
+        (`update_block_hint(may|no)` on a structured-class must block).
+        """
+        return self._p_h_hat
+
+    @property
+    def unstructured_k_current(self) -> float:
+        """Current effective `k` for vanilla TTL `T_v(b) = T̂_v + k·ε_v`.
+
+        Returns the env / kwarg override when set; otherwise the
+        adaptive `k = sqrt(p̂_h / (1 − p̂_h))` clamped to
+        [_K_MIN, _K_MAX] using the latest p̂_h.
+        """
+        if self._unstructured_k_override is not None:
+            return self._unstructured_k_override
+        return self._derive_k_from_ph(self._p_h_hat)
+
+    @staticmethod
+    def _derive_k_from_ph(p_h: float) -> float:
+        """M14: `k = sqrt(p̂_h / (1 − p̂_h))` clamped to [_K_MIN, _K_MAX].
+
+        Pure function so tests can assert behaviour independent of any
+        queue state. Defensive clamp keeps `p_h` strictly inside (0, 1)
+        so the division never blows up under floating-point noise.
+        """
+        eps = 1e-9
+        p = min(max(p_h, eps), 1.0 - eps)
+        k_raw = (p / (1.0 - p)) ** 0.5
+        return min(_K_MAX, max(_K_MIN, k_raw))
+
+    def _feed_p_h_sample(self, indicator: int) -> None:
+        """M14: feed an indicator (0 or 1) into the p̂_h EMA and refresh
+        the adaptive `k`.
+
+        Called from `update_block_hint` exactly once per runner-driven
+        hinted-must demote. T_h backstop demotes (driven by
+        `_sweep_ttl_must`) do NOT call this — those are excluded from
+        the survival statistic per paper §3.6.
+        """
+        if indicator not in (0, 1):
+            raise ValueError(
+                f"_feed_p_h_sample expects an indicator in (0, 1), got {indicator}"
+            )
+        a = self._p_h_ema_alpha
+        self._p_h_hat = (1.0 - a) * self._p_h_hat + a * float(indicator)
+        self._n_samples_p_h += 1
+        self.p_h_ema_sample_count += 1
+        # Refresh cached `k` only when adaptive (no env / kwarg override).
+        if self._unstructured_k_override is None:
+            self._unstructured_k = self._derive_k_from_ph(self._p_h_hat)
 
     def _feed_unstructured_sample(self, interval_ns: int) -> None:
         """Phase C3: update EMA with a new prefix-reuse interval sample.
@@ -658,11 +830,19 @@ class FreeKVCacheBlockQueue:
         self.unstructured_ema_sample_count += 1
 
     def _unstructured_ttl_at_promotion_ns(self) -> int:
-        """Phase C3: snapshot value for ttl_at_promotion_ns at unstructured
-        may->must promotion time. Bootstrap default until enough samples."""
+        """Phase C3 + M14: snapshot value for ttl_at_promotion_ns at
+        unstructured may->must promotion time.
+
+        Returns the bootstrap constant until the EMA estimator has
+        ``_bootstrap_samples`` interval samples; once converged,
+        snapshots ``T̂_v + k · ε_v`` using the CURRENT effective k
+        (env/kwarg override or adaptive derivation from p̂_h).
+        """
         if self._n_samples_unstructured < self._bootstrap_samples:
             return self._unstructured_bootstrap_ttl_ns
-        return int(self._T_hat_u_ns + self._unstructured_k * self.sigma_u_ns)
+        return int(
+            self._T_hat_u_ns + self.unstructured_k_current * self.sigma_u_ns
+        )
 
     def _recompute_alpha(self) -> float:
         """Phase C4: capacity-boundary shrinkage.
@@ -730,12 +910,20 @@ class FreeKVCacheBlockQueue:
     def _sweep_ttl_must(self) -> int:
         """Lazy TTL sweep on the must pool head (docs/v2/32 §2.4 + DL-10).
 
-        Walks the must pool from the head; any block whose
-        ``last_promoted_ns + structured_ttl_ns < now`` is demoted to
-        the may pool's HEAD (LRU end — they evict before may's
-        existing entries on the next popleft_n). Stops at the first
-        non-expired block; since pool ordering reflects promotion
-        time, all subsequent blocks are fresher.
+        Walks the must pool from the head; any block whose effective
+        deadline has elapsed is demoted to the may pool's HEAD (LRU
+        end — they evict before may's existing entries on the next
+        popleft_n). Stops at the first non-expired block; since pool
+        ordering reflects promotion time, all subsequent blocks are
+        fresher.
+
+        Per M16 (paper §3.6, post-2026-05-13): α-shrinkage is now
+        applied to vanilla (unstructured-class) blocks only — the
+        constant T_h backstop on hinted (structured-class) blocks is
+        never shortened by α. The earlier uniform application was
+        operationally inert on the hinted side (monitor-driven demote
+        always fired first) but the paper no longer claims α as a
+        fairness mechanism, so this scoping makes code match docs.
 
         No-op when:
         - mode is pure_lru (must pool is always empty there)
@@ -747,15 +935,17 @@ class FreeKVCacheBlockQueue:
         if self.mode == VICTIM_POLICY_PURE_LRU:
             return 0
         # Phase C3 + C4 (docs/v2/32 §2.4): per-block deadline using
-        # ttl_at_promotion_ns snapshot scaled by α-shrinkage. Recompute
-        # α first (Q4 answer = every popleft_n).
+        # ttl_at_promotion_ns snapshot scaled by α-shrinkage (vanilla
+        # side only, see M16). Recompute α first (Q4 answer = every
+        # popleft_n).
         alpha = self._recompute_alpha()
         must = self._pools["must"]
         if must.size == 0:
             return 0
         now_ns = time.monotonic_ns()
         # Walk from head; demote blocks where
-        # `now > promoted_at_ns + alpha * ttl_at_promotion_ns`.
+        # `now > promoted_at_ns + scale * ttl_at_promotion_ns`,
+        # where `scale = α` for vanilla and `scale = 1.0` for hinted.
         # Mixed source classes at head: the strict "stop at first
         # non-expired" trick doesn't strictly hold (structured may
         # have longer TTL than the unstructured behind it), but
@@ -773,7 +963,10 @@ class FreeKVCacheBlockQueue:
                 # the new path); skip rather than demote. Could
                 # happen during transition / for legacy blocks.
                 break
-            deadline_ns = head.last_promoted_ns + int(alpha * ttl)
+            # M16: α scoped to vanilla blocks only. Hinted blocks
+            # use the raw constant T_h backstop with no shrinkage.
+            scale = alpha if head.source_class == "unstructured" else 1.0
+            deadline_ns = head.last_promoted_ns + int(scale * ttl)
             if deadline_ns > now_ns:
                 break
             blk = must.popleft_one()
@@ -839,9 +1032,14 @@ class FreeKVCacheBlockQueue:
         self, block: KVCacheBlock, now_ns: int, source_class: str
     ) -> None:
         """Phase C3: stamp promoted_at + ttl_at_promotion + source_class
-        on a block as it enters the must pool."""
+        on a block as it enters the must pool.
+
+        M14: also resets ``_must_hit_count`` so the indicator that
+        feeds p̂_h reflects only hits during this must-residency.
+        """
         block.last_promoted_ns = now_ns
         block.source_class = source_class
+        block._must_hit_count = 0
         if source_class == "structured":
             block.ttl_at_promotion_ns = self._structured_ttl_ns
         else:
@@ -929,6 +1127,21 @@ class FreeKVCacheBlockQueue:
             # Hint is metadata only; never move pools.
             block.lifecycle_hint = new_hint
             return
+
+        # M14: sample p̂_h on runner-driven hinted-must demotes.
+        # The signal is "≥1 in-must hit during this segment's lifetime".
+        # Fires when a must-pool block (lifecycle_hint == "must") with
+        # source_class == "structured" (hinted, runner-managed) is
+        # demoted to may|no via this method. T_h backstop demotes go
+        # through `_sweep_ttl_must` which never calls update_block_hint,
+        # so they are naturally excluded per paper §3.6.
+        if (
+            block.lifecycle_hint == "must"
+            and new_hint != "must"
+            and block.source_class == "structured"
+        ):
+            indicator = 1 if block._must_hit_count > 0 else 0
+            self._feed_p_h_sample(indicator)
 
         current_pool = self._pool_of.get(block.block_id)
         if current_pool is not None:

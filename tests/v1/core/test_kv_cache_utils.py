@@ -1118,8 +1118,15 @@ def test_phase_c4_alpha_clamped_at_floor():
 
 
 def test_phase_c4_sweep_uses_alpha_to_scale_deadline():
-    """A block whose unscaled TTL would NOT have expired but α-scaled
-    TTL HAS expired must be demoted.
+    """A vanilla block whose unscaled TTL would NOT have expired but
+    α-scaled TTL HAS expired must be demoted.
+
+    M16: α applies only to vanilla (unstructured-class) blocks; hinted
+    (structured-class) blocks use the raw constant T_h backstop. This
+    test exercises the vanilla branch by promoting blocks with
+    ``source_class="unstructured"`` and forcing the bootstrap TTL via
+    ``bootstrap_samples=1`` + ``ema_alpha=1.0`` so the snapshot is
+    deterministic.
 
     To force α<1 we need must_pool_size > B - may_size - in_use, i.e.
     must_size > total_capacity - 0 (no may, no real in_use in this
@@ -1128,12 +1135,16 @@ def test_phase_c4_sweep_uses_alpha_to_scale_deadline():
     queue = FreeKVCacheBlockQueue(
         blocks,
         mode=VICTIM_POLICY_WIRES_THREE_POOL,
-        structured_ttl_ns=10_000_000_000,  # 10s
+        structured_ttl_ns=10_000_000_000,  # 10s; ignored on vanilla path
+        unstructured_bootstrap_ttl_ns=10_000_000_000,  # 10s vanilla TTL
+        bootstrap_samples=1,
+        ema_alpha=1.0,
+        unstructured_k=0.0,  # snapshot = T̂_v + 0 = bootstrap value
         total_capacity=2,  # 5 in must vs B=2 → forces α=0.4
         overflow_shrink_floor=0.0001,
     )
     for blk in blocks:
-        queue.update_block_hint(blk, "must", source_class="structured")
+        queue.update_block_hint(blk, "must", source_class="unstructured")
     # α = 2 / 5 = 0.4 → scaled deadline = promoted_at + 0.4 * 10s = +4s.
     # Backdate 5s to push past scaled deadline.
     for blk in blocks:
@@ -1142,6 +1153,40 @@ def test_phase_c4_sweep_uses_alpha_to_scale_deadline():
     assert demoted == 5
     # α should reflect the pressure.
     assert 0.3 < queue.alpha_shrinkage < 0.5
+
+
+def test_m16_sweep_skips_alpha_on_hinted_blocks():
+    """M16: hinted (structured-class) must blocks ignore α — their
+    constant T_h backstop is never shortened by capacity pressure.
+
+    Same pressure setup as test_phase_c4_sweep_uses_alpha_to_scale_deadline
+    but with structured-class promotion: α = 0.4 would shorten T_h
+    from 10s to 4s, but the M16 fix ignores α for structured blocks
+    and uses the raw 10s. Backdating 5s should NOT demote them."""
+    blocks = [KVCacheBlock(block_id=i) for i in range(5)]
+    queue = FreeKVCacheBlockQueue(
+        blocks,
+        mode=VICTIM_POLICY_WIRES_THREE_POOL,
+        structured_ttl_ns=10_000_000_000,  # 10s
+        total_capacity=2,  # forces α ~ 0.4
+        overflow_shrink_floor=0.0001,
+    )
+    for blk in blocks:
+        queue.update_block_hint(blk, "must", source_class="structured")
+    # Backdate 5s — under M16 hinted blocks survive (deadline = +10s
+    # not +4s). Under the old uniform-α code these would be demoted.
+    for blk in blocks:
+        blk.last_promoted_ns -= 5_000_000_000
+    demoted = queue._sweep_ttl_must()
+    assert demoted == 0
+    # α itself is still computed (telemetry), it just isn't applied.
+    assert 0.3 < queue.alpha_shrinkage < 0.5
+    # Backdating an additional 6s pushes past the raw 10s deadline →
+    # all five demote even without α.
+    for blk in blocks:
+        blk.last_promoted_ns -= 6_000_000_000
+    demoted = queue._sweep_ttl_must()
+    assert demoted == 5
 
 
 def test_phase_c4_alpha_pure_lru_mode_always_one():
@@ -1160,10 +1205,208 @@ def test_phase_c3_env_knobs(monkeypatch):
     monkeypatch.setenv("WIRES_KVCACHE_UNSTRUCTURED_BOOTSTRAP_SAMPLES", "100")
     monkeypatch.setenv("WIRES_KVCACHE_OVERFLOW_SHRINK_FLOOR", "0.5")
     queue = FreeKVCacheBlockQueue([])
+    # Env override pins both the legacy mirror attribute and the
+    # adaptive-k current value to the env value (see M14).
     assert queue._unstructured_k == 2.5
+    assert queue._unstructured_k_override == 2.5
+    assert queue.unstructured_k_current == 2.5
     assert queue._ema_alpha == 0.1
     assert queue._bootstrap_samples == 100
     assert queue._overflow_shrink_floor == 0.5
+
+
+# -- M14: p_h EMA + adaptive k -----------------------------------------------
+
+
+def test_m14_p_h_starts_at_default_init():
+    """No samples yet -> p_h sits at default init (0.5) and adaptive
+    k clamps to the floor (1.0)."""
+    queue = FreeKVCacheBlockQueue([], mode=VICTIM_POLICY_WIRES_THREE_POOL)
+    assert queue.p_h_hat == 0.5
+    assert queue.unstructured_k_current == 1.0
+    assert queue.p_h_ema_sample_count == 0
+
+
+def test_m14_p_h_ema_halflife_property():
+    """After `halflife` samples of indicator=1 from p_h_init=0.5,
+    EMA reaches halfway (~0.75). Asymptote: feeding a Bernoulli mix
+    with mean 0.8 over many halflives drives p_h to ~0.8."""
+    queue = FreeKVCacheBlockQueue(
+        [],
+        mode=VICTIM_POLICY_WIRES_THREE_POOL,
+        ph_init=0.5,
+        ph_ema_halflife=100,
+    )
+    for _ in range(100):
+        queue._feed_p_h_sample(1)
+    assert 0.74 < queue.p_h_hat < 0.76
+    assert queue.p_h_ema_sample_count == 100
+
+    queue2 = FreeKVCacheBlockQueue(
+        [],
+        mode=VICTIM_POLICY_WIRES_THREE_POOL,
+        ph_init=0.5,
+        ph_ema_halflife=100,
+    )
+    pattern = [1, 1, 1, 1, 0]  # 80% ones
+    for i in range(2000):
+        queue2._feed_p_h_sample(pattern[i % 5])
+    assert 0.75 < queue2.p_h_hat < 0.85
+
+
+def test_m14_k_derivation_reference_points():
+    """`_derive_k_from_ph` matches the closed-form values from paper §3.6."""
+    derive = FreeKVCacheBlockQueue._derive_k_from_ph
+    assert derive(0.5) == pytest.approx(1.0)
+    assert derive(0.8) == pytest.approx(2.0, rel=1e-6)
+    assert 3.9 < derive(0.94) < 4.1
+    assert 9.9 < derive(0.99) <= 10.0
+    # p = 0.997 -> sqrt(332) ~ 18.2 -> clamped to 10.
+    assert derive(0.997) == 10.0
+    # p = 0.1 -> sqrt(0.111) ~ 0.33 -> clamped to floor 1.0.
+    assert derive(0.1) == 1.0
+
+
+def test_m14_k_clamp_boundaries():
+    """k clamps at [1, 10] independently of p_h pathology."""
+    derive = FreeKVCacheBlockQueue._derive_k_from_ph
+    assert derive(0.001) == 1.0
+    assert derive(1e-9) == 1.0
+    assert derive(1.0 - 1e-9) == 10.0
+    assert derive(0.999999) == 10.0
+
+
+def test_m14_env_override_pins_k(monkeypatch):
+    """`WIRES_KVCACHE_UNSTRUCTURED_K=7.0` pins k=7 regardless of EMA
+    state, before and after samples arrive."""
+    monkeypatch.setenv("WIRES_KVCACHE_UNSTRUCTURED_K", "7.0")
+    queue = FreeKVCacheBlockQueue([], mode=VICTIM_POLICY_WIRES_THREE_POOL)
+    assert queue.unstructured_k_current == 7.0
+    for _ in range(500):
+        queue._feed_p_h_sample(1)
+    assert queue.unstructured_k_current == 7.0
+    for _ in range(500):
+        queue._feed_p_h_sample(0)
+    assert queue.unstructured_k_current == 7.0
+    assert queue._unstructured_k == 7.0
+
+
+def test_m14_kwarg_override_pins_k():
+    """Constructor kwarg `unstructured_k=` overrides env + adaptive."""
+    queue = FreeKVCacheBlockQueue(
+        [], mode=VICTIM_POLICY_WIRES_THREE_POOL, unstructured_k=3.5
+    )
+    assert queue.unstructured_k_current == 3.5
+    for _ in range(200):
+        queue._feed_p_h_sample(1)
+    assert queue.unstructured_k_current == 3.5
+
+
+def test_m14_adaptive_k_tracks_p_h():
+    """Without an override, k tracks p_h: feed lots of ones -> p_h rises
+    -> k climbs above the floor of 1."""
+    queue = FreeKVCacheBlockQueue(
+        [], mode=VICTIM_POLICY_WIRES_THREE_POOL, ph_ema_halflife=10
+    )
+    assert queue.unstructured_k_current == 1.0
+    for _ in range(100):
+        queue._feed_p_h_sample(1)
+    assert queue.p_h_hat > 0.99
+    assert queue.unstructured_k_current > 9.0
+
+
+def test_m14_runner_driven_hinted_demote_samples_p_h():
+    """`update_block_hint(may|no, structured)` on a must-pool block
+    feeds p_h with `1[_must_hit_count > 0]`."""
+    blocks = [KVCacheBlock(block_id=i) for i in range(2)]
+    queue = FreeKVCacheBlockQueue(
+        blocks,
+        mode=VICTIM_POLICY_WIRES_THREE_POOL,
+        ph_ema_halflife=1,
+        ph_init=0.5,
+    )
+    queue.update_block_hint(blocks[0], "must", source_class="structured")
+    queue.update_block_hint(blocks[1], "must", source_class="structured")
+    blocks[0]._must_hit_count = 1
+    queue.update_block_hint(blocks[0], "may", source_class="structured")
+    queue.update_block_hint(blocks[1], "no", source_class="structured")
+    assert queue.p_h_ema_sample_count == 2
+    # halflife=1 -> alpha = 1 - 0.5 = 0.5. From 0.5 with samples [1, 0]:
+    # p1 = 0.5*0.5 + 0.5*1 = 0.75 ; p2 = 0.5*0.75 + 0.5*0 = 0.375.
+    assert queue.p_h_hat == pytest.approx(0.375, rel=1e-9)
+
+
+def test_m14_t_h_backstop_demote_does_not_sample():
+    """`_sweep_ttl_must` does NOT feed p_h - only runner-driven
+    demotes count, per paper §3.6."""
+    blocks = [KVCacheBlock(block_id=i) for i in range(3)]
+    queue = FreeKVCacheBlockQueue(
+        blocks,
+        mode=VICTIM_POLICY_WIRES_THREE_POOL,
+        structured_ttl_ns=1_000_000_000,
+        ph_ema_halflife=10,
+    )
+    for blk in blocks:
+        queue.update_block_hint(blk, "must", source_class="structured")
+    initial_n = queue.p_h_ema_sample_count
+    for blk in blocks:
+        blk.last_promoted_ns -= 5_000_000_000
+    demoted = queue._sweep_ttl_must()
+    assert demoted == 3
+    assert queue.p_h_ema_sample_count == initial_n
+
+
+def test_m14_unstructured_demote_does_not_sample_p_h():
+    """A vanilla (unstructured-class) demote must not feed p_h."""
+    blocks = [KVCacheBlock(block_id=i) for i in range(2)]
+    queue = FreeKVCacheBlockQueue(
+        blocks, mode=VICTIM_POLICY_WIRES_THREE_POOL
+    )
+    queue.update_block_hint(blocks[0], "must", source_class="unstructured")
+    initial_n = queue.p_h_ema_sample_count
+    queue.update_block_hint(blocks[0], "may", source_class="unstructured")
+    assert queue.p_h_ema_sample_count == initial_n
+
+
+def test_m14_ph_env_knobs(monkeypatch):
+    """`WIRES_PH_INIT` and `WIRES_PH_EMA_HALFLIFE` resolve as expected."""
+    monkeypatch.setenv("WIRES_PH_INIT", "0.94")
+    monkeypatch.setenv("WIRES_PH_EMA_HALFLIFE", "50")
+    queue = FreeKVCacheBlockQueue([], mode=VICTIM_POLICY_WIRES_THREE_POOL)
+    assert queue._p_h_init == 0.94
+    assert queue.p_h_hat == 0.94
+    assert queue._p_h_ema_halflife == 50
+    assert 3.9 < queue.unstructured_k_current < 4.1
+
+
+def test_m14_ph_init_validation():
+    """ph_init must be strictly in (0, 1)."""
+    with pytest.raises(ValueError):
+        FreeKVCacheBlockQueue([], ph_init=0.0)
+    with pytest.raises(ValueError):
+        FreeKVCacheBlockQueue([], ph_init=1.0)
+    with pytest.raises(ValueError):
+        FreeKVCacheBlockQueue([], ph_init=-0.1)
+
+
+def test_m14_halflife_validation():
+    """ph_ema_halflife must be >= 1."""
+    with pytest.raises(ValueError):
+        FreeKVCacheBlockQueue([], ph_ema_halflife=0)
+
+
+def test_m14_must_hit_count_resets_on_promotion():
+    """`_stamp_must_promotion` resets `_must_hit_count` so each fresh
+    must-residency starts the indicator at 0."""
+    block = KVCacheBlock(block_id=0)
+    queue = FreeKVCacheBlockQueue(
+        [block], mode=VICTIM_POLICY_WIRES_THREE_POOL
+    )
+    queue.update_block_hint(block, "must", source_class="structured")
+    block._must_hit_count = 7
+    queue.update_block_hint(block, "may", source_class="structured")
+    queue.update_block_hint(block, "must", source_class="structured")
+    assert block._must_hit_count == 0
 
 
 def test_generate_block_hash_extra_keys():
