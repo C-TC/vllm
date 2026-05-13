@@ -489,11 +489,32 @@ class KVCacheManager:
         # to the freshly-allocated blocks so subsequent eviction (via
         # FreeKVCacheBlockQueue.popleft_n's 3-priority traversal) honors
         # it. Default "may" reproduces legacy LRU behavior. See docs/v2/31 §E2.
+        #
+        # M13 (paper/CODE_MISMATCH_NOTES.md): per-segment hints from
+        # ``segment_lifecycle_hints`` override the request-level fallback
+        # for blocks whose ``_segment_id`` matches a known scope_key.
+        # The legacy single ``lifecycle_hint`` field still applies to any
+        # newly-allocated block NOT covered by a per-segment entry. This
+        # lets the runner ship per-segment intent for not-yet-prepared
+        # segments via the chat completion while baseline lanes (which
+        # only set the legacy field) keep working unchanged.
         request_hint = getattr(request, "lifecycle_hint", "may")
+        seg_hints = getattr(request, "segment_lifecycle_hints", None)
         if request_hint != "may":
             for group_blocks in new_blocks:
                 for blk in group_blocks:
                     blk.lifecycle_hint = request_hint
+        if isinstance(seg_hints, dict) and seg_hints:
+            # Per-segment override: for each newly-allocated block whose
+            # ``_segment_id`` matches a scope_key, switch to the per-
+            # segment hint. Blocks without a tagged segment fall back to
+            # whatever the request-level pass set above (legacy hint or
+            # the default "may").
+            for group_blocks in new_blocks:
+                for blk in group_blocks:
+                    blk_seg_id = getattr(blk, "_segment_id", None)
+                    if isinstance(blk_seg_id, str) and blk_seg_id in seg_hints:
+                        blk.lifecycle_hint = seg_hints[blk_seg_id]
 
         # WIRES Phase E5: when the request carries a workflow_segment_id
         # (set by submit_workflow_segment_prewarm via SamplingParams.extra_args

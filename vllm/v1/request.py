@@ -99,7 +99,28 @@ class Request:
         # SamplingParams.extra_args["lifecycle_hint"] (which the
         # OpenAI router populates from the request's vllm_xargs field).
         # See docs/v2/31 §E2.
+        #
+        # M13 (paper/CODE_MISMATCH_NOTES.md): the legacy single hint is
+        # the FALLBACK for any block this request touches that is NOT
+        # covered by ``segment_lifecycle_hints`` below. It also remains
+        # the only signal the engine sees from baseline lanes
+        # (naive_workflow_aware, etc.) that have not adopted per-segment
+        # hints.
         self.lifecycle_hint: str = "may"
+        # M13: per-segment lifecycle hints carried on the chat
+        # completion. List of ``{"scope_key": str, "lifecycle_hint":
+        # "must"|"may"|"no"}`` entries. The runner MUST omit segments it
+        # has already pre-registered via ``segment_prepare`` (those
+        # already carry the hint set at preparation time); this list
+        # therefore covers "not-yet-prepared" segments only. Engine
+        # treats absence of a scope_key as "no contribution from this
+        # request" and falls back to ``lifecycle_hint`` above when
+        # tagging fresh blocks.
+        #
+        # Stored as ``dict[scope_key, hint]`` for O(1) lookup in the
+        # KVCacheManager. ``None`` for ordinary requests that did not
+        # populate the field.
+        self.segment_lifecycle_hints: dict[str, str] | None = None
         # WIRES Phase E5 (V1-native segment prewarm): per-request
         # workflow segment id. Set from
         # SamplingParams.extra_args["workflow_segment_id"] when the
@@ -134,6 +155,28 @@ class Request:
                 )
                 if isinstance(segment_id_raw, str) and segment_id_raw:
                     self.segment_id = segment_id_raw
+                # M13: parse per-segment hints (chat completion may carry
+                # entries for not-yet-prepared segments). Tolerate
+                # malformed entries silently — hint plumbing is advisory
+                # and must NEVER abort request submission.
+                seg_hints_raw = sampling_params.extra_args.get(
+                    "segment_lifecycle_hints"
+                )
+                if isinstance(seg_hints_raw, list) and seg_hints_raw:
+                    parsed: dict[str, str] = {}
+                    for entry in seg_hints_raw:
+                        if not isinstance(entry, dict):
+                            continue
+                        scope_key = entry.get("scope_key")
+                        hint = entry.get("lifecycle_hint")
+                        if (
+                            isinstance(scope_key, str)
+                            and scope_key
+                            and hint in ("must", "may", "no")
+                        ):
+                            parsed[scope_key] = hint
+                    if parsed:
+                        self.segment_lifecycle_hints = parsed
         else:
             raise ValueError("sampling_params and pooling_params can't both be unset")
 
