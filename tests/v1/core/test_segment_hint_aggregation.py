@@ -9,8 +9,16 @@ different runners, unrelated engine clients). Pre-M3 the engine flipped
 ``KVCacheBlock.lifecycle_hint`` last-write-wins on every
 ``segment_lifecycle_update`` call, regardless of who else still
 referenced the segment. M3 routes hint updates through a per-segment
-``live_hints_by_instance`` multiset and re-derives the effective hint
+``live_hints_by_caller`` multiset and re-derives the effective hint
 as ``max(must, may, no)`` over all live referencers.
+
+Caller identity is the ``(runner_id, instance_id)`` tuple, NOT the
+``instance_id`` alone: independent runners (different teams /
+processes / orgs) do not coordinate the ``instance_id`` namespace,
+so a collision on ``instance_id`` alone would silently merge
+their entries — and a "no" from one would yank the other's
+contribution. Keying on the tuple isolates each runner's
+namespace.
 
 These tests lock the contract:
 
@@ -29,6 +37,13 @@ These tests lock the contract:
 7. Concurrent updates are serialized through the registry lock —
    final state is always one of the per-thread orderings, never a
    torn read.
+8. Two runners with identical ``instance_id`` are tracked as
+   independent entries; runner A releasing its contribution does
+   NOT drop runner B's.
+9. The HTTP route's default ``runner_id`` fallback ("default") keeps
+   the pre-M3 single-tenant wire schema working unchanged.
+10. Telemetry exposes both ``runner_id`` and ``instance_id`` per
+    live entry as JSON-friendly records.
 """
 
 from __future__ import annotations
@@ -132,16 +147,28 @@ def test_compute_effective_hint_max_priority():
     """Priority order: must > may > no."""
 
     entry = _new_entry()
-    entry.live_hints_by_instance = {"i1": "may", "i2": "no"}
+    entry.live_hints_by_caller = {
+        ("default", "i1"): "may",
+        ("default", "i2"): "no",
+    }
     assert entry.compute_effective_hint() == "may"
 
-    entry.live_hints_by_instance = {"i1": "must", "i2": "may"}
+    entry.live_hints_by_caller = {
+        ("default", "i1"): "must",
+        ("default", "i2"): "may",
+    }
     assert entry.compute_effective_hint() == "must"
 
-    entry.live_hints_by_instance = {"i1": "no", "i2": "no"}
+    entry.live_hints_by_caller = {
+        ("default", "i1"): "no",
+        ("default", "i2"): "no",
+    }
     assert entry.compute_effective_hint() == "no"
 
-    entry.live_hints_by_instance = {"i1": "must", "i2": "must"}
+    entry.live_hints_by_caller = {
+        ("default", "i1"): "must",
+        ("default", "i2"): "must",
+    }
     assert entry.compute_effective_hint() == "must"
 
 
@@ -150,19 +177,19 @@ def test_record_instance_hint_no_removes_slot_by_default():
     the slot rather than contributing a literal ``no``."""
 
     entry = _new_entry()
-    entry.record_instance_hint("i1", "must")
-    entry.record_instance_hint("i2", "may")
+    entry.record_instance_hint("default", "i1", "must")
+    entry.record_instance_hint("default", "i2", "may")
     assert entry.compute_effective_hint() == "must"
 
     # i1 demotes by signaling "no" — its slot is dropped.
-    entry.record_instance_hint("i1", "no")
-    assert "i1" not in entry.live_hints_by_instance
+    entry.record_instance_hint("default", "i1", "no")
+    assert ("default", "i1") not in entry.live_hints_by_caller
     # Only i2=may remains.
     assert entry.compute_effective_hint() == "may"
 
     # i2 also demotes — live set empty, default may.
-    entry.record_instance_hint("i2", "no")
-    assert entry.live_hints_by_instance == {}
+    entry.record_instance_hint("default", "i2", "no")
+    assert entry.live_hints_by_caller == {}
     assert entry.compute_effective_hint() == "may"
 
 
@@ -171,39 +198,109 @@ def test_set_instance_hint_literal_records_no_as_contribution():
     path: a literal ``no`` STAYS in the live set."""
 
     entry = _new_entry()
-    entry.set_instance_hint_literal("i1", "no")
-    entry.set_instance_hint_literal("i2", "may")
+    entry.set_instance_hint_literal("default", "i1", "no")
+    entry.set_instance_hint_literal("default", "i2", "may")
     # max(no, may) = may
     assert entry.compute_effective_hint() == "may"
 
-    entry.set_instance_hint_literal("i2", "no")
+    entry.set_instance_hint_literal("default", "i2", "no")
     # All literal no => effective no (no-one wants the block alive).
-    assert entry.live_hints_by_instance == {"i1": "no", "i2": "no"}
+    assert entry.live_hints_by_caller == {
+        ("default", "i1"): "no",
+        ("default", "i2"): "no",
+    }
     assert entry.compute_effective_hint() == "no"
 
 
 def test_release_instance_contribution_idempotent():
     entry = _new_entry()
-    entry.record_instance_hint("i1", "must")
-    entry.release_instance_contribution("i1")
-    assert entry.live_hints_by_instance == {}
+    entry.record_instance_hint("default", "i1", "must")
+    entry.release_instance_contribution("default", "i1")
+    assert entry.live_hints_by_caller == {}
     # Releasing again is a no-op, NOT an error.
-    entry.release_instance_contribution("i1")
-    entry.release_instance_contribution("nonexistent")
+    entry.release_instance_contribution("default", "i1")
+    entry.release_instance_contribution("default", "nonexistent")
     assert entry.compute_effective_hint() == "may"
 
 
 def test_anonymous_slot_collapses_to_last_write_wins():
-    """Legacy callers without an instance_id share the ``_anon`` slot."""
+    """Legacy callers without runner_id + instance_id share the
+    ``("default", "_anon")`` slot."""
 
     entry = _new_entry()
-    entry.record_instance_hint(None, "must")
-    entry.record_instance_hint(None, "may")  # last-write-wins
-    assert entry.live_hints_by_instance == {"_anon": "may"}
+    entry.record_instance_hint(None, None, "must")
+    entry.record_instance_hint(None, None, "may")  # last-write-wins
+    assert entry.live_hints_by_caller == {("default", "_anon"): "may"}
     assert entry.compute_effective_hint() == "may"
 
-    entry.record_instance_hint("", "must")  # empty string also _anon
-    assert entry.live_hints_by_instance == {"_anon": "must"}
+    entry.record_instance_hint("", "", "must")  # empty strings also collapse
+    assert entry.live_hints_by_caller == {("default", "_anon"): "must"}
+
+
+def test_two_runners_same_instance_id_are_independent_slots():
+    """Cross-runner isolation: runner A's instance "alice-123" and
+    runner B's instance "alice-123" must NOT collide. Each has its
+    own slot in ``live_hints_by_caller`` keyed on the
+    ``(runner_id, instance_id)`` tuple."""
+
+    entry = _new_entry()
+    entry.record_instance_hint("runner-A", "alice-123", "must")
+    entry.record_instance_hint("runner-B", "alice-123", "may")
+    # Both slots live, keyed on (runner_id, instance_id).
+    assert entry.live_hints_by_caller == {
+        ("runner-A", "alice-123"): "must",
+        ("runner-B", "alice-123"): "may",
+    }
+    assert entry.compute_effective_hint() == "must"
+
+
+def test_runner_a_release_does_not_drop_runner_b_slot():
+    """Runner A demoting / releasing its instance "alice-123" must
+    NOT drop runner B's instance "alice-123" — that would be the
+    cross-runner coupling bug M3 fixes."""
+
+    entry = _new_entry()
+    entry.record_instance_hint("runner-A", "alice-123", "must")
+    entry.record_instance_hint("runner-B", "alice-123", "must")
+    assert entry.compute_effective_hint() == "must"
+
+    # Runner A releases its contribution.
+    entry.release_instance_contribution("runner-A", "alice-123")
+    # Runner B's slot is intact.
+    assert entry.live_hints_by_caller == {
+        ("runner-B", "alice-123"): "must",
+    }
+    assert entry.compute_effective_hint() == "must"
+
+    # Runner A demoting via "no" (without literal_no) is also
+    # isolated: only A's slot is removed.
+    entry.record_instance_hint("runner-A", "alice-123", "may")
+    entry.record_instance_hint("runner-A", "alice-123", "no")
+    assert entry.live_hints_by_caller == {
+        ("runner-B", "alice-123"): "must",
+    }
+    assert entry.compute_effective_hint() == "must"
+
+
+def test_default_runner_id_falls_back_when_field_omitted():
+    """A caller that omits ``runner_id`` lands in the ``"default"``
+    runner slot. This preserves back-compat for the pre-M3 single-
+    tenant wire schema (where the wire only carried ``instance_id``)."""
+
+    entry = _new_entry()
+    # None runner_id resolves to "default"
+    entry.record_instance_hint(None, "alice", "must")
+    # Empty runner_id also resolves to "default"
+    entry.record_instance_hint("", "bob", "may")
+    # Explicit "default" lands in the same namespace, so submitting
+    # for instance "alice" again under explicit "default" overwrites
+    # the same slot.
+    entry.record_instance_hint("default", "alice", "may")
+    assert entry.live_hints_by_caller == {
+        ("default", "alice"): "may",
+        ("default", "bob"): "may",
+    }
+    assert entry.compute_effective_hint() == "may"
 
 
 # ---------------------------------------------------------------------------
@@ -330,16 +427,19 @@ def test_e2e_release_segment_instance_contribution_drops_slot():
     update_segment_lifecycle_hint("seg-shared", "may", instance_id="B")
     assert all(b.lifecycle_hint == "must" for b in blocks)
 
-    res = release_segment_instance_contribution("seg-shared", "A")
+    res = release_segment_instance_contribution(
+        "seg-shared", None, "A"
+    )
     assert res["effective_hint"] == "may"
     assert res["live_referencer_count"] == 1
     assert all(b.lifecycle_hint == "may" for b in blocks)
 
 
 def test_e2e_anonymous_caller_falls_back_to_last_write_wins():
-    """Legacy callers (no instance_id) share the ``_anon`` slot, so
-    consecutive anon calls just overwrite each other. This preserves
-    backward compatibility with all callers that pre-date M3."""
+    """Legacy callers (no runner_id, no instance_id) share the
+    ``("default", "_anon")`` slot, so consecutive anon calls just
+    overwrite each other. This preserves backward compatibility with
+    all callers that pre-date M3."""
 
     from vllm.entrypoints.openai.chat_completion import segment_actions
 
@@ -369,6 +469,94 @@ def test_e2e_anonymous_and_named_aggregate_independently():
     assert all(b.lifecycle_hint == "must" for b in blocks)
 
 
+def test_e2e_two_runners_same_instance_isolated_at_block_level():
+    """End-to-end version of the cross-runner isolation test: two
+    runners with identical ``instance_id`` are tracked independently
+    AND the block-flip path honors the aggregated effective hint."""
+
+    from vllm.entrypoints.openai.chat_completion import segment_actions
+
+    blocks = _seed_segment(segment_actions._registry)
+    # Both runners use instance_id "alice-123".
+    update_segment_lifecycle_hint(
+        "seg-shared", "must", runner_id="runner-A", instance_id="alice-123"
+    )
+    res = update_segment_lifecycle_hint(
+        "seg-shared", "may", runner_id="runner-B", instance_id="alice-123"
+    )
+    # Two independent slots — effective = max(must, may) = must.
+    assert res["live_referencer_count"] == 2
+    assert res["effective_hint"] == "must"
+    assert all(b.lifecycle_hint == "must" for b in blocks)
+
+    # Runner A drops out — runner B's "may" remains.
+    res = update_segment_lifecycle_hint(
+        "seg-shared", "no", runner_id="runner-A", instance_id="alice-123"
+    )
+    assert res["effective_hint"] == "may"
+    assert res["live_referencer_count"] == 1
+    assert all(b.lifecycle_hint == "may" for b in blocks)
+
+
+def test_e2e_runner_a_release_does_not_yank_runner_b():
+    """``release_segment_instance_contribution`` keyed on tuple: only
+    runner A's slot for ``alice-123`` drops; runner B's stays."""
+
+    from vllm.entrypoints.openai.chat_completion import segment_actions
+
+    blocks = _seed_segment(segment_actions._registry)
+    update_segment_lifecycle_hint(
+        "seg-shared", "must", runner_id="runner-A", instance_id="alice-123"
+    )
+    update_segment_lifecycle_hint(
+        "seg-shared", "must", runner_id="runner-B", instance_id="alice-123"
+    )
+
+    res = release_segment_instance_contribution(
+        "seg-shared", "runner-A", "alice-123"
+    )
+    assert res["effective_hint"] == "must"
+    assert res["live_referencer_count"] == 1
+    # Runner B's must-contribution still keeps blocks alive.
+    assert all(b.lifecycle_hint == "must" for b in blocks)
+
+    entry = segment_actions._registry._entry_by_segment_id_locked(
+        "seg-shared"
+    )
+    assert entry is not None
+    assert entry.live_hints_by_caller == {
+        ("runner-B", "alice-123"): "must",
+    }
+
+
+def test_e2e_default_runner_back_compat_no_runner_id_field():
+    """Pre-M3 wire schema sent only ``instance_id`` (no ``runner_id``).
+    The HTTP route's "missing runner_id falls through to default"
+    contract is exercised here at the function-level entry point:
+    omitting ``runner_id`` from the kwargs is identical to passing
+    ``runner_id="default"``."""
+
+    from vllm.entrypoints.openai.chat_completion import segment_actions
+
+    blocks = _seed_segment(segment_actions._registry)
+    # First call omits runner_id (pre-M3 wire shape).
+    update_segment_lifecycle_hint("seg-shared", "must", instance_id="alice")
+    # Second call passes explicit runner_id="default" — same slot.
+    res = update_segment_lifecycle_hint(
+        "seg-shared", "may", runner_id="default", instance_id="alice"
+    )
+    # Same slot ⇒ overwritten ⇒ last-write-wins ⇒ may.
+    assert res["live_referencer_count"] == 1
+    assert res["effective_hint"] == "may"
+
+    entry = segment_actions._registry._entry_by_segment_id_locked(
+        "seg-shared"
+    )
+    assert entry is not None
+    assert entry.live_hints_by_caller == {("default", "alice"): "may"}
+    assert all(b.lifecycle_hint == "may" for b in blocks)
+
+
 def test_invalid_hint_does_not_mutate_state():
     from vllm.entrypoints.openai.chat_completion import segment_actions
 
@@ -384,7 +572,7 @@ def test_invalid_hint_does_not_mutate_state():
         "seg-shared"
     )
     assert entry is not None
-    assert entry.live_hints_by_instance == {"A": "must"}
+    assert entry.live_hints_by_caller == {("default", "A"): "must"}
     assert all(b.lifecycle_hint == "must" for b in blocks)
 
 
@@ -409,21 +597,39 @@ def test_unregistered_segment_returns_legacy_shape():
     assert res["updated"] == 0
 
 
-def test_live_hints_visible_in_telemetry():
+def test_live_hints_visible_in_telemetry_with_runner_id_records():
+    """Telemetry must expose both ``runner_id`` AND ``instance_id``
+    per live entry as JSON-friendly records (raw tuples are not
+    JSON-serializable)."""
+
     from vllm.entrypoints.openai.chat_completion import segment_actions
 
     _seed_segment(segment_actions._registry)
-    update_segment_lifecycle_hint("seg-shared", "must", instance_id="A")
-    update_segment_lifecycle_hint("seg-shared", "may", instance_id="B")
+    update_segment_lifecycle_hint(
+        "seg-shared", "must", runner_id="runner-A", instance_id="alice"
+    )
+    update_segment_lifecycle_hint(
+        "seg-shared", "may", runner_id="runner-B", instance_id="alice"
+    )
+    # Legacy anon caller too — exercises the default-runner fallback.
+    update_segment_lifecycle_hint("seg-shared", "may")
 
     entry = segment_actions._registry._entry_by_segment_id_locked(
         "seg-shared"
     )
     assert entry is not None
     status = entry.redacted_status()
-    assert status["live_referencer_count"] == 2
+    assert status["live_referencer_count"] == 3
     assert status["effective_lifecycle_hint"] == "must"
-    assert status["live_hints_by_instance"] == {"A": "must", "B": "may"}
+    assert status["live_hints_by_caller"] == [
+        {"runner_id": "default", "instance_id": "_anon", "hint": "may"},
+        {"runner_id": "runner-A", "instance_id": "alice", "hint": "must"},
+        {"runner_id": "runner-B", "instance_id": "alice", "hint": "may"},
+    ]
+    # Sanity: the JSON-friendly list survives a json round-trip.
+    import json as _json
+
+    _json.dumps(status["live_hints_by_caller"])
 
 
 # ---------------------------------------------------------------------------
@@ -494,9 +700,62 @@ def test_concurrent_updates_serialize_through_registry_lock():
     )
     assert entry is not None
     # Each instance's last write was its assigned final hint, so the
-    # live set must reflect exactly those four contributions and the
-    # effective hint = max over them.
-    assert entry.live_hints_by_instance == dict(
-        zip(instances, final_hints)
+    # live set must reflect exactly those four contributions (under
+    # the default runner) and the effective hint = max over them.
+    expected = {
+        ("default", inst): hint
+        for inst, hint in zip(instances, final_hints)
+    }
+    assert entry.live_hints_by_caller == expected
+    assert entry.compute_effective_hint() == "must"
+
+
+def test_concurrent_updates_two_runners_same_instance_id():
+    """Same instance_id on two runners must remain isolated under
+    concurrent stress — proves the cross-runner contention guarantee
+    is not just a single-thread invariant."""
+
+    from vllm.entrypoints.openai.chat_completion import segment_actions
+
+    _seed_segment(segment_actions._registry, segment_id="seg-cross")
+    n_iters = 200
+
+    def _worker(runner: str, final_hint: str) -> None:
+        for _ in range(n_iters):
+            update_segment_lifecycle_hint(
+                "seg-cross",
+                "must",
+                runner_id=runner,
+                instance_id="alice-123",
+            )
+            update_segment_lifecycle_hint(
+                "seg-cross",
+                "may",
+                runner_id=runner,
+                instance_id="alice-123",
+            )
+        update_segment_lifecycle_hint(
+            "seg-cross",
+            final_hint,
+            runner_id=runner,
+            instance_id="alice-123",
+        )
+
+    threads = [
+        threading.Thread(target=_worker, args=("runner-A", "must")),
+        threading.Thread(target=_worker, args=("runner-B", "may")),
+    ]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    entry = segment_actions._registry._entry_by_segment_id_locked(
+        "seg-cross"
     )
+    assert entry is not None
+    assert entry.live_hints_by_caller == {
+        ("runner-A", "alice-123"): "must",
+        ("runner-B", "alice-123"): "may",
+    }
     assert entry.compute_effective_hint() == "must"
