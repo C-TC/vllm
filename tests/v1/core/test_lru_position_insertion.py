@@ -201,7 +201,8 @@ def test_telemetry_buckets_route_correctly():
     queue._record_lru_insert_walk(5000)
 
     assert queue.lru_insert_count == 8
-    assert queue.lru_insert_walk_steps_total == 0 + 9 + 10 + 99 + 100 + 999 + 1000 + 5000
+    expected_total = 0 + 9 + 10 + 99 + 100 + 999 + 1000 + 5000
+    assert queue.lru_insert_walk_steps_total == expected_total
     assert queue.lru_insert_walk_depth_buckets == [2, 2, 2, 2]
 
 
