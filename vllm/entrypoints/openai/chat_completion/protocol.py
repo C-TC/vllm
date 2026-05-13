@@ -337,7 +337,7 @@ class ChatCompletionRequest(OpenAIBaseModel):
         description="KVTransfer parameters used for disaggregated serving.",
     )
 
-    vllm_xargs: dict[str, str | int | float | list[str | int | float]] | None = Field(
+    vllm_xargs: dict[str, str | int | float | list[str | int | float | dict[str, str]]] | None = Field(
         default=None,
         description=(
             "Additional request parameters with (list of) string or "
