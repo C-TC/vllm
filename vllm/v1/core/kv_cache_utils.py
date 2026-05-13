@@ -219,14 +219,29 @@ class KVCacheBlock:
     # consulted on the runner-driven path.
     _must_hit_count: int = 0
 
-    # WIRES Phase E4: per-block segment id used by the block-pool
-    # touch / eviction hooks to attribute cache events back to the
-    # SegmentRegistry. ``None`` for non-WIRES blocks (the vast
-    # majority); set by ``segment_actions.tag_blocks_with_segment_id``
-    # when a segment_prepare prefill returns. The block_pool hooks
-    # short-circuit when this is None, so non-WIRES request paths pay
-    # zero telemetry cost.
-    _segment_id: str | None = None
+    # WIRES Phase E4 / M18 (paper/CODE_MISMATCH_NOTES.md): per-block
+    # segment ids used by the block-pool touch / eviction hooks to
+    # attribute cache events back to the SegmentRegistry. Empty tuple
+    # ``()`` for non-WIRES blocks (the vast majority); appended to by
+    # ``segment_actions.tag_blocks_with_segment_id`` when a
+    # segment_prepare prefill returns. The block_pool hooks
+    # short-circuit when this is empty, so non-WIRES request paths
+    # pay zero telemetry cost.
+    #
+    # M18: this used to be a single ``str | None``. A physical KV
+    # block (16 tokens by default) may overlap multiple segments
+    # when segment boundaries don't align with block boundaries
+    # (doc 32 §2.3 "min wins"); the previous single-valued schema
+    # silently lost the earlier segment's reverse-index entry on
+    # the second tag. The new tuple keeps the full set so
+    # ``update_block_hints`` can recompute the min-priority hint
+    # across all overlapping segments and the reverse map stays
+    # symmetric. ``_segment_ids[0]`` is the "primary" tag (the
+    # first segment to claim the block); a backward-compat
+    # ``_segment_id`` property returns it for read-only consumers
+    # that haven't migrated yet (delete in a follow-up after all
+    # consumers migrate).
+    _segment_ids: tuple[str, ...] = ()
 
     # T-45.7 (docs/v2/45 §3.4): writer attribution. Each time this
     # block is filled (chat completion prefill, segment_prepare
@@ -269,6 +284,22 @@ class KVCacheBlock:
         )
         self._block_hash = block_hash
 
+    @property
+    def _segment_id(self) -> str | None:
+        """M18 backward-compat shim: return the primary segment id.
+
+        The schema migrated from ``_segment_id: str | None`` to
+        ``_segment_ids: tuple[str, ...]`` so a single physical KV
+        block can carry multiple overlapping segment tags (doc 32
+        §2.3 "min wins"). Read-only consumers that haven't migrated
+        yet can still call ``block._segment_id`` and get the first /
+        "primary" tag; callers that need the FULL set must read
+        ``block._segment_ids`` directly. Delete this property in a
+        follow-up once all consumers migrate.
+        """
+
+        return self._segment_ids[0] if self._segment_ids else None
+
     def reset_hash(self):
         """Reset the block hash when the block is evicted.
 
@@ -282,7 +313,14 @@ class KVCacheBlock:
         # M14: clear must-residency hit tally (the previous content's
         # in-must hits are no longer meaningful for the new content).
         self._must_hit_count = 0
-        # Phase C3: clear promotion snapshot — the next promotion
+        # M18: a recycled slot must lose its prior segment tags so the
+        # new content's tag_blocks_with_segment_id calls don't union
+        # against stale segment ids. The reverse-index in
+        # SegmentRegistry self-heals stale entries via the
+        # ``segment_id not in block._segment_ids`` skip; this clear
+        # keeps memory bounded across slot reuse.
+        self._segment_ids = ()
+        # Phase C3: clear promotion snapshot, the next promotion
         # starts a fresh TTL window for the new content.
         self.last_promoted_ns = 0
         self.ttl_at_promotion_ns = 0
@@ -1204,22 +1242,29 @@ class FreeKVCacheBlockQueue:
             if _wires_telemetry_enabled():
                 ts_now = time.time()
                 for blk in demoted:
-                    _wires_emit_eviction(
-                        block_id=blk.block_id,
-                        scope_key=blk._segment_id,
-                        pool_at_evict="must",
-                        source_class=blk.source_class,
-                        hint=blk.lifecycle_hint,
-                        reason=EVICT_REASON_TTL_EXPIRED,
-                        ttl_at_demote_ms=(
-                            blk.ttl_at_promotion_ns / 1_000_000.0
-                            if blk.ttl_at_promotion_ns > 0
-                            else None
-                        ),
-                        must_hit_count=blk._must_hit_count,
-                        ref_count_at_evict=blk.ref_cnt,
-                        ts_epoch=ts_now,
-                    )
+                    # M18: emit one E3 row per overlapping segment so
+                    # each tagged segment's telemetry sees the eviction
+                    # (single-tag fast path: 1 row, identical to pre-M18
+                    # behavior). Untagged blocks emit one row with
+                    # ``scope_key=None`` per the original contract.
+                    scope_keys = blk._segment_ids if blk._segment_ids else (None,)
+                    for scope_key in scope_keys:
+                        _wires_emit_eviction(
+                            block_id=blk.block_id,
+                            scope_key=scope_key,
+                            pool_at_evict="must",
+                            source_class=blk.source_class,
+                            hint=blk.lifecycle_hint,
+                            reason=EVICT_REASON_TTL_EXPIRED,
+                            ttl_at_demote_ms=(
+                                blk.ttl_at_promotion_ns / 1_000_000.0
+                                if blk.ttl_at_promotion_ns > 0
+                                else None
+                            ),
+                            must_hit_count=blk._must_hit_count,
+                            ref_count_at_evict=blk.ref_cnt,
+                            ts_epoch=ts_now,
+                        )
         return len(demoted)
 
     def popleft(self) -> KVCacheBlock:
@@ -1294,26 +1339,32 @@ class FreeKVCacheBlockQueue:
         if pool_taken:
             ts_now = time.time()
             for pool_name, blk in pool_taken:
-                _wires_emit_eviction(
-                    block_id=blk.block_id,
-                    scope_key=blk._segment_id,
-                    pool_at_evict=pool_name,
-                    source_class=blk.source_class,
-                    hint=blk.lifecycle_hint,
-                    reason=(
-                        EVICT_REASON_MUST_PRESSURE_BACKSTOP
-                        if pool_name == "must"
-                        else EVICT_REASON_LRU_PRESSURE
-                    ),
-                    ttl_at_demote_ms=(
-                        blk.ttl_at_promotion_ns / 1_000_000.0
-                        if blk.ttl_at_promotion_ns > 0
-                        else None
-                    ),
-                    must_hit_count=blk._must_hit_count,
-                    ref_count_at_evict=blk.ref_cnt,
-                    ts_epoch=ts_now,
-                )
+                # M18: emit one E3 row per overlapping segment (single-tag
+                # fast path: 1 row, identical to pre-M18 behavior).
+                # Untagged blocks emit one row with ``scope_key=None``
+                # per the original contract.
+                scope_keys = blk._segment_ids if blk._segment_ids else (None,)
+                for scope_key in scope_keys:
+                    _wires_emit_eviction(
+                        block_id=blk.block_id,
+                        scope_key=scope_key,
+                        pool_at_evict=pool_name,
+                        source_class=blk.source_class,
+                        hint=blk.lifecycle_hint,
+                        reason=(
+                            EVICT_REASON_MUST_PRESSURE_BACKSTOP
+                            if pool_name == "must"
+                            else EVICT_REASON_LRU_PRESSURE
+                        ),
+                        ttl_at_demote_ms=(
+                            blk.ttl_at_promotion_ns / 1_000_000.0
+                            if blk.ttl_at_promotion_ns > 0
+                            else None
+                        ),
+                        must_hit_count=blk._must_hit_count,
+                        ref_count_at_evict=blk.ref_cnt,
+                        ts_epoch=ts_now,
+                    )
         return ret
 
     def _stamp_must_promotion(

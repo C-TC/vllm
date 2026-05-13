@@ -198,6 +198,13 @@ class BlockPool:
                 queue.update_block_hint(blk, new_hint, source_class="structured")
 
             segment_actions.set_block_hint_updater(_structured_hint_updater)
+
+            # M20: separate slot for speculative may->must promotion.
+            # See ``set_speculative_block_promoter`` docstring.
+            def _speculative_promoter(blk):
+                queue.update_block_hint(blk, "must", source_class="speculative")
+
+            segment_actions.set_speculative_block_promoter(_speculative_promoter)
         except ImportError:
             pass
 
@@ -434,21 +441,26 @@ class BlockPool:
             # eviction is not needed
             return False
 
-        # WIRES Phase E4: if this block was tagged with a segment id by
-        # segment_actions.tag_blocks_with_segment_id, attribute the
-        # eviction back to that segment so the per-segment telemetry
-        # surface (GET /v1/coopt/segment_telemetry/{segment_id})
-        # accurately reflects what the eviction policy is doing.
+        # WIRES Phase E4 / M18: if this block was tagged with one or
+        # more segment ids by segment_actions.tag_blocks_with_segment_id,
+        # attribute the eviction back to EACH overlapping segment so
+        # the per-segment telemetry surface
+        # (GET /v1/coopt/segment_telemetry/{segment_id}) accurately
+        # reflects what the eviction policy is doing for every
+        # segment whose tokens lived in this block. Single-tag blocks
+        # (the common case) cost one tuple iteration; untagged blocks
+        # short-circuit (empty tuple).
         # Best-effort + import-local to avoid a hard dependency from
         # the v1 core onto the OpenAI entrypoint package.
-        segment_id = getattr(block, "_segment_id", None)
-        if segment_id is not None:
+        segment_ids = getattr(block, "_segment_ids", ())
+        if segment_ids:
             try:
                 from vllm.entrypoints.openai.chat_completion.segment_actions import (
                     record_segment_eviction,
                 )
 
-                record_segment_eviction(segment_id, block.lifecycle_hint)
+                for segment_id in segment_ids:
+                    record_segment_eviction(segment_id, block.lifecycle_hint)
             except Exception:  # noqa: BLE001 - telemetry must never break serving
                 pass
 
@@ -483,14 +495,15 @@ class BlockPool:
         Args:
             blocks: A list of blocks to touch.
         """
-        # WIRES Phase E4: if any of the touched blocks carry a segment
-        # id, attribute the cache hit + retention to that segment.
-        # Resolve the helpers once per call (not per block) to avoid
-        # the import overhead in the inner loop.
+        # WIRES Phase E4 / M18: if any of the touched blocks carry one
+        # or more segment ids, attribute the cache hit + retention to
+        # EACH overlapping segment. Resolve the helpers once per call
+        # (not per block) to avoid the import overhead in the inner
+        # loop.
         record_cache_hit = None
         record_retention = None
         for block in blocks:
-            if getattr(block, "_segment_id", None) is not None:
+            if getattr(block, "_segment_ids", ()):
                 try:
                     from vllm.entrypoints.openai.chat_completion.segment_actions import (  # noqa: E501
                         record_segment_cache_hit,
@@ -507,6 +520,25 @@ class BlockPool:
 
         now_ns = _time.monotonic_ns()
         for block in blocks:
+            # M20: speculative -> unstructured class upgrade. A cache
+            # hit on a block currently classed as "speculative" confirms
+            # the speculation; promote the block out of the speculative
+            # class so subsequent eviction logic uses the normal EMA-
+            # based TTL (the speculative TTL was a *backstop* for
+            # mispredicted speculation; once a hit lands, the block is
+            # behaving like any access-promoted block). Done BEFORE the
+            # unstructured-EMA feed below so the post-upgrade block is
+            # eligible for the normal sample path. We re-stamp
+            # ``ttl_at_promotion_ns`` and ``last_promoted_ns`` here so
+            # the lazy sweep treats this as a fresh unstructured
+            # promotion (no carryover of the short speculative TTL).
+            if block.source_class == "speculative":
+                block.source_class = "unstructured"
+                block.last_promoted_ns = now_ns
+                block.ttl_at_promotion_ns = (
+                    self.free_block_queue._unstructured_ttl_at_promotion_ns()
+                )
+                self.free_block_queue.speculation_hit_count += 1
             # WIRES Phase C3 (docs/v2/32 §2.4.1 + Q8 answer):
             # If this block is in must-pool with source_class
             # "unstructured", feed the EMA estimator with the
@@ -548,15 +580,21 @@ class BlockPool:
             if self.metrics_collector:
                 self.metrics_collector.on_block_accessed(block)
             if record_cache_hit is not None:
-                segment_id = getattr(block, "_segment_id", None)
-                if segment_id is not None:
-                    try:
-                        record_cache_hit(segment_id)
-                        # Touch implies the block was kept in cache and
-                        # reused — counts as a retention event.
-                        record_retention(segment_id)
-                    except Exception:  # noqa: BLE001
-                        pass
+                # M18: a block can carry multiple overlapping segment
+                # ids; record one hit + one retention per overlapping
+                # segment so each segment's cache_hit_count reflects
+                # the touch.
+                segment_ids = getattr(block, "_segment_ids", ())
+                if segment_ids:
+                    for segment_id in segment_ids:
+                        try:
+                            record_cache_hit(segment_id)
+                            # Touch implies the block was kept in
+                            # cache and reused, counts as a retention
+                            # event.
+                            record_retention(segment_id)
+                        except Exception:  # noqa: BLE001
+                            pass
 
     def free_blocks(self, ordered_blocks: Iterable[KVCacheBlock]) -> None:
         """Free a list of blocks. The blocks should be ordered by their

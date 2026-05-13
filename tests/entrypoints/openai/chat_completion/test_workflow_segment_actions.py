@@ -511,10 +511,14 @@ def test_m9_segment_refresh_with_hint_does_touch_and_flip(
     assert prepare_resp.status_code == 200
 
     class _FakeBlock:
-        __slots__ = ("_segment_id", "lifecycle_hint")
+        # M18: schema migrated from single ``_segment_id`` slot to
+        # ``_segment_ids`` tuple. Test fakes that mimic KVCacheBlock
+        # must expose the new attribute so tag_blocks_with_segment_id
+        # can append the tag (the production setter writes the tuple).
+        __slots__ = ("_segment_ids", "lifecycle_hint")
 
         def __init__(self):
-            self._segment_id = None
+            self._segment_ids = ()
             self.lifecycle_hint = "may"
 
     blk_a, blk_b = _FakeBlock(), _FakeBlock()
@@ -566,10 +570,14 @@ def test_m9_segment_refresh_hint_only_skips_prewarm(
     assert prepare_resp.status_code == 200
 
     class _FakeBlock:
-        __slots__ = ("_segment_id", "lifecycle_hint")
+        # M18: schema migrated from single ``_segment_id`` slot to
+        # ``_segment_ids`` tuple. Test fakes that mimic KVCacheBlock
+        # must expose the new attribute so tag_blocks_with_segment_id
+        # can append the tag (the production setter writes the tuple).
+        __slots__ = ("_segment_ids", "lifecycle_hint")
 
         def __init__(self):
-            self._segment_id = None
+            self._segment_ids = ()
             self.lifecycle_hint = "may"
 
     blk_a, blk_b, blk_c = _FakeBlock(), _FakeBlock(), _FakeBlock()
@@ -758,15 +766,19 @@ def test_m9_segment_refresh_hint_only_self_heals_stale_tag(
     assert prepare_resp.status_code == 200
 
     class _FakeBlock:
-        __slots__ = ("_segment_id", "lifecycle_hint")
+        # M18: schema migrated from single ``_segment_id`` slot to
+        # ``_segment_ids`` tuple. Test fakes that mimic KVCacheBlock
+        # must expose the new attribute so tag_blocks_with_segment_id
+        # can append the tag (the production setter writes the tuple).
+        __slots__ = ("_segment_ids", "lifecycle_hint")
 
         def __init__(self):
-            self._segment_id = None
+            self._segment_ids = ()
             self.lifecycle_hint = "may"
 
     blk_a, blk_b = _FakeBlock(), _FakeBlock()
     tag_blocks_with_segment_id([blk_a, blk_b], "seg-abc")
-    blk_b._segment_id = "seg-other"  # simulate eviction + reuse
+    blk_b._segment_ids = ("seg-other",)  # simulate eviction + reuse
 
     resp = client.post(
         "/v1/coopt/segment_refresh",

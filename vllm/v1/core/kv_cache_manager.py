@@ -522,15 +522,32 @@ class KVCacheManager:
                     blk.lifecycle_hint = request_hint
         if isinstance(seg_hints, dict) and seg_hints:
             # Per-segment override: for each newly-allocated block whose
-            # ``_segment_id`` matches a scope_key, switch to the per-
-            # segment hint. Blocks without a tagged segment fall back to
-            # whatever the request-level pass set above (legacy hint or
-            # the default "may").
+            # ``_segment_ids`` overlap a scope_key, apply the per-
+            # segment hint. Blocks without a tagged segment fall back
+            # to whatever the request-level pass set above (legacy
+            # hint or the default "may").
+            #
+            # M18: a block may carry multiple overlapping segment ids
+            # (doc 32 §2.3 "min wins"). When several of those tags
+            # match scope_keys, pick the MIN-priority hint
+            # (no < may < must) to honor the most-conservative
+            # caller's intent; this keeps the per-segment override
+            # semantics consistent with the runner-driven hint flips
+            # that go through ``update_block_hints`` and also fold
+            # multiple overlapping segments into one effective hint.
+            _PRIORITY = {"no": 0, "may": 1, "must": 2}
             for group_blocks in new_blocks:
                 for blk in group_blocks:
-                    blk_seg_id = getattr(blk, "_segment_id", None)
-                    if isinstance(blk_seg_id, str) and blk_seg_id in seg_hints:
-                        blk.lifecycle_hint = seg_hints[blk_seg_id]
+                    blk_seg_ids = getattr(blk, "_segment_ids", ())
+                    chosen: str | None = None
+                    for seg in blk_seg_ids:
+                        h = seg_hints.get(seg)
+                        if h is None:
+                            continue
+                        if chosen is None or _PRIORITY[h] < _PRIORITY[chosen]:
+                            chosen = h
+                    if chosen is not None:
+                        blk.lifecycle_hint = chosen
 
         # WIRES Phase E5: when the request carries a workflow_segment_id
         # (set by submit_workflow_segment_prewarm via SamplingParams.extra_args
@@ -616,18 +633,25 @@ class KVCacheManager:
         """
         # Group all touched blocks by their segment id. Ungrouped
         # blocks (segment_id is None) are not part of any tracked
-        # segment and therefore not emitted — they show up in the E1
+        # segment and therefore not emitted; they show up in the E1
         # ``blocks_*`` totals already.
+        #
+        # M18: a block may carry multiple overlapping segment ids when
+        # segment boundaries don't align with block boundaries (doc 32
+        # §2.3 "min wins"). Iterate ``_segment_ids`` so each
+        # overlapping segment's E4 row sees the touch; single-tag
+        # blocks (the common case) cost one tuple lookup over the
+        # legacy single-id read.
         by_seg: dict[str, list] = {}
         for group in new_computed_block_list:
             for blk in group:
-                seg_id = getattr(blk, "_segment_id", None)
-                if isinstance(seg_id, str) and seg_id:
+                seg_ids = getattr(blk, "_segment_ids", ())
+                for seg_id in seg_ids:
                     by_seg.setdefault(seg_id, []).append(blk)
         for group in new_blocks:
             for blk in group:
-                seg_id = getattr(blk, "_segment_id", None)
-                if isinstance(seg_id, str) and seg_id:
+                seg_ids = getattr(blk, "_segment_ids", ())
+                for seg_id in seg_ids:
                     by_seg.setdefault(seg_id, []).append(blk)
         if not by_seg:
             return

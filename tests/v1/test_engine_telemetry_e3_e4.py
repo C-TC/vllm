@@ -66,10 +66,15 @@ def _reset_module_state(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
 class _FakeBlock:
     """Plain-attribute stand-in for KVCacheBlock for unit tests.
 
-    Mirrors the four telemetry-relevant fields:
-    ``_last_writer_kind`` / ``_last_writer_ts`` / ``_last_writer_request_id``
-    / ``_segment_id``. Plain Python class so we can mutate freely
-    without slots constraints.
+    Mirrors the telemetry-relevant fields:
+    ``_last_writer_kind`` / ``_last_writer_ts`` /
+    ``_last_writer_request_id`` / ``_segment_ids``. Plain Python
+    class so we can mutate freely without slots constraints.
+
+    M18: schema migrated from a single ``_segment_id`` to a
+    ``_segment_ids`` tuple to carry multiple overlapping segments
+    (doc 32 §2.3). Legacy ``segment_id`` kwarg is normalized onto a
+    1-tuple so existing call sites stay readable.
     """
 
     def __init__(
@@ -80,12 +85,18 @@ class _FakeBlock:
         ts: float = 0.0,
         request_id: str | None = None,
         segment_id: str | None = None,
+        segment_ids: tuple[str, ...] | None = None,
     ):
         self.block_id = block_id
         self._last_writer_kind = kind
         self._last_writer_ts = ts
         self._last_writer_request_id = request_id
-        self._segment_id = segment_id
+        if segment_ids is not None:
+            self._segment_ids = segment_ids
+        elif isinstance(segment_id, str) and segment_id:
+            self._segment_ids = (segment_id,)
+        else:
+            self._segment_ids = ()
 
 
 # ===========================================================================

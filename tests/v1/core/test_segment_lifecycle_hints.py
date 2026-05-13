@@ -149,12 +149,28 @@ def test_legacy_lifecycle_hint_still_parsed_alongside_per_segment():
 class _FakeBlock:
     """Minimal stand-in for KVCacheBlock to exercise the M13 branch in
     KVCacheManager.allocate_slots. The real block carries many more
-    fields; we only need ``lifecycle_hint`` + ``_segment_id`` here.
+    fields; we only need ``lifecycle_hint`` + ``_segment_ids`` here.
+
+    M18: schema migrated from single ``_segment_id`` to a
+    ``_segment_ids`` tuple so a block can carry multiple overlapping
+    segment ids (doc 32 §2.3 "min wins"). The ``segment_id`` kwarg
+    on this fake is mapped onto a single-element tuple for legacy
+    test cases; pass ``segment_ids`` explicitly for the multi-tag
+    cases.
     """
 
-    def __init__(self, segment_id: str | None = None):
+    def __init__(
+        self,
+        segment_id: str | None = None,
+        segment_ids: tuple[str, ...] | None = None,
+    ):
         self.lifecycle_hint = "may"
-        self._segment_id = segment_id
+        if segment_ids is not None:
+            self._segment_ids = segment_ids
+        elif isinstance(segment_id, str) and segment_id:
+            self._segment_ids = (segment_id,)
+        else:
+            self._segment_ids = ()
 
 
 def _apply_lifecycle_hints_like_manager(request, new_blocks):
@@ -162,8 +178,15 @@ def _apply_lifecycle_hints_like_manager(request, new_blocks):
     ``KVCacheManager.allocate_slots`` so we can unit-test the policy
     without spinning up the full manager. Behavior MUST stay in sync
     with ``vllm/v1/core/kv_cache_manager.py``.
+
+    M18: a block may carry multiple overlapping segment ids; per
+    doc 32 §2.3 "min wins", when several of those tags match
+    scope_keys we pick the MIN-priority hint
+    (``no`` < ``may`` < ``must``) to honor the most-conservative
+    caller's intent.
     """
 
+    _PRIORITY = {"no": 0, "may": 1, "must": 2}
     request_hint = getattr(request, "lifecycle_hint", "may")
     seg_hints = getattr(request, "segment_lifecycle_hints", None)
     if request_hint != "may":
@@ -173,9 +196,16 @@ def _apply_lifecycle_hints_like_manager(request, new_blocks):
     if isinstance(seg_hints, dict) and seg_hints:
         for group_blocks in new_blocks:
             for blk in group_blocks:
-                blk_seg_id = getattr(blk, "_segment_id", None)
-                if isinstance(blk_seg_id, str) and blk_seg_id in seg_hints:
-                    blk.lifecycle_hint = seg_hints[blk_seg_id]
+                blk_seg_ids = getattr(blk, "_segment_ids", ())
+                chosen: str | None = None
+                for seg in blk_seg_ids:
+                    h = seg_hints.get(seg)
+                    if h is None:
+                        continue
+                    if chosen is None or _PRIORITY[h] < _PRIORITY[chosen]:
+                        chosen = h
+                if chosen is not None:
+                    blk.lifecycle_hint = chosen
 
 
 def test_legacy_only_applies_uniformly_to_all_blocks():

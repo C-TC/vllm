@@ -89,7 +89,9 @@ __all__ = [
     "update_segment_lifecycle_hint",
     "release_segment_instance_contribution",
     "mark_segment_prepare_prefilled",
+    "mark_segment_blocks_speculative",
     "set_block_hint_updater",
+    "set_speculative_block_promoter",
 ]
 
 
@@ -111,6 +113,15 @@ __all__ = [
 # don't exercise the queue.
 _block_hint_updater: Callable[[Any, str], None] | None = None
 
+# M20: callback that promotes a block to "must" with source_class
+# "speculative" (short TTL backstop). Bound by ``BlockPool.__init__`` to
+# a closure over ``free_block_queue.update_block_hint(blk, "must",
+# source_class="speculative")``. Kept as a separate slot from
+# ``_block_hint_updater`` (which is hardcoded to source_class
+# "structured") so the speculative path doesn't risk changing the
+# semantics of the existing structured-promotion callback.
+_speculative_block_promoter: Callable[[Any], None] | None = None
+
 
 def set_block_hint_updater(fn: Callable[[Any, str], None] | None) -> None:
     """Install (or clear) the callback used by ``SegmentRegistry.update_block_hints``
@@ -123,6 +134,21 @@ def set_block_hint_updater(fn: Callable[[Any, str], None] | None) -> None:
     """
     global _block_hint_updater
     _block_hint_updater = fn
+
+
+def set_speculative_block_promoter(fn: Callable[[Any], None] | None) -> None:
+    """M20: install (or clear) the callback used by
+    ``mark_segment_blocks_speculative`` to promote each tagged block to
+    must with source_class "speculative" via the block_pool's queue.
+
+    Called by ``BlockPool.__init__`` with a closure over
+    ``free_block_queue.update_block_hint(blk, "must",
+    source_class="speculative")``. Multiple block_pool instances share
+    this module-level slot, last writer wins (mirrors
+    ``_block_hint_updater`` semantics).
+    """
+    global _speculative_block_promoter
+    _speculative_block_promoter = fn
 
 
 # Action kinds (mirrors runner-side v2/backend/segment_action.py constants).
@@ -798,6 +824,22 @@ class SegmentRegistry:
         prefill_status: str,
         prefill_token_count: int,
     ) -> dict[str, Any]:
+        """Register a segment_prepare action.
+
+        Recognised optional fields on ``action`` (in addition to the
+        usual ``segment_id`` / ``token_hash`` / ``family_id`` / etc.):
+
+          * ``speculative`` (bool, default False): M20 hook for the
+            paper §3.2 future-work extension. When True, downstream
+            block-pool operations on this segment's blocks should use
+            ``source_class="speculative"`` (short TTL backstop, default
+            30s, env ``WIRES_KVCACHE_SPECULATIVE_TTL_MS``). The actual
+            stamping happens later when blocks are promoted via
+            ``mark_segment_blocks_speculative`` (engine-side primitive
+            this commit lands; runner-side patterns that *invoke* it
+            are intentionally left to future work, see
+            CODE_MISMATCH_NOTES.md M20).
+        """
         token_hash = _normalize_token_hash(action) or ""
         family_id = _resolve_family_id(action) or ""
         segment_id = _optional_str(action.get("segment_id")) or ""
@@ -1114,15 +1156,35 @@ class SegmentRegistry:
             kept: list[Any] = []
             skipped = 0
             for blk in blocks:
-                tagged = getattr(blk, "_segment_id", None)
-                if tagged != segment_id:
+                # M18: stale-tag check now uses tuple membership.
+                # Legacy fakes that only expose ``_segment_id`` (not
+                # ``_segment_ids``) fall through the empty default and
+                # are correctly treated as stale.
+                tagged_ids = getattr(blk, "_segment_ids", ())
+                if segment_id not in tagged_ids:
                     skipped += 1
                     continue
+                # M18 (doc 32 §2.3 "min wins"): per-block effective
+                # hint is the MIN-priority (no < may < must) hint
+                # across all overlapping segments. Targeted
+                # ``segment_id`` contributes ``new_hint``; other
+                # overlapping ids contribute their current registry
+                # effective hint (default ``"may"`` when unregistered).
+                # Single-tag blocks (the common case) take a fast
+                # path that bypasses the recompute and behaves
+                # exactly like pre-M18 (the new hint is the only
+                # contributor, so it IS the effective).
+                if len(tagged_ids) == 1:
+                    effective_for_block = new_hint
+                else:
+                    effective_for_block = self._compute_min_hint_locked(
+                        tagged_ids, segment_id, new_hint
+                    )
                 try:
                     if updater is not None:
-                        updater(blk, new_hint)
+                        updater(blk, effective_for_block)
                     else:
-                        blk.lifecycle_hint = new_hint
+                        blk.lifecycle_hint = effective_for_block
                     updated += 1
                     kept.append(blk)
                 except AttributeError:
@@ -1138,6 +1200,43 @@ class SegmentRegistry:
                 if updated > 0
                 else ("no_blocks_for_segment" if not blocks else "all_stale"),
             }
+
+    def _compute_min_hint_locked(
+        self,
+        tagged_ids: tuple[str, ...],
+        target_segment_id: str,
+        target_new_hint: str,
+    ) -> str:
+        """M18 helper: min-priority hint over all overlapping segments.
+
+        Caller MUST hold ``self._lock``. ``target_segment_id`` is the
+        segment whose hint is being flipped right now (use
+        ``target_new_hint`` instead of the registry-stored value);
+        every other id in ``tagged_ids`` contributes its current
+        registry effective hint, defaulting to ``"may"`` if no entry
+        exists yet (matches the empty-live-set default elsewhere).
+        Priority order: ``no`` (0) < ``may`` (1) < ``must`` (2);
+        "min wins" means we pick the LOWEST-priority hint.
+        """
+
+        priority = SegmentEntry._HINT_PRIORITY
+        chosen: str | None = None
+        for seg in tagged_ids:
+            if seg == target_segment_id:
+                contrib = target_new_hint
+            else:
+                other_entry = self._entries_by_segment_id.get(seg)
+                contrib = (
+                    other_entry.compute_effective_hint()
+                    if other_entry is not None
+                    else "may"
+                )
+            if chosen is None or priority.get(contrib, 1) < priority.get(chosen, 1):
+                chosen = contrib
+        # tagged_ids was non-empty by construction (called only on the
+        # multi-tag branch); chosen is therefore guaranteed non-None.
+        assert chosen is not None
+        return chosen
 
     def _entry_by_segment_id_locked(self, segment_id: str) -> SegmentEntry | None:
         """Lookup a segment entry by its ``segment_id``.
@@ -1610,11 +1709,88 @@ def tag_blocks_with_segment_id(blocks: Any, segment_id: str | None) -> None:
     except TypeError:
         return
     for blk in iterator:
+        # M18: a block can carry MULTIPLE overlapping segment ids when
+        # segment boundaries don't align with block boundaries (doc 32
+        # §2.3 "min wins"). Append this segment_id to the block's
+        # ``_segment_ids`` tuple if not already present (idempotent
+        # re-tag) so the previous segment's reverse-index entry is
+        # NOT lost on a second tag. ``_segment_ids[0]`` is the primary
+        # tag (the first segment to claim the block); subsequent
+        # tags accumulate.
         try:
-            blk._segment_id = segment_id  # noqa: SLF001
+            existing = getattr(blk, "_segment_ids", ())
+            if segment_id not in existing:
+                blk._segment_ids = existing + (segment_id,)  # noqa: SLF001
             _registry.register_block_for_segment(segment_id, blk)
         except AttributeError:
             continue
+
+
+def mark_segment_blocks_speculative(segment_id: str | None) -> dict[str, Any]:
+    """M20: speculative-promote every block currently tagged for
+    ``segment_id``.
+
+    Each block is moved to the must pool with
+    ``source_class="speculative"`` (short TTL backstop, default 30s,
+    env ``WIRES_KVCACHE_SPECULATIVE_TTL_MS``). The class upgrades back
+    to ``"unstructured"`` on the first cache hit (see
+    ``BlockPool.touch()``); if no hit lands before the TTL, the lazy
+    sweep demotes the block and increments ``speculation_miss_count``.
+
+    Returns ``{"updated": N, "skipped": K, "reject_reason": str|None}``.
+    Engine-side primitive only: paper §3.2 leaves the runner-side
+    speculation patterns to future work, so there is no built-in caller
+    here. Tests and future runner code can invoke this directly after
+    ``submit_segment_prepare_action`` has tagged the segment's blocks.
+    """
+
+    if not isinstance(segment_id, str) or not segment_id:
+        return {"updated": 0, "skipped": 0, "reject_reason": "missing_segment_id"}
+    promoter = _speculative_block_promoter
+    with _registry._lock:
+        blocks = _registry._blocks_by_segment_id.get(segment_id, [])
+        updated = 0
+        skipped = 0
+        kept: list[Any] = []
+        for blk in blocks:
+            # Stale-tag check tolerant of both the legacy single-id
+            # ``_segment_id`` slot and the M18 tuple ``_segment_ids``
+            # field. We accept the block as live for this segment if
+            # the segment id appears in the tuple OR matches the
+            # legacy single value (covers test fakes both old and new).
+            tagged_ids = getattr(blk, "_segment_ids", None)
+            tagged_id = getattr(blk, "_segment_id", None)
+            if tagged_ids is not None:
+                live = segment_id in tagged_ids
+            else:
+                live = tagged_id == segment_id
+            if not live:
+                skipped += 1
+                continue
+            try:
+                if promoter is not None:
+                    promoter(blk)
+                else:
+                    # Fallback path (no block_pool wired, e.g. unit
+                    # tests). Stamp the field directly so subsequent
+                    # promote-on-append picks the speculative TTL.
+                    blk.source_class = "speculative"
+                    blk.lifecycle_hint = "must"
+                updated += 1
+                kept.append(blk)
+            except AttributeError:
+                skipped += 1
+        if kept:
+            _registry._blocks_by_segment_id[segment_id] = kept
+        else:
+            _registry._blocks_by_segment_id.pop(segment_id, None)
+        return {
+            "updated": updated,
+            "skipped": skipped,
+            "reject_reason": None
+            if updated > 0
+            else ("no_blocks_for_segment" if not blocks else "all_stale"),
+        }
 
 
 def mark_segment_prepare_prefilled(

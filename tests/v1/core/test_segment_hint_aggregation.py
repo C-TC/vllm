@@ -72,15 +72,31 @@ pytestmark = pytest.mark.cpu_test
 class _FakeBlock:
     """Minimal stand-in for KVCacheBlock with the fields the registry
     needs to flip ``lifecycle_hint`` and stale-detect via
-    ``_segment_id``. Same shape as the M13 fake in
-    ``test_segment_lifecycle_hints.py``."""
+    ``_segment_ids``. Same shape as the M13 fake in
+    ``test_segment_lifecycle_hints.py``.
 
-    __slots__ = ("lifecycle_hint", "_segment_id", "block_id")
+    M18: schema migrated from single ``_segment_id`` to a
+    ``_segment_ids`` tuple. The legacy ``segment_id`` kwarg is
+    mapped onto a single-element tuple; pass ``segment_ids``
+    explicitly for the multi-tag cases.
+    """
 
-    def __init__(self, block_id: int, segment_id: str | None = None):
+    __slots__ = ("lifecycle_hint", "_segment_ids", "block_id")
+
+    def __init__(
+        self,
+        block_id: int,
+        segment_id: str | None = None,
+        segment_ids: tuple[str, ...] | None = None,
+    ):
         self.block_id = block_id
         self.lifecycle_hint = "may"
-        self._segment_id = segment_id
+        if segment_ids is not None:
+            self._segment_ids = segment_ids
+        elif isinstance(segment_id, str) and segment_id:
+            self._segment_ids = (segment_id,)
+        else:
+            self._segment_ids = ()
 
 
 def _seed_segment(
@@ -646,7 +662,9 @@ def test_tag_blocks_smoke_test_routes_through_registry():
 
     blocks = [_FakeBlock(i) for i in range(3)]
     tag_blocks_with_segment_id(blocks, "seg-tag")
-    assert all(b._segment_id == "seg-tag" for b in blocks)
+    # M18: tagging now appends to the ``_segment_ids`` tuple; for a
+    # single tag the tuple is ``("seg-tag",)``.
+    assert all(b._segment_ids == ("seg-tag",) for b in blocks)
     # Reverse map should now hold all three blocks.
     assert (
         len(segment_actions._registry._blocks_by_segment_id["seg-tag"])
