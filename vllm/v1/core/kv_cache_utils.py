@@ -749,6 +749,32 @@ class FreeKVCacheBlockQueue:
         # adaptive-k loop.
         self.p_h_ema_sample_count: int = 0
 
+        # M19 (CODE_MISMATCH_NOTES.md): engine-side lazy hint flips.
+        # Per-block pending pool moves are coalesced here and applied
+        # at the entry of any cache op that reads pool state
+        # (popleft / popleft_n / append / append_n / remove / get_all).
+        # ``block.lifecycle_hint`` is ALWAYS updated eagerly (it is
+        # just metadata read by other modules); only the doubly-linked
+        # list move is deferred. Multiple flips on the same block
+        # within one window collapse to the final
+        # ``(block, new_hint, source_class)`` entry in this dict, which
+        # is what motivates the design (a fan-out join hint-flipping
+        # the same block N times costs N dict writes + 1 pool move at
+        # the next cache op, not N pool moves). Storing the block
+        # object directly avoids any O(num_free_blocks) lookup at
+        # flush time.
+        self._pending_hint_flips: dict[
+            int, tuple[KVCacheBlock, str, str]
+        ] = {}
+        # M19 telemetry: cumulative count of pending flips actually
+        # applied by ``_flush_pending_hint_flips`` (sum across all
+        # flushes). When this grows much faster than the count of
+        # distinct cache ops that triggered the flush, the lazy
+        # batching is doing its job; when they grow at the same rate,
+        # the batching window only ever sees one pending flip and the
+        # deferral is overhead-only.
+        self.lazy_flush_total_blocks: int = 0
+
     @property
     def T_hat_u_ns(self) -> float:
         """Current EMA estimate of unstructured prefix-reuse interval (ns)."""
@@ -860,6 +886,65 @@ class FreeKVCacheBlockQueue:
             pool_name = "may"
         return pool_name
 
+    # --- M19: engine-side lazy hint flips --------------------------------
+    def _do_real_pool_move(
+        self,
+        block: KVCacheBlock,
+        new_hint: str,
+        source_class: str,
+    ) -> None:
+        """Apply a single deferred hint flip to a block currently sitting
+        in a free pool: remove from the current pool, optionally stamp
+        must-promotion metadata, and append into the destination pool.
+
+        Caller (`_flush_pending_hint_flips`) is responsible for verifying
+        the block is still in a pool. We re-check here because the
+        block may have been popped (eviction) or removed (touch hit)
+        between the deferred record time and now.
+        """
+        current_pool = self._pool_of.get(block.block_id)
+        if current_pool is None:
+            # Block has been evicted or pulled into in-use since the
+            # flip was recorded; the eager update of ``lifecycle_hint``
+            # is the only state that mattered, and it has already
+            # happened. Nothing else to do.
+            return
+        # If the block is already in the right pool (e.g., back-to-back
+        # flip ended up where it started), skip the move.
+        if current_pool == new_hint:
+            return
+        self._pools[current_pool].remove(block)
+        if new_hint == "must":
+            # Promotion to must: stamp promoted_at + ttl_at_promotion +
+            # source_class (Phase C3).
+            self._stamp_must_promotion(block, time.monotonic_ns(), source_class)
+        self._pools[new_hint].append(block)
+        self._pool_of[block.block_id] = new_hint
+
+    def _flush_pending_hint_flips(self) -> int:
+        """Apply all deferred hint flips. Called at the entry of any
+        cache op that depends on pool state being up to date
+        (``popleft``, ``popleft_n``, ``append``, ``append_n``,
+        ``remove``, ``get_all_free_blocks``).
+
+        Returns the number of pending flips actually applied (always
+        equal to ``len(self._pending_hint_flips)`` at entry; useful as
+        a per-call counter for tests).
+        """
+        if not self._pending_hint_flips:
+            return 0
+        # Snapshot + clear BEFORE iterating so any nested cache op
+        # (defensive: none exists today, but cheap to guarantee) sees
+        # an empty pending dict and does not re-flush the same entry.
+        pending = self._pending_hint_flips
+        self._pending_hint_flips = {}
+        applied = 0
+        for _block_id, (block, new_hint, source_class) in pending.items():
+            self._do_real_pool_move(block, new_hint, source_class)
+            applied += 1
+        self.lazy_flush_total_blocks += applied
+        return applied
+
     # --- Backward-compat fake-head/tail aliases ---------------------------
     # Legacy tests inspect ``fake_free_list_head`` / ``fake_free_list_tail``
     # directly. Default-may blocks all land in the may pool, so exposing
@@ -905,6 +990,14 @@ class FreeKVCacheBlockQueue:
 
         Returns the number of blocks demoted.
         """
+        # M19: apply any deferred hint flips so the must-pool head
+        # walked below reflects the latest pool placement. Without
+        # this, a block freshly promoted into must by a runner hint
+        # (but whose move was deferred) would still appear in may and
+        # the sweep would skip it; conversely, a block freshly demoted
+        # out of must (deferred) would still be in must and could be
+        # reaped twice.
+        self._flush_pending_hint_flips()
         if self.mode == VICTIM_POLICY_PURE_LRU:
             return 0
         must = self._pools["must"]
@@ -1087,6 +1180,13 @@ class FreeKVCacheBlockQueue:
         ``block.source_class`` directly (default "unstructured" per
         paper §2.3); explicit CFG callers stamp "structured" via
         ``update_block_hint`` BEFORE this re-append fires."""
+        # M19: flush any deferred hint flips for OTHER blocks before
+        # this append. The block being appended itself is not in any
+        # pool yet, so its own (if any) pending entry is stale and
+        # would be a no-op; flushing here only helps other blocks
+        # whose deferred state might affect aggregate pool sizes /
+        # ordering invariants observed by callers between ops.
+        self._flush_pending_hint_flips()
         pool_name = self._pool_for_block(block)
         if pool_name == "must":
             self._stamp_must_promotion(block, time.monotonic_ns(), block.source_class)
@@ -1097,6 +1197,9 @@ class FreeKVCacheBlockQueue:
         """Bulk append; groups by destination pool to do one splice per pool."""
         if not blocks:
             return
+        # M19: flush deferred flips before bulk-appending so the
+        # subsequent placement reflects the latest pool state.
+        self._flush_pending_hint_flips()
         by_pool: dict[str, list[KVCacheBlock]] = {n: [] for n in self.POOL_ORDER}
         now_ns = time.monotonic_ns()
         for b in blocks:
@@ -1111,6 +1214,14 @@ class FreeKVCacheBlockQueue:
 
     def remove(self, block: KVCacheBlock) -> None:
         """Remove block from whichever pool it's currently in."""
+        # M19: flush deferred flips so the block is in the pool the
+        # caller expects (matches the latest lifecycle_hint metadata).
+        # Without this, a block whose hint was just flipped might
+        # still be in the OLD pool while ``_pool_of`` reports the OLD
+        # pool too, but the caller (e.g., ``BlockPool.touch()``) may
+        # have read ``block.lifecycle_hint`` and assumed agreement.
+        # Flushing here keeps remove() locally consistent.
+        self._flush_pending_hint_flips()
         pool_name = self._pool_of.pop(block.block_id, None)
         if pool_name is None:
             raise RuntimeError(f"remove() called on an unknown block: {block}")
@@ -1176,27 +1287,42 @@ class FreeKVCacheBlockQueue:
             indicator = 1 if block._must_hit_count > 0 else 0
             self._feed_p_h_sample(indicator)
 
+        # M19: eagerly update the metadata so anyone reading
+        # ``block.lifecycle_hint`` between now and the next flush sees
+        # the latest value. The pool list move itself is deferred.
+        block.lifecycle_hint = new_hint
+
         current_pool = self._pool_of.get(block.block_id)
-        if current_pool is not None:
-            # Block is in a free pool — move it.
-            self._pools[current_pool].remove(block)
-            block.lifecycle_hint = new_hint
-            if new_hint == "must":
-                # Promotion to must: stamp promoted_at +
-                # ttl_at_promotion + source_class (Phase C3).
-                self._stamp_must_promotion(block, time.monotonic_ns(), source_class)
-            self._pools[new_hint].append(block)
-            self._pool_of[block.block_id] = new_hint
-        else:
-            # Block is in-use; just update the metadata. Pool placement
-            # will be resolved at next append() (which stamps the
-            # promotion metadata if landing in must).
-            block.lifecycle_hint = new_hint
+        if current_pool is None:
+            # Block is in-use (not in any free pool). Pool placement
+            # will be resolved at the next append() call, which reads
+            # ``lifecycle_hint`` (already updated above) and stamps
+            # promotion metadata if landing in must. Make sure
+            # source_class is recorded so the must-stamp picks up the
+            # right ttl_at_promotion when the block re-enters.
             if new_hint == "must":
                 # Stamp source_class now so next append() picks up
                 # the right ttl_at_promotion. (last_promoted_ns will
                 # be set by append's _stamp_must_promotion call.)
                 block.source_class = source_class
+            # Drop any stale pending flip; block is no longer in a
+            # free pool, so the deferred move would be a no-op anyway.
+            self._pending_hint_flips.pop(block.block_id, None)
+            return
+
+        # M19: block IS in a free pool. Defer the move; collapse with
+        # any existing pending entry on the same block (last write
+        # wins). If the new hint matches the current physical pool
+        # placement (e.g., previous flips already targeted it but were
+        # not yet flushed), drop any pending entry: nothing to do.
+        if current_pool == new_hint:
+            self._pending_hint_flips.pop(block.block_id, None)
+            return
+        self._pending_hint_flips[block.block_id] = (
+            block,
+            new_hint,
+            source_class,
+        )
 
     # --- Phase D: access-based promotion ------------------------------------
     def try_access_promote(self, block: KVCacheBlock) -> bool:
@@ -1246,6 +1372,10 @@ class FreeKVCacheBlockQueue:
         ``lifecycle_hint = "may"``), this reproduces exactly the
         single-queue insertion order.
         """
+        # M19: caller asked for the authoritative pool snapshot; flush
+        # any deferred hint flips so the returned ordering reflects
+        # the latest hint state.
+        self._flush_pending_hint_flips()
         ret: list[KVCacheBlock] = []
         for name in self.POOL_ORDER:
             ret.extend(self._pools[name].iter_blocks())
