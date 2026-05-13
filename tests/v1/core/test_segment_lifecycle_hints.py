@@ -94,6 +94,39 @@ def test_segment_lifecycle_hints_empty_list_stays_none():
     assert req.segment_lifecycle_hints is None
 
 
+def test_chat_completion_request_accepts_segment_lifecycle_hints_in_xargs():
+    """Regression for the M13 schema gap: the prior tests only exercised
+    the internal `Request` parser. The OpenAI HTTP layer's
+    `ChatCompletionRequest` pydantic schema must also admit the
+    list-of-dicts shape inside `vllm_xargs`. Without this, every
+    M13-emitting runner request 400s at the FastAPI validator before
+    `Request.__init__` ever runs.
+    """
+
+    from vllm.entrypoints.openai.chat_completion.protocol import (
+        ChatCompletionRequest,
+    )
+
+    req = ChatCompletionRequest.model_validate(
+        {
+            "model": "Qwen/Qwen3-32B",
+            "messages": [{"role": "user", "content": "hi"}],
+            "vllm_xargs": {
+                "segment_lifecycle_hints": [
+                    {"scope_key": "seg-a", "lifecycle_hint": "must"},
+                    {"scope_key": "seg-b", "lifecycle_hint": "may"},
+                ],
+                "lifecycle_hint": "may",
+            },
+        }
+    )
+    assert req.vllm_xargs["segment_lifecycle_hints"] == [
+        {"scope_key": "seg-a", "lifecycle_hint": "must"},
+        {"scope_key": "seg-b", "lifecycle_hint": "may"},
+    ]
+    assert req.vllm_xargs["lifecycle_hint"] == "may"
+
+
 def test_legacy_lifecycle_hint_still_parsed_alongside_per_segment():
     """Backward compat: the legacy single field MUST still set
     ``Request.lifecycle_hint``; M13 only adds the per-segment list."""

@@ -337,11 +337,21 @@ class ChatCompletionRequest(OpenAIBaseModel):
         description="KVTransfer parameters used for disaggregated serving.",
     )
 
-    vllm_xargs: dict[str, str | int | float | list[str | int | float]] | None = Field(
+    vllm_xargs: (
+        dict[
+            str,
+            str | int | float | list[str | int | float | dict[str, str]],
+        ]
+        | None
+    ) = Field(
         default=None,
         description=(
-            "Additional request parameters with (list of) string or "
-            "numeric values, used by custom extensions."
+            "Additional request parameters with (list of) string, "
+            "numeric, or per-element string-dict values, used by "
+            "custom extensions. The string-dict element variant exists "
+            "for M13 segment_lifecycle_hints (per-segment hint records "
+            "carried inside vllm_xargs); see vllm/v1/request.py "
+            "Request.from_engine_request for downstream parsing."
         ),
     )
 
