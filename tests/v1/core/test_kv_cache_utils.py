@@ -1067,143 +1067,101 @@ def test_phase_c3_unstructured_promotion_snapshots_estimator_value():
     assert blocks[1].ttl_at_promotion_ns >= 1_000_000_000_000
 
 
-# -- WIRES Phase C4: α-shrinkage capacity boundary ---------------------------
+# -- M16 cleanup regression guard: α-shrinkage removed entirely --------------
 
 
-def test_phase_c4_alpha_default_one_when_no_pressure():
-    """No capacity pressure → α stays at 1.0."""
-    blocks = [KVCacheBlock(block_id=i) for i in range(10)]
-    queue = FreeKVCacheBlockQueue(
-        blocks, mode=VICTIM_POLICY_WIRES_THREE_POOL, total_capacity=100
+def test_m16_cleanup_alpha_shrinkage_field_absent():
+    """M16 cleanup: ``FreeKVCacheBlockQueue`` no longer carries any α-shrinkage
+    state. Regression guard so a future revert can't silently restore it."""
+    queue = FreeKVCacheBlockQueue([], mode=VICTIM_POLICY_WIRES_THREE_POOL)
+    for attr in (
+        "_alpha_shrinkage",
+        "_overflow_shrink_floor",
+        "alpha_shrinkage",  # property
+    ):
+        assert not hasattr(queue, attr), (
+            f"M16 cleanup regression: {attr!r} must not exist on "
+            f"FreeKVCacheBlockQueue (α-shrinkage removed; capacity "
+            f"pressure handled via must_pool_evicted backstop only)."
+        )
+
+
+def test_m16_cleanup_recompute_alpha_method_absent():
+    """The ``_recompute_alpha`` method itself is gone; no caller may
+    rely on it returning a scaling factor."""
+    assert not hasattr(FreeKVCacheBlockQueue, "_recompute_alpha"), (
+        "M16 cleanup regression: _recompute_alpha() must not exist."
     )
-    # 10 blocks in may, 90 capacity unused → tons of headroom.
-    alpha = queue._recompute_alpha()
-    assert alpha == 1.0
 
 
-def test_phase_c4_alpha_shrinks_under_must_pool_pressure():
-    """When must pool size exceeds N_must_target = B - may - in_use,
-    α drops below 1 to scale down deadlines."""
-    blocks = [KVCacheBlock(block_id=i) for i in range(50)]
-    for b in blocks:
-        b.lifecycle_hint = "must"
-    queue = FreeKVCacheBlockQueue(
-        blocks,
-        mode=VICTIM_POLICY_WIRES_THREE_POOL,
-        total_capacity=10,  # 10 capacity but 50 must blocks!
-        overflow_shrink_floor=0.1,
-    )
-    # in_use = 10 - 50 - 1 = -41 → clamped to 0.
-    # N_must_target = 10 - 0 - 0 = 10. must_size = 50.
-    # raw_alpha = 10/50 = 0.2 → above floor (0.1) → α = 0.2.
-    alpha = queue._recompute_alpha()
-    assert 0.1 < alpha < 1.0
+def test_m16_cleanup_overflow_shrink_floor_env_var_not_read(monkeypatch):
+    """The ``WIRES_KVCACHE_OVERFLOW_SHRINK_FLOOR`` env var is no longer
+    read by the queue; setting it must NOT create any α-related state."""
+    monkeypatch.setenv("WIRES_KVCACHE_OVERFLOW_SHRINK_FLOOR", "0.5")
+    queue = FreeKVCacheBlockQueue([], mode=VICTIM_POLICY_WIRES_THREE_POOL)
+    assert not hasattr(queue, "_overflow_shrink_floor")
+    assert not hasattr(queue, "_alpha_shrinkage")
 
 
-def test_phase_c4_alpha_clamped_at_floor():
-    """When N_must_target ≤ 0, α clamps to the floor."""
-    blocks = [KVCacheBlock(block_id=i) for i in range(20)]
-    for b in blocks:
-        b.lifecycle_hint = "may"
-    queue = FreeKVCacheBlockQueue(
-        blocks,
-        mode=VICTIM_POLICY_WIRES_THREE_POOL,
-        total_capacity=20,
-        overflow_shrink_floor=0.3,
-    )
-    # may=20, in_use = 20-20-1 = -1 clamped 0. N_must_target = 20-20-0 = 0
-    # → clamps to floor.
-    alpha = queue._recompute_alpha()
-    assert alpha == 0.3
+def test_m16_cleanup_overflow_shrink_floor_kwarg_rejected():
+    """The ``overflow_shrink_floor=`` constructor kwarg is gone; passing
+    it must raise (TypeError on unexpected keyword)."""
+    with pytest.raises(TypeError, match="overflow_shrink_floor"):
+        FreeKVCacheBlockQueue([], overflow_shrink_floor=0.5)
 
 
-def test_phase_c4_sweep_uses_alpha_to_scale_deadline():
-    """A vanilla block whose unscaled TTL would NOT have expired but
-    α-scaled TTL HAS expired must be demoted.
-
-    M16: α applies only to vanilla (unstructured-class) blocks; hinted
-    (structured-class) blocks use the raw constant T_h backstop. This
-    test exercises the vanilla branch by promoting blocks with
-    ``source_class="unstructured"`` and forcing the bootstrap TTL via
-    ``bootstrap_samples=1`` + ``ema_alpha=1.0`` so the snapshot is
-    deterministic.
-
-    To force α<1 we need must_pool_size > B - may_size - in_use, i.e.
-    must_size > total_capacity - 0 (no may, no real in_use in this
-    test). So set total_capacity LESS than the must pool size."""
-    blocks = [KVCacheBlock(block_id=i) for i in range(5)]
-    queue = FreeKVCacheBlockQueue(
-        blocks,
-        mode=VICTIM_POLICY_WIRES_THREE_POOL,
-        structured_ttl_ns=10_000_000_000,  # 10s; ignored on vanilla path
-        unstructured_bootstrap_ttl_ns=10_000_000_000,  # 10s vanilla TTL
-        bootstrap_samples=1,
-        ema_alpha=1.0,
-        unstructured_k=0.0,  # snapshot = T̂_v + 0 = bootstrap value
-        total_capacity=2,  # 5 in must vs B=2 → forces α=0.4
-        overflow_shrink_floor=0.0001,
-    )
-    for blk in blocks:
-        queue.update_block_hint(blk, "must", source_class="unstructured")
-    # α = 2 / 5 = 0.4 → scaled deadline = promoted_at + 0.4 * 10s = +4s.
-    # Backdate 5s to push past scaled deadline.
-    for blk in blocks:
-        blk.last_promoted_ns -= 5_000_000_000
-    demoted = queue._sweep_ttl_must()
-    assert demoted == 5
-    # α should reflect the pressure.
-    assert 0.3 < queue.alpha_shrinkage < 0.5
+def test_m16_cleanup_source_class_default_is_unstructured():
+    """M16 cleanup correction (paper §2.3): the default ``source_class``
+    on a fresh ``KVCacheBlock`` is ``"unstructured"``. Access-based
+    promotion is the dominant path; explicit CFG callers must opt in
+    to ``"structured"``. Regression guard so the default doesn't flip
+    back to "structured" silently."""
+    block = KVCacheBlock(block_id=0)
+    assert block.source_class == "unstructured"
 
 
-def test_m16_sweep_skips_alpha_on_hinted_blocks():
-    """M16: hinted (structured-class) must blocks ignore α — their
-    constant T_h backstop is never shortened by capacity pressure.
+def test_m16_cleanup_update_block_hint_default_source_class_is_unstructured():
+    """``update_block_hint`` default ``source_class`` is ``"unstructured"``
+    so callers that don't specify get the access-based-equivalent path
+    (matches paper §2.3 dominant promotion source)."""
+    blocks = [KVCacheBlock(block_id=0)]
+    queue = FreeKVCacheBlockQueue(blocks, mode=VICTIM_POLICY_WIRES_THREE_POOL)
+    queue.update_block_hint(blocks[0], "must")  # no source_class kwarg
+    assert blocks[0].source_class == "unstructured"
 
-    Same pressure setup as test_phase_c4_sweep_uses_alpha_to_scale_deadline
-    but with structured-class promotion: α = 0.4 would shorten T_h
-    from 10s to 4s, but the M16 fix ignores α for structured blocks
-    and uses the raw 10s. Backdating 5s should NOT demote them."""
+
+def test_m16_cleanup_sweep_uses_raw_ttl_no_alpha_scaling():
+    """``_sweep_ttl_must`` now uses ``last_promoted_ns + ttl_at_promotion_ns``
+    as the deadline — no α multiplier. Even under heavy must-pool pressure
+    (where α used to drop to the floor), blocks should NOT be demoted
+    early; they live until their raw TTL elapses."""
     blocks = [KVCacheBlock(block_id=i) for i in range(5)]
     queue = FreeKVCacheBlockQueue(
         blocks,
         mode=VICTIM_POLICY_WIRES_THREE_POOL,
         structured_ttl_ns=10_000_000_000,  # 10s
-        total_capacity=2,  # forces α ~ 0.4
-        overflow_shrink_floor=0.0001,
+        total_capacity=2,  # ridiculous pressure — would have driven α<<1
     )
     for blk in blocks:
         queue.update_block_hint(blk, "must", source_class="structured")
-    # Backdate 5s — under M16 hinted blocks survive (deadline = +10s
-    # not +4s). Under the old uniform-α code these would be demoted.
+    # Backdate 5s — half the TTL elapsed. Under the old α code with
+    # B=2 / must=5 → α=0.4 → scaled deadline 4s → all would demote.
+    # M16 cleanup: raw 10s deadline → none demote.
     for blk in blocks:
         blk.last_promoted_ns -= 5_000_000_000
     demoted = queue._sweep_ttl_must()
     assert demoted == 0
-    # α itself is still computed (telemetry), it just isn't applied.
-    assert 0.3 < queue.alpha_shrinkage < 0.5
-    # Backdating an additional 6s pushes past the raw 10s deadline →
-    # all five demote even without α.
+    # Push past the raw 10s deadline → all demote.
     for blk in blocks:
         blk.last_promoted_ns -= 6_000_000_000
     demoted = queue._sweep_ttl_must()
     assert demoted == 5
 
 
-def test_phase_c4_alpha_pure_lru_mode_always_one():
-    """pure_lru mode skips α-shrinkage entirely."""
-    blocks = [KVCacheBlock(block_id=i) for i in range(5)]
-    queue = FreeKVCacheBlockQueue(
-        blocks, mode=VICTIM_POLICY_PURE_LRU, total_capacity=2
-    )
-    alpha = queue._recompute_alpha()
-    assert alpha == 1.0
-
-
 def test_phase_c3_env_knobs(monkeypatch):
     monkeypatch.setenv("WIRES_KVCACHE_UNSTRUCTURED_K", "2.5")
     monkeypatch.setenv("WIRES_KVCACHE_UNSTRUCTURED_EMA_ALPHA", "0.1")
     monkeypatch.setenv("WIRES_KVCACHE_UNSTRUCTURED_BOOTSTRAP_SAMPLES", "100")
-    monkeypatch.setenv("WIRES_KVCACHE_OVERFLOW_SHRINK_FLOOR", "0.5")
     queue = FreeKVCacheBlockQueue([])
     # Env override pins both the legacy mirror attribute and the
     # adaptive-k current value to the env value (see M14).
@@ -1212,7 +1170,6 @@ def test_phase_c3_env_knobs(monkeypatch):
     assert queue.unstructured_k_current == 2.5
     assert queue._ema_alpha == 0.1
     assert queue._bootstrap_samples == 100
-    assert queue._overflow_shrink_floor == 0.5
 
 
 # -- M14: p_h EMA + adaptive k -----------------------------------------------

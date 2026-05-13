@@ -174,14 +174,24 @@ class BlockPool:
         # WIRES Phase B: register the queue's update_block_hint as the
         # callback used by SegmentRegistry.update_block_hints, so
         # post-prefill hint flips correctly move blocks between pools
-        # in the 3-pool victim policy. Best-effort import — the
-        # OpenAI entrypoint is optional in some build configs.
+        # in the 3-pool victim policy. The segment_actions path is the
+        # explicit CFG-driven promotion path (paper §2.3), so it MUST
+        # tag the source as "structured" — the queue's default is now
+        # "unstructured" (M16 cleanup, post-2026-05-13). We bind the
+        # source_class kwarg here so segment_actions doesn't need to
+        # know about it. Best-effort import — the OpenAI entrypoint is
+        # optional in some build configs.
         try:
             from vllm.entrypoints.openai.chat_completion import segment_actions
 
-            segment_actions.set_block_hint_updater(
-                self.free_block_queue.update_block_hint
-            )
+            queue = self.free_block_queue
+
+            def _structured_hint_updater(blk, new_hint):
+                queue.update_block_hint(
+                    blk, new_hint, source_class="structured"
+                )
+
+            segment_actions.set_block_hint_updater(_structured_hint_updater)
         except ImportError:
             pass
 

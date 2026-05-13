@@ -146,8 +146,10 @@ class KVCacheBlock:
     # was last promoted into the must pool. 0 = never promoted (block
     # has always lived in no/may, or was just allocated). Used by the
     # lazy TTL sweep at the head of popleft_n. Phase C3+ uses
-    # ``last_promoted_ns + alpha * ttl_at_promotion_ns < now`` as the
-    # demotion deadline. See docs/v2/32 §2.4.
+    # ``last_promoted_ns + ttl_at_promotion_ns < now`` as the demotion
+    # deadline (M16 cleanup: α-shrinkage removed; capacity pressure is
+    # handled via the `must_pool_evicted` backstop only). See
+    # docs/v2/32 §2.4.
     last_promoted_ns: int = 0
 
     # WIRES Phase C3 (per docs/v2/32 §2.4.1 unstructured TTL design):
@@ -173,16 +175,18 @@ class KVCacheBlock:
 
     # WIRES Phase D: which promotion path put this block into the must
     # pool. Drives per-class TTL during the lazy sweep.
-    #   "structured"   — explicit promotion via update_segment_lifecycle_hint
-    #                    (driver / monitor knows the segment will recur)
+    #   "structured"   — explicit CFG-driven promotion via
+    #                    update_segment_lifecycle_hint (driver/monitor
+    #                    knows the segment will recur). Caller MUST opt
+    #                    in by passing source_class="structured".
     #   "unstructured" — access-based promotion via block_pool.touch()
-    #                    once _access_count crosses the threshold
-    # Default "structured" matches the pre-Phase-D world (everything
-    # was structured because access-based promotion didn't exist).
+    #                    once _access_count crosses the threshold (the
+    #                    natural LRU path, paper §2.3). This is the
+    #                    DEFAULT — most blocks reach must this way.
     # Refreshed each time the block is promoted; demotion does not
     # clear it (so a block re-promoted via access continues to use
     # the unstructured TTL).
-    source_class: str = "structured"
+    source_class: str = "unstructured"
 
     # WIRES Phase D: per-block hit count, used by access-based
     # promotion. Incremented in block_pool.touch() (one cache hit on
@@ -394,15 +398,12 @@ _DEFAULT_PH_INIT = 0.5
 # value and the new constant. Translates to smoothing constant
 # alpha_ema = 1 − 0.5**(1/N).
 _DEFAULT_PH_EMA_HALFLIFE = 100
-# Phase C4 α-shrinkage floor; below this α, `must_pool_evicted`
-# fires (emergency capacity).
-#
-# M16 scope (paper §3.6, post-2026-05-13 rewrite): α-shrinkage is no
-# longer claimed as a fairness mechanism; the docs/v2/32 DL-22 reframe
-# scopes it to the vanilla-side advance-demote (engineering control
-# only). Hinted (structured-class) blocks now skip α scaling entirely
-# in `_sweep_ttl_must` so the constant T_h backstop is never shortened.
-_DEFAULT_OVERFLOW_SHRINK_FLOOR = 0.25
+# Phase C4 α-shrinkage was removed in the M16 cleanup (2026-05-13
+# follow-up). Capacity pressure on the must pool is now handled
+# exclusively by the `must_pool_evicted` backstop in `popleft_n`
+# (docs/v2/32 §2.2 step 3). The earlier α scaling in `_sweep_ttl_must`
+# added code complexity with no paper claim (paper §3.6 does not
+# mention α) and is gone.
 
 # Phase D access-based promotion threshold (DL-OQ5 = 1).
 _DEFAULT_ACCESS_PROMOTION_THRESHOLD = 1
@@ -555,7 +556,6 @@ class FreeKVCacheBlockQueue:
         unstructured_k: float | None = None,
         ema_alpha: float | None = None,
         bootstrap_samples: int | None = None,
-        overflow_shrink_floor: float | None = None,
         total_capacity: int | None = None,
         ph_init: float | None = None,
         ph_ema_halflife: int | None = None,
@@ -674,19 +674,9 @@ class FreeKVCacheBlockQueue:
         if self._unstructured_k_override is None:
             self._unstructured_k = self._derive_k_from_ph(self._p_h_hat)
 
-        # Phase C4: α-shrinkage capacity boundary.
-        self._overflow_shrink_floor: float = (
-            overflow_shrink_floor
-            if overflow_shrink_floor is not None
-            else _resolve_float_from_env(
-                "WIRES_KVCACHE_OVERFLOW_SHRINK_FLOOR",
-                _DEFAULT_OVERFLOW_SHRINK_FLOOR,
-            )
-        )
-        self._alpha_shrinkage: float = 1.0
-        # Total capacity B for α formula. If None, α-shrinkage is
-        # effectively disabled (α stays at 1.0). block_pool passes
-        # this in; tests can omit when not exercising α.
+        # Total capacity B (block_pool passes this in). Retained for
+        # telemetry / future use; α-shrinkage no longer reads it
+        # (removed in the M16 cleanup, 2026-05-13 follow-up).
         self._total_capacity: int | None = total_capacity
 
         self._pools: dict[str, _PoolList] = {
@@ -702,11 +692,13 @@ class FreeKVCacheBlockQueue:
         for block in blocks:
             pool_name = self._pool_for_block(block)
             if pool_name == "must":
-                # Initial placement counts as promotion-time for TTL;
-                # respect block's source_class if set, else default
-                # to structured.
+                # Initial placement counts as promotion-time for TTL.
+                # `source_class` is dataclass-defaulted to "unstructured"
+                # (M16 cleanup: the default flipped from "structured" to
+                # match paper §2.3 — explicit CFG promotion is the
+                # special case, access-based is the dominant path).
                 self._stamp_must_promotion(
-                    block, now_ns, block.source_class or "structured"
+                    block, now_ns, block.source_class
                 )
             self._pools[pool_name].append(block)
             self._pool_of[block.block_id] = pool_name
@@ -738,18 +730,6 @@ class FreeKVCacheBlockQueue:
         """Current EMA-derived stddev of unstructured prefix-reuse interval (ns)."""
         # Var can drift slightly negative under floating-point noise.
         return (max(self._var_u_ns2, 0.0)) ** 0.5
-
-    @property
-    def alpha_shrinkage(self) -> float:
-        """Current α-shrinkage value (1.0 = no shrinkage; α_floor = clamp).
-
-        M16: α now applies to vanilla (unstructured-class) blocks only;
-        hinted (structured-class) blocks skip α scaling in
-        `_sweep_ttl_must` so their constant T_h backstop is never
-        shortened. The value reported here is the raw recompute output;
-        consumers can still observe pressure independent of class.
-        """
-        return self._alpha_shrinkage
 
     # --- M14: p̂_h EMA + adaptive k ---------------------------------------
     @property
@@ -844,39 +824,6 @@ class FreeKVCacheBlockQueue:
             self._T_hat_u_ns + self.unstructured_k_current * self.sigma_u_ns
         )
 
-    def _recompute_alpha(self) -> float:
-        """Phase C4: capacity-boundary shrinkage.
-
-        Per docs/v2/32 §2.4.2 (Q3 answer = no safety_margin):
-            N_must_target = B − len(may_pool) − in_use_count
-            α = clamp(N_must_target / max(len(must_pool), 1), α_floor, 1)
-
-        Uses observed values (Q1, Q5: no projection). When
-        ``total_capacity`` is None (test mode without block_pool),
-        skip and leave α at 1.0.
-        """
-        if self.mode == VICTIM_POLICY_PURE_LRU:
-            self._alpha_shrinkage = 1.0
-            return 1.0
-        if self._total_capacity is None:
-            return self._alpha_shrinkage
-        # in_use = total - num_free - 1 (-1 for null block, which is
-        # not in any free pool but isn't a real "user" of cache).
-        in_use_count = max(
-            0, self._total_capacity - self.num_free_blocks - 1
-        )
-        may_size = self._pools["may"].size
-        must_size = max(self._pools["must"].size, 1)
-        n_must_target = self._total_capacity - may_size - in_use_count
-        if n_must_target <= 0:
-            self._alpha_shrinkage = self._overflow_shrink_floor
-            return self._alpha_shrinkage
-        raw_alpha = n_must_target / must_size
-        self._alpha_shrinkage = min(
-            1.0, max(self._overflow_shrink_floor, raw_alpha)
-        )
-        return self._alpha_shrinkage
-
     def _pool_for_block(self, block: KVCacheBlock) -> str:
         """Resolve which pool ``block`` should land in given the active mode."""
         if self.mode == VICTIM_POLICY_PURE_LRU:
@@ -910,20 +857,17 @@ class FreeKVCacheBlockQueue:
     def _sweep_ttl_must(self) -> int:
         """Lazy TTL sweep on the must pool head (docs/v2/32 §2.4 + DL-10).
 
-        Walks the must pool from the head; any block whose effective
-        deadline has elapsed is demoted to the may pool's HEAD (LRU
-        end — they evict before may's existing entries on the next
-        popleft_n). Stops at the first non-expired block; since pool
-        ordering reflects promotion time, all subsequent blocks are
-        fresher.
+        Walks the must pool from the head; any block whose deadline
+        (`last_promoted_ns + ttl_at_promotion_ns`) has elapsed is
+        demoted to the may pool's HEAD (LRU end — they evict before
+        may's existing entries on the next popleft_n). Stops at the
+        first non-expired block; since pool ordering reflects promotion
+        time, all subsequent blocks are fresher.
 
-        Per M16 (paper §3.6, post-2026-05-13): α-shrinkage is now
-        applied to vanilla (unstructured-class) blocks only — the
-        constant T_h backstop on hinted (structured-class) blocks is
-        never shortened by α. The earlier uniform application was
-        operationally inert on the hinted side (monitor-driven demote
-        always fired first) but the paper no longer claims α as a
-        fairness mechanism, so this scoping makes code match docs.
+        M16 cleanup (2026-05-13): α-shrinkage was removed entirely.
+        Capacity pressure on the must pool is now handled exclusively
+        via the `must_pool_evicted` backstop in `popleft_n` (no
+        retroactive shortening of per-block TTLs).
 
         No-op when:
         - mode is pure_lru (must pool is always empty there)
@@ -934,24 +878,18 @@ class FreeKVCacheBlockQueue:
         """
         if self.mode == VICTIM_POLICY_PURE_LRU:
             return 0
-        # Phase C3 + C4 (docs/v2/32 §2.4): per-block deadline using
-        # ttl_at_promotion_ns snapshot scaled by α-shrinkage (vanilla
-        # side only, see M16). Recompute α first (Q4 answer = every
-        # popleft_n).
-        alpha = self._recompute_alpha()
         must = self._pools["must"]
         if must.size == 0:
             return 0
         now_ns = time.monotonic_ns()
         # Walk from head; demote blocks where
-        # `now > promoted_at_ns + scale * ttl_at_promotion_ns`,
-        # where `scale = α` for vanilla and `scale = 1.0` for hinted.
-        # Mixed source classes at head: the strict "stop at first
-        # non-expired" trick doesn't strictly hold (structured may
-        # have longer TTL than the unstructured behind it), but
-        # pragmatically we stop at first non-expired — any expired
-        # blocks behind a non-expired head get caught next cycle.
-        # Worst case: 1-cycle demotion delay. Acceptable.
+        # `now > promoted_at_ns + ttl_at_promotion_ns`. Mixed source
+        # classes at head: the strict "stop at first non-expired" trick
+        # doesn't strictly hold (structured may have longer TTL than
+        # the unstructured behind it), but pragmatically we stop at
+        # first non-expired — any expired blocks behind a non-expired
+        # head get caught next cycle. Worst case: 1-cycle demotion
+        # delay. Acceptable.
         demoted: list[KVCacheBlock] = []
         while must.size > 0:
             head = must.head.next_free_block
@@ -963,10 +901,7 @@ class FreeKVCacheBlockQueue:
                 # the new path); skip rather than demote. Could
                 # happen during transition / for legacy blocks.
                 break
-            # M16: α scoped to vanilla blocks only. Hinted blocks
-            # use the raw constant T_h backstop with no shrinkage.
-            scale = alpha if head.source_class == "unstructured" else 1.0
-            deadline_ns = head.last_promoted_ns + int(scale * ttl)
+            deadline_ns = head.last_promoted_ns + ttl
             if deadline_ns > now_ns:
                 break
             blk = must.popleft_one()
@@ -1049,14 +984,14 @@ class FreeKVCacheBlockQueue:
     def append(self, block: KVCacheBlock) -> None:
         """Append block to the pool that matches its current lifecycle_hint
         (always the may pool in ``pure_lru`` mode). Stamps must-promotion
-        metadata when the destination is the must pool."""
+        metadata when the destination is the must pool. Reads
+        ``block.source_class`` directly (default "unstructured" per
+        paper §2.3); explicit CFG callers stamp "structured" via
+        ``update_block_hint`` BEFORE this re-append fires."""
         pool_name = self._pool_for_block(block)
         if pool_name == "must":
-            # Initial pool placement: source_class default 'structured'
-            # (block was placed straight into must — implies caller
-            # intentionally tagged it as structured-class).
             self._stamp_must_promotion(
-                block, time.monotonic_ns(), block.source_class or "structured"
+                block, time.monotonic_ns(), block.source_class
             )
         self._pools[pool_name].append(block)
         self._pool_of[block.block_id] = pool_name
@@ -1071,7 +1006,7 @@ class FreeKVCacheBlockQueue:
             pool_name = self._pool_for_block(b)
             if pool_name == "must":
                 self._stamp_must_promotion(
-                    b, now_ns, b.source_class or "structured"
+                    b, now_ns, b.source_class
                 )
             by_pool[pool_name].append(b)
             self._pool_of[b.block_id] = pool_name
@@ -1091,7 +1026,7 @@ class FreeKVCacheBlockQueue:
         self,
         block: KVCacheBlock,
         new_hint: str,
-        source_class: str = "structured",
+        source_class: str = "unstructured",
     ) -> None:
         """Update a block's lifecycle_hint, moving pools if necessary.
 
@@ -1104,10 +1039,13 @@ class FreeKVCacheBlockQueue:
         ``pure_lru`` mode: hint is metadata only. Updates the field
         but never moves blocks between pools (everything is in may).
 
-        Used by Phase B (segment_actions.update_block_hints) for the
-        explicit / structured promotion path (default
-        source_class="structured"); Phase D's access-based
-        promotion calls this with source_class="unstructured".
+        ``source_class`` defaults to ``"unstructured"`` per paper §2.3
+        (access-based promotion is the dominant path; explicit CFG
+        promotion is the special case). Callers on the explicit CFG
+        path (``segment_actions.update_block_hints`` →
+        ``update_segment_lifecycle_hint``) MUST opt in by passing
+        ``source_class="structured"``. Phase D's access-based promotion
+        path (``try_access_promote``) keeps the default.
 
         ``source_class`` is recorded on the block ONLY when the new
         hint is "must" (it's only meaningful for must-pool blocks
@@ -1200,7 +1138,10 @@ class FreeKVCacheBlockQueue:
             return False
         if block.lifecycle_hint != "may":
             return False
-        self.update_block_hint(block, "must", source_class="unstructured")
+        # source_class defaults to "unstructured" (the default since
+        # M16 cleanup); access-based promotion is the canonical
+        # unstructured path so we rely on the default.
+        self.update_block_hint(block, "must")
         self.access_promoted_count += 1
         return True
 
