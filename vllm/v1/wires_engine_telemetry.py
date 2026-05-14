@@ -484,6 +484,29 @@ def note_evict_for_current_request(count: int = 1) -> None:
         req.num_evicts_caused_total += count
 
 
+def current_alloc_is_segment_prepare() -> bool:
+    """M25 (paper §3.5): True iff the request currently on the
+    allocate stack is a hidden segment_prepare prewarm dispatch.
+
+    Detection: prewarm requests carry a non-empty ``segment_id``
+    (set by ``submit_workflow_segment_prewarm`` via
+    ``SamplingParams.extra_args["workflow_segment_id"]``); ordinary
+    chat completions have ``segment_id=None``.
+
+    Used by ``BlockPool.touch`` as the ``from_segment_prepare``
+    discriminator: a touch happening DURING a segment_prepare
+    allocate (the prewarm prefill itself touches its own prefix-
+    cache hits) must NOT bump prewarm_consumed_count, otherwise
+    the consumed counter overcounts dispatches that never met a
+    real chat completion.
+    """
+    req = _current_alloc_request
+    if req is None:
+        return False
+    seg_id = getattr(req, "segment_id", None)
+    return isinstance(seg_id, str) and bool(seg_id)
+
+
 def stamp_block_writer(
     block: Any,
     *,

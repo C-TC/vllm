@@ -30,6 +30,7 @@ from vllm.v1.request import Request
 from vllm.v1.wires_engine_telemetry import (
     WRITER_KIND_CHAT_COMPLETION,
     WRITER_KIND_SEGMENT_PREPARE,
+    current_alloc_is_segment_prepare,
     note_evict_for_current_request,
     stamp_block_writer,
 )
@@ -527,6 +528,14 @@ class BlockPool:
         # ``source_class`` snapshot read below reflects the latest
         # promotion state.
         self.free_block_queue._flush_pending_hint_flips()
+        # M25 (paper §3.5 + CODE_MISMATCH_NOTES.md M25): resolve the
+        # from_segment_prepare discriminator ONCE per touch call (NOT
+        # per block) -- the current alloc-stack request does not
+        # change mid-call. Touches happening WITHIN a segment_prepare
+        # allocate (the prewarm prefill itself touches its own
+        # prefix-cache hits) must NOT clear was_prewarmed; only a
+        # touch from a real chat completion counts as "consumed".
+        from_segment_prepare = current_alloc_is_segment_prepare()
         for block in blocks:
             # M24 sanity counter (paper §3.4 + CODE_MISMATCH_NOTES.md
             # M24 step 6 #1): if this block is currently in the ``no``
@@ -567,6 +576,24 @@ class BlockPool:
             # Bump last_access_ns BEFORE promotion (Phase D), so the
             # next interval is measured from this hit forward.
             block.last_access_ns = now_ns
+            # M25 (paper §3.5 + CODE_MISMATCH_NOTES.md M25): a
+            # prewarmed block consumed by a real (non-prewarm) chat
+            # completion is the success signal -- the runner's
+            # frontier pick was correct. Bump the cumulative consumed
+            # counter and clear was_prewarmed so subsequent touches /
+            # eviction do not double-count. Placed AFTER the
+            # must / no pool tracking above (those still see the
+            # block's pre-touch pool state) and BEFORE
+            # try_access_promote / remove() so the LRU plumbing still
+            # moves the block correctly. The from_segment_prepare
+            # guard prevents a prewarm prefill's OWN prefix-cache hits
+            # from clearing the flag prematurely (those touches
+            # happen on already-cached prefix blocks the prewarm did
+            # NOT itself admit, but the discriminator keeps the
+            # consumed counter scoped to genuinely external hits).
+            if block.was_prewarmed and not from_segment_prepare:
+                block.was_prewarmed = False
+                self.free_block_queue.prewarm_consumed_count += 1
             # WIRES Phase D: access-based promotion. Increment per-block
             # _access_count; if it crosses WIRES_KVCACHE_ACCESS_PROMOTION_THRESHOLD
             # (default 1), promote may -> must with source_class="unstructured".
