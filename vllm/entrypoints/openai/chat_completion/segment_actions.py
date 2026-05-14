@@ -1753,18 +1753,12 @@ def mark_segment_blocks_speculative(segment_id: str | None) -> dict[str, Any]:
         skipped = 0
         kept: list[Any] = []
         for blk in blocks:
-            # Stale-tag check tolerant of both the legacy single-id
-            # ``_segment_id`` slot and the M18 tuple ``_segment_ids``
-            # field. We accept the block as live for this segment if
-            # the segment id appears in the tuple OR matches the
-            # legacy single value (covers test fakes both old and new).
-            tagged_ids = getattr(blk, "_segment_ids", None)
-            tagged_id = getattr(blk, "_segment_id", None)
-            if tagged_ids is not None:
-                live = segment_id in tagged_ids
-            else:
-                live = tagged_id == segment_id
-            if not live:
+            # Stale-tag check on M18 tuple field. The block is live for
+            # this segment iff segment_id appears in the tuple. Test fakes
+            # MUST expose ``_segment_ids`` (the legacy ``_segment_id``
+            # backward-compat property was removed in the M18 cleanup).
+            tagged_ids = getattr(blk, "_segment_ids", ())
+            if segment_id not in tagged_ids:
                 skipped += 1
                 continue
             try:

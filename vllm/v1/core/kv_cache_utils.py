@@ -301,21 +301,6 @@ class KVCacheBlock:
         )
         self._block_hash = block_hash
 
-    @property
-    def _segment_id(self) -> str | None:
-        """M18 backward-compat shim: return the primary segment id.
-
-        The schema migrated from ``_segment_id: str | None`` to
-        ``_segment_ids: tuple[str, ...]`` so a single physical KV
-        block can carry multiple overlapping segment tags (doc 32
-        §2.3 "min wins"). Read-only consumers that haven't migrated
-        yet can still call ``block._segment_id`` and get the first /
-        "primary" tag; callers that need the FULL set must read
-        ``block._segment_ids`` directly. Delete this property in a
-        follow-up once all consumers migrate.
-        """
-
-        return self._segment_ids[0] if self._segment_ids else None
 
     def reset_hash(self):
         """Reset the block hash when the block is evicted.
