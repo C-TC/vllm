@@ -159,11 +159,26 @@ class CompletionRequest(OpenAIBaseModel):
         description="KVTransfer parameters used for disaggregated serving.",
     )
 
-    vllm_xargs: dict[str, str | int | float] | None = Field(
+    vllm_xargs: (
+        dict[
+            str,
+            str | int | float | list[str | int | float | dict[str, str]],
+        ]
+        | None
+    ) = Field(
         default=None,
         description=(
-            "Additional request parameters with string or "
-            "numeric values, used by custom extensions."
+            "Additional request parameters with (list of) string, "
+            "numeric, or per-element string-dict values, used by "
+            "custom extensions. Mirrors the ChatCompletionRequest "
+            "schema (M13): the string-dict list element exists so "
+            "segment_lifecycle_hints (per-segment hint records) can "
+            "ride through /v1/completions for workflows that already "
+            "use it via /v1/chat/completions. Without this widening, "
+            "switching the runner real-LLM call from chat_completions "
+            "to completions (per CODE_MISMATCH_NOTES.md M25 follow-up "
+            "for prewarm + real-call token-ID alignment) would silently "
+            "drop M13 hints."
         ),
     )
 
