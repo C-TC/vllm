@@ -68,6 +68,13 @@ EXPECTED_SNAPSHOT_KEYS = {
     # is the early-warning signal for an analysis miss.
     "no_pool_hit_count",
     "no_pool_evicted_then_recomputed_count",
+    # M25 prewarm telemetry (paper §3.5 + CODE_MISMATCH_NOTES.md M25).
+    # admitted vs declined gives the prewarm admission rate; consumed
+    # vs evicted_before_use gives the per-block quality signal.
+    "prewarm_admitted_count",
+    "prewarm_declined_count",
+    "prewarm_consumed_count",
+    "prewarm_evicted_before_use_count",
 }
 
 
@@ -145,6 +152,12 @@ def test_snapshot_initial_values_are_zero():
         # EXPECTED_SNAPSHOT_KEYS above).
         "no_pool_hit_count",
         "no_pool_evicted_then_recomputed_count",
+        # M25 prewarm telemetry (also cumulative ints; see
+        # EXPECTED_SNAPSHOT_KEYS above).
+        "prewarm_admitted_count",
+        "prewarm_declined_count",
+        "prewarm_consumed_count",
+        "prewarm_evicted_before_use_count",
     }
     for k in int_counters:
         assert snapshot[k] == 0, f"{k} should start at 0, got {snapshot[k]!r}"
