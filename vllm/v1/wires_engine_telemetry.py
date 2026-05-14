@@ -21,6 +21,7 @@ Public surface:
 * ``emit_action(...)``              — E2, ``actions.jsonl``
 * ``emit_eviction(...)``            — E3, ``evictions.jsonl``
 * ``emit_segment_touch(...)``       — E4, ``segment_touches.jsonl``
+* ``emit_cache_stats(...)``         — E5, ``engine_cache_stats.jsonl``
 * Constants: ``WRITER_KIND_*`` for the ``KVCacheBlock._last_writer_kind``
   enum the E4 cache_source decision walks over.
 
@@ -51,6 +52,10 @@ STREAM_REQUESTS = "requests"
 STREAM_ACTIONS = "actions"
 STREAM_EVICTIONS = "evictions"
 STREAM_SEGMENT_TOUCHES = "segment_touches"
+# M5(a): periodic engine-side cumulative cache-stats snapshot. Driven from
+# the scheduler tick on a coarse interval so the JSONL stays low-volume
+# (one row per second by default, gated by ``WIRES_TELEMETRY_ENABLED``).
+STREAM_ENGINE_CACHE_STATS = "engine_cache_stats"
 
 # ---------------------------------------------------------------------------
 # Block writer-kind enum. Tagged onto KVCacheBlock at fill / re-fill time
@@ -358,6 +363,75 @@ def emit_segment_touch(
                 "source_class": source_class,
             }
         )
+
+
+# ---------------------------------------------------------------------------
+# E5 — periodic engine cache-stats snapshot (M5(a)).
+# ---------------------------------------------------------------------------
+#
+# Exports the cumulative counters tracked on ``FreeKVCacheBlockQueue``
+# (must_pool_evicted, ttl_demoted, access_promoted, EMA sample tallies,
+# speculation_*, lazy_flush_total_blocks, LRU walk-depth histogram) into
+# a low-volume JSONL stream so offline analysis can plot them over wall
+# clock without scraping engine logs.
+#
+# Driven from the scheduler tick (``Scheduler.schedule()``) on a coarse
+# interval (``WIRES_TELEMETRY_CACHE_STATS_INTERVAL_S``, default 1.0).
+# Disabled-mode cost is one ``is_enabled()`` attribute read; enabled-mode
+# cost is one ``time.monotonic()`` + a small dict construction once per
+# interval.
+
+DEFAULT_CACHE_STATS_INTERVAL_S = 1.0
+
+
+def _resolve_cache_stats_interval_s() -> float:
+    raw = os.environ.get("WIRES_TELEMETRY_CACHE_STATS_INTERVAL_S")
+    if raw is None:
+        return DEFAULT_CACHE_STATS_INTERVAL_S
+    try:
+        v = float(raw)
+    except ValueError:
+        return DEFAULT_CACHE_STATS_INTERVAL_S
+    # Guard a 0/negative value (would emit every tick); clamp to a small
+    # positive minimum so the stream stays bounded even if a bad value
+    # leaks in from env.
+    return max(0.05, v)
+
+
+_CACHE_STATS_INTERVAL_S: float = _resolve_cache_stats_interval_s()
+
+
+def _set_cache_stats_interval_for_tests(value: float) -> None:
+    """Tests-only hook to override the periodic emit interval."""
+    global _CACHE_STATS_INTERVAL_S
+    _CACHE_STATS_INTERVAL_S = float(value)
+
+
+def get_cache_stats_interval_s() -> float:
+    """Public accessor for the resolved periodic emit interval (seconds)."""
+    return _CACHE_STATS_INTERVAL_S
+
+
+def emit_cache_stats(
+    snapshot: dict[str, Any],
+    *,
+    ts_epoch: float | None = None,
+) -> None:
+    """Emit one E5 row carrying the engine cache-stats snapshot
+    (CODE_MISMATCH_NOTES.md M5(a)).
+
+    ``snapshot`` is the dict returned by
+    ``FreeKVCacheBlockQueue.cache_stats_snapshot()``; this helper just
+    layers a wall-clock timestamp on top and hands the row to the
+    background writer. Caller is responsible for cadence (typically the
+    scheduler tick honoring ``WIRES_TELEMETRY_CACHE_STATS_INTERVAL_S``).
+    """
+    if not is_enabled():
+        return
+    with contextlib.suppress(Exception):
+        row = {"ts_epoch": ts_epoch if ts_epoch is not None else time.time()}
+        row.update(snapshot)
+        get_writer(STREAM_ENGINE_CACHE_STATS).append(row)
 
 
 # ---------------------------------------------------------------------------

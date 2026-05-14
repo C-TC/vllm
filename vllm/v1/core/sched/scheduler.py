@@ -75,7 +75,13 @@ from vllm.v1.spec_decode.metrics import SpecDecodingStats
 from vllm.v1.structured_output import StructuredOutputManager
 from vllm.v1.utils import record_function_or_nullcontext
 from vllm.v1.wires_engine_telemetry import (
+    emit_cache_stats as _wires_emit_cache_stats,
+)
+from vllm.v1.wires_engine_telemetry import (
     emit_request_lifecycle as _wires_emit_request_lifecycle,
+)
+from vllm.v1.wires_engine_telemetry import (
+    get_cache_stats_interval_s as _wires_cache_stats_interval_s,
 )
 from vllm.v1.wires_telemetry import is_enabled as _wires_telemetry_enabled
 
@@ -316,6 +322,12 @@ class Scheduler(SchedulerInterface):
         ):
             self.connector.bind_gpu_block_pool(self.kv_cache_manager.block_pool)
 
+        # M5(a): periodic cache-stats snapshot tick state. ``-inf`` so the
+        # first ``schedule()`` always emits a baseline row when telemetry
+        # is enabled (handy for offline aggregation that wants a "t=0"
+        # anchor). Comparison is against ``time.monotonic()``.
+        self._wires_last_cache_stats_emit_mono: float = float("-inf")
+
         self.use_pp = self.parallel_config.pipeline_parallel_size > 1
         self.use_v2_model_runner = envs.VLLM_USE_V2_MODEL_RUNNER
         self.scheduler_reserve_full_isl = (
@@ -455,6 +467,16 @@ class Scheduler(SchedulerInterface):
 
         self.kv_cache_manager.new_step_starts()
         self.kv_cache_manager.release_expired_workflow_prepared_prefix_leases()
+
+        # M5(a) (CODE_MISMATCH_NOTES.md): periodic engine cache-stats
+        # snapshot. Disabled-mode cost is one ``is_enabled()`` attribute
+        # read; enabled-mode cost is one ``time.monotonic()`` per tick
+        # plus a small dict construction once per
+        # ``WIRES_TELEMETRY_CACHE_STATS_INTERVAL_S`` window. Exceptions
+        # are swallowed inside ``_wires_emit_cache_stats`` so a
+        # telemetry bug never breaks scheduling.
+        if _wires_telemetry_enabled():
+            self._wires_maybe_emit_cache_stats()
 
         # First, schedule the RUNNING requests.
         req_index = 0
@@ -2150,6 +2172,30 @@ class Scheduler(SchedulerInterface):
             self._wires_emit_e1(request)
 
         return kv_xfer_params
+
+    def _wires_maybe_emit_cache_stats(self) -> None:
+        """M5(a): emit one engine_cache_stats row when the periodic
+        interval has elapsed.
+
+        Caller is responsible for the ``_wires_telemetry_enabled()``
+        gate; this method only does the time-since-last-emit check
+        and the snapshot/emit pair. Failure is swallowed inside the
+        emitter so telemetry NEVER breaks scheduling.
+        """
+        now_mono = time.monotonic()
+        interval_s = _wires_cache_stats_interval_s()
+        if (now_mono - self._wires_last_cache_stats_emit_mono) < interval_s:
+            return
+        self._wires_last_cache_stats_emit_mono = now_mono
+        try:
+            queue = self.kv_cache_manager.block_pool.free_block_queue
+            snapshot = queue.cache_stats_snapshot()
+        except AttributeError:
+            # Block pool is on a non-WIRES victim policy or the
+            # snapshot helper isn't wired; skip silently rather than
+            # spam logs every tick.
+            return
+        _wires_emit_cache_stats(snapshot)
 
     def _wires_emit_e1(self, request: Request) -> None:
         """Emit the E1 per-request lifecycle row.

@@ -1037,6 +1037,46 @@ class FreeKVCacheBlockQueue:
             return None
         return self.speculation_hit_count / self.speculation_promotion_count
 
+    # --- M5(a): telemetry counter snapshot --------------------------------
+    def cache_stats_snapshot(self) -> dict[str, object]:
+        """Return a flat dict of every cumulative cache-stats counter
+        currently tracked by this queue (CODE_MISMATCH_NOTES.md M5(a)).
+
+        The returned dict is JSON-serialisable and is the canonical
+        shape consumed by ``wires_engine_telemetry.emit_cache_stats``
+        (E5 stream, ``engine_cache_stats.jsonl``). Keys are stable
+        across releases; new counters are added (never renamed) so
+        offline analysis can grow without breaking back-fills.
+
+        ``speculation_hit_rate`` is denominator-protected: returns
+        ``None`` when ``speculation_promotion_count == 0`` (avoid
+        0/0 noise in dashboards).
+
+        Cheap by construction: a few attribute reads + a list copy
+        for the bucket histogram. Safe to call from the engine tick
+        when telemetry is enabled.
+        """
+        return {
+            # Three-pool eviction / demote / promote (paper §3, docs/v2/32 §2.4 + §2.6).
+            "must_pool_evicted_count": self.must_pool_evicted_count,
+            "ttl_demoted_count": self.ttl_demoted_count,
+            "access_promoted_count": self.access_promoted_count,
+            # EMA estimator sample tallies (Phase C3, M14).
+            "unstructured_ema_sample_count": self.unstructured_ema_sample_count,
+            "p_h_ema_sample_count": self.p_h_ema_sample_count,
+            # M20 speculative source class (CODE_MISMATCH_NOTES.md M20).
+            "speculation_promotion_count": self.speculation_promotion_count,
+            "speculation_hit_count": self.speculation_hit_count,
+            "speculation_miss_count": self.speculation_miss_count,
+            "speculation_hit_rate": self.speculation_hit_rate,
+            # M19 lazy hint flips.
+            "lazy_flush_total_blocks": self.lazy_flush_total_blocks,
+            # M17 LRU walk-depth histogram + cumulative steps.
+            "lru_insert_count": self.lru_insert_count,
+            "lru_insert_walk_steps_total": self.lru_insert_walk_steps_total,
+            "lru_insert_walk_depth_buckets": list(self.lru_insert_walk_depth_buckets),
+        }
+
     @staticmethod
     def _derive_k_from_ph(p_h: float) -> float:
         """M14: `k = sqrt(p̂_h / (1 − p̂_h))` clamped to [_K_MIN, _K_MAX].
