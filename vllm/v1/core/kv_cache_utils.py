@@ -276,6 +276,20 @@ class KVCacheBlock:
     _last_writer_ts: float = 0.0
     _last_writer_request_id: str | None = None
 
+    # M25 (paper §3.5 + CODE_MISMATCH_NOTES.md M25): True iff this
+    # block was admitted via the segment_prepare prewarm path AND has
+    # not yet been touched by a real (non-prewarm) chat completion.
+    # Lifecycle: set to True at admission inside ``allocate_slots``
+    # when the request originates from a hidden ``submit_workflow_segment_prewarm``
+    # (request.segment_id is non-empty); cleared to False on the
+    # first ``BlockPool.touch`` from a real chat completion path
+    # (which also bumps ``prewarm_consumed_count``). If the block is
+    # evicted while still True, the eviction path bumps
+    # ``prewarm_evicted_before_use_count`` (the direct quality signal
+    # that prewarm was wasted on this block). Default False so non-
+    # WIRES / non-prewarm blocks pay zero construction cost.
+    was_prewarmed: bool = False
+
     @property
     def block_hash(self) -> BlockHashWithGroupId | None:
         return self._block_hash
@@ -316,6 +330,12 @@ class KVCacheBlock:
         # the slot's latest physical access regardless of content,
         # and zero-after-allocation behaviour is preserved by the
         # default field initialiser only on construction.
+        # M25: a recycled slot must lose any stale prewarm flag so
+        # the new content does not inherit "admitted via segment_prepare"
+        # status from a previous occupant. The flag's lifecycle is
+        # admission to first-touch (or eviction-before-touch); slot
+        # recycling resets it back to the default.
+        self.was_prewarmed = False
 
     def __repr__(self) -> str:
         # Use block_id instead of KVCacheBlock object to avoid calling __repr__
@@ -927,6 +947,42 @@ class FreeKVCacheBlockQueue:
         # adaptive-k loop.
         self.p_h_ema_sample_count: int = 0
 
+        # M25 prewarm telemetry (paper §3.5 + CODE_MISMATCH_NOTES.md
+        # M25). All four counters are cumulative ints, exported via
+        # cache_stats_snapshot, and consumed by the E5 stream
+        # (engine_cache_stats.jsonl). Healthy operation:
+        #   - admitted grows with prewarm dispatches that found capacity.
+        #   - declined stays small (free pool exhaustion is rare under
+        #     correct frontier-filter sizing).
+        #   - consumed grows roughly in lockstep with admitted (the
+        #     runner's prewarm picks were correct).
+        #   - evicted_before_use stays near zero (any spike means the
+        #     runner is prewarming work the engine evicts before the
+        #     real chat completion arrives -- frontier filter mis-
+        #     classification or admission too lax).
+        # See ``KVCacheBlock.was_prewarmed`` for the per-block flag
+        # that drives consumed / evicted attribution.
+        # Bumped once per segment_prepare dispatch that admits at
+        # least one block (NOT once per block). Wired in
+        # ``KVCacheManager.allocate_slots`` on the prewarm path.
+        self.prewarm_admitted_count: int = 0
+        # Bumped once per segment_prepare dispatch that fails because
+        # the free pool could not satisfy the request. Wired in
+        # ``KVCacheManager.allocate_slots`` on the prewarm path.
+        self.prewarm_declined_count: int = 0
+        # Bumped per-block in ``BlockPool.touch`` when the touched
+        # block carries ``was_prewarmed=True`` AND the touch is NOT
+        # itself coming from another segment_prepare path. Same
+        # operation clears ``was_prewarmed`` so subsequent touches /
+        # eviction do not double-count.
+        self.prewarm_consumed_count: int = 0
+        # Bumped per-block in any eviction path (``popleft``,
+        # ``popleft_n``, ``_sweep_ttl_must``) when the freed block
+        # still carries ``was_prewarmed=True`` (i.e. no real request
+        # ever touched it). The eviction path also clears the flag
+        # defensively so a recycled slot does not re-trigger.
+        self.prewarm_evicted_before_use_count: int = 0
+
         # M19 (CODE_MISMATCH_NOTES.md): engine-side lazy hint flips.
         # Per-block pending pool moves are coalesced here and applied
         # at the entry of any cache op that reads pool state
@@ -1046,6 +1102,17 @@ class FreeKVCacheBlockQueue:
             "lru_insert_count": self.lru_insert_count,
             "lru_insert_walk_steps_total": self.lru_insert_walk_steps_total,
             "lru_insert_walk_depth_buckets": list(self.lru_insert_walk_depth_buckets),
+            # M25 prewarm telemetry (paper §3.5). admitted vs declined
+            # is the admission rate; consumed vs evicted_before_use is
+            # the per-block quality signal (was the runner's frontier
+            # pick correct, or did the engine waste a block on work
+            # the chat completion never arrived to consume).
+            "prewarm_admitted_count": self.prewarm_admitted_count,
+            "prewarm_declined_count": self.prewarm_declined_count,
+            "prewarm_consumed_count": self.prewarm_consumed_count,
+            "prewarm_evicted_before_use_count": (
+                self.prewarm_evicted_before_use_count
+            ),
         }
 
     # --- M24 sanity-counter helpers ---------------------------------------
@@ -1395,6 +1462,24 @@ class FreeKVCacheBlockQueue:
             blk.lifecycle_hint = "may"
             demoted.append(blk)
             self._pool_of[blk.block_id] = "may"
+            # M25 prewarm telemetry (paper §3.5 + CODE_MISMATCH_NOTES.md
+            # M25): TTL demote moves the block from must to may; the
+            # block is still alive in the free pool (content not
+            # actually evicted yet). Per the brief we instrument every
+            # path that frees a block back to the free pool; clearing
+            # the flag here keeps the counter from double-counting if
+            # the same prewarmed block also gets popped via popleft_n
+            # later. In practice this branch is a no-op: prewarmed
+            # blocks enter ``may`` directly per paper §3.5 ("Prewarmed
+            # blocks enter the engine's may pool with lifecycle_hint =
+            # may"), so a was_prewarmed=True block reaching this sweep
+            # would only happen if the prewarm path stamped must
+            # explicitly (not currently the case). We bump + clear
+            # defensively so the counter remains correct under future
+            # changes that may admit prewarmed blocks into must.
+            if blk.was_prewarmed:
+                self.prewarm_evicted_before_use_count += 1
+                blk.was_prewarmed = False
         if demoted:
             # M17: demoted blocks were popped from the must pool head
             # in promotion-time order, which correlates with (but is
@@ -1460,6 +1545,20 @@ class FreeKVCacheBlockQueue:
                 # Wired here so both popleft and popleft_n hit it.
                 if name == "no":
                     self._no_evict_record_hash(blk.block_hash)
+                # M25 prewarm telemetry (paper §3.5 + CODE_MISMATCH_NOTES.md
+                # M25): a block evicted from the free pool while still
+                # carrying ``was_prewarmed=True`` was admitted via
+                # segment_prepare and never touched by a real chat
+                # completion -- the runner's prewarm pick was wasted
+                # capacity. Bump the cumulative counter and clear the
+                # flag (defensive: a recycled slot reset_hash() also
+                # clears it, but defending against ricochet keeps the
+                # counter monotone). This is the direct quality
+                # signal: spikes mean the frontier filter is mis-
+                # classifying, or admission is too lax.
+                if blk.was_prewarmed:
+                    self.prewarm_evicted_before_use_count += 1
+                    blk.was_prewarmed = False
                 return blk
         raise ValueError("No free blocks available")
 
@@ -1502,6 +1601,16 @@ class FreeKVCacheBlockQueue:
                 # reflect reality).
                 if name == "no":
                     self._no_evict_record_hash(blk.block_hash)
+                # M25 prewarm telemetry (paper §3.5 + CODE_MISMATCH_NOTES.md
+                # M25): mirrors the popleft path -- a was_prewarmed
+                # block exiting the free pool here without a real
+                # touch is the wasted-capacity signal. Wired in BOTH
+                # popleft and popleft_n so the counter reflects all
+                # eviction-from-free events regardless of which entry
+                # point fired.
+                if blk.was_prewarmed:
+                    self.prewarm_evicted_before_use_count += 1
+                    blk.was_prewarmed = False
             if len(ret) == n:
                 break
 
