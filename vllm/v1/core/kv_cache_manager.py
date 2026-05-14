@@ -469,7 +469,21 @@ class KVCacheManager:
         )
 
         if num_blocks_to_allocate > self.block_pool.get_num_free_blocks():
-            # Cannot allocate new blocks
+            # Cannot allocate new blocks.
+            # M25 prewarm telemetry (paper §3.5 + CODE_MISMATCH_NOTES.md
+            # M25): a segment_prepare dispatch that fails here is the
+            # capacity-bound "decline" signal. Bump once per declined
+            # dispatch (NOT once per missing block) so the counter
+            # tracks dispatch outcomes, matching admitted's per-
+            # dispatch semantics. Detection: hidden prewarm requests
+            # carry a non-empty ``request.segment_id`` (set by
+            # ``submit_workflow_segment_prewarm`` via
+            # ``SamplingParams.extra_args["workflow_segment_id"]``);
+            # ordinary user-facing requests have segment_id=None and
+            # so do not count.
+            prewarm_segment_id = getattr(request, "segment_id", None)
+            if isinstance(prewarm_segment_id, str) and prewarm_segment_id:
+                self.block_pool.free_block_queue.prewarm_declined_count += 1
             return None
 
         # T-45.4 (docs/v2/45 §3.1): mark this request as the current
@@ -591,6 +605,24 @@ class KVCacheManager:
             if tag_blocks_with_segment_id is not None:
                 for group_blocks in new_blocks:
                     tag_blocks_with_segment_id(list(group_blocks), request_segment_id)
+            # M25 prewarm telemetry (paper §3.5 + CODE_MISMATCH_NOTES.md
+            # M25): mark every freshly-admitted block so subsequent
+            # touch / eviction can attribute consumed vs evicted-before-
+            # use. The flag's lifecycle is admission to first-touch
+            # (BlockPool.touch clears it on the first non-prewarm hit)
+            # or admission to eviction (popleft / popleft_n /
+            # _sweep_ttl_must clear it and bump evicted_before_use_count).
+            # Bumped here exactly once per admitted dispatch (NOT per
+            # block) so the counter tracks dispatch outcomes; pairing
+            # admitted vs declined gives the prewarm admission rate
+            # without a per-block weighting bias.
+            admitted_any_block = False
+            for group_blocks in new_blocks:
+                for blk in group_blocks:
+                    blk.was_prewarmed = True
+                    admitted_any_block = True
+            if admitted_any_block:
+                self.block_pool.free_block_queue.prewarm_admitted_count += 1
 
         # T-45.4 (docs/v2/45 §3.1): per-request E1 tallies. Counts the
         # freshly-allocated and prefix-cache-hit blocks across all
