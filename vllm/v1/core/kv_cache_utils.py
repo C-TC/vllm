@@ -1170,6 +1170,12 @@ class FreeKVCacheBlockQueue:
         the block is still in a pool. We re-check here because the
         block may have been popped (eviction) or removed (touch hit)
         between the deferred record time and now.
+
+        source_class Option D, Site 2 (the speculative-precedence
+        rules): the must-promotion branch picks the effective
+        source_class via the precedence laid out below; the demote
+        branch reclassifies a "structured" block to "unstructured"
+        on flip-out-of-must.
         """
         current_pool = self._pool_of.get(block.block_id)
         if current_pool is None:
@@ -1179,8 +1185,23 @@ class FreeKVCacheBlockQueue:
             # happened. Nothing else to do.
             return
         # If the block is already in the right pool (e.g., back-to-back
-        # flip ended up where it started), skip the move.
+        # flip ended up where it started), skip the pool move BUT keep
+        # going if this is a runner-confirmed-must upgrade on a
+        # speculative block: we need to re-stamp source_class + TTL +
+        # bump speculation_hit_count even though pool placement is
+        # unchanged. Site 2's same-pool re-stamp is the engine-side
+        # mirror of Site 3's touch-driven upgrade (see the upgrade
+        # case in the must-promotion branch below).
         if current_pool == new_hint:
+            if (
+                new_hint == "must"
+                and source_class == "structured"
+                and block.source_class == "speculative"
+            ):
+                self.speculation_hit_count += 1
+                self._stamp_must_promotion(
+                    block, time.monotonic_ns(), "structured"
+                )
             return
         self._pools[current_pool].remove(block)
         if new_hint == "must":
@@ -1191,9 +1212,72 @@ class FreeKVCacheBlockQueue:
             # demote (must -> may) and the runner-driven non-must
             # transitions where access-time ordering matters for the
             # LRU eviction class.
-            self._stamp_must_promotion(block, time.monotonic_ns(), source_class)
+            #
+            # source_class Option D, Site 2 (must-promotion branch).
+            # Resolve the effective source_class with the precedence
+            # rules, then stamp. Three cases worth calling out:
+            #
+            # 1. Block was already "speculative" and the incoming
+            #    promotion intent is "structured" (runner explicitly
+            #    confirms must via segment_refresh hint=must, M9):
+            #    UPGRADE speculative -> structured. Speculation
+            #    confirmed by runner intent counts as a hit (the
+            #    speculative pre-promotion saved real wall clock vs
+            #    waiting for the runner hint to land); bump
+            #    speculation_hit_count to mirror the touch-driven hit
+            #    counted by BlockPool.touch (Site 3). The TTL is
+            #    re-stamped to the structured backstop (default 5min)
+            #    by _stamp_must_promotion (which keys off the
+            #    effective class we pass in here).
+            #
+            # 2. Block was already "speculative" and the incoming
+            #    intent is "speculative" or "unstructured": preserve
+            #    the speculative class. M20 owns the short-TTL
+            #    backstop semantics on this block until either a
+            #    touch hit (Site 3) or a runner-confirmed-must (case
+            #    1 above) upgrades it. We re-stamp last_promoted_ns
+            #    so the freshly re-promoted block gets a full TTL
+            #    window, but keep the source_class.
+            #
+            # 3. Block was non-speculative: use the incoming
+            #    source_class as the effective class (the existing
+            #    Phase C3 behaviour: structured for the runner-driven
+            #    explicit path, unstructured for the access-driven
+            #    path, speculative when this is the speculative
+            #    promoter's first run on the block).
+            effective_source_class = source_class
+            if block.source_class == "speculative":
+                if source_class == "structured":
+                    # Case 1: runner-confirmed upgrade. Mirror the
+                    # speculation-hit accounting that Site 3 (touch)
+                    # already does, so both confirmation paths are
+                    # symmetric in the cache_stats output.
+                    self.speculation_hit_count += 1
+                    effective_source_class = "structured"
+                else:
+                    # Case 2: preserve speculative.
+                    effective_source_class = "speculative"
+            self._stamp_must_promotion(
+                block, time.monotonic_ns(), effective_source_class
+            )
             self._pools[new_hint].append(block)
         else:
+            # source_class Option D, Site 2 (demote branch). When a
+            # block flips out of must (to may or no), drop a stale
+            # "structured" stamp: the structured class is meaningful
+            # only while the block sits in the must pool with the
+            # 300s backstop TTL. Demoting via update_block_hint means
+            # the runner has dropped the must intent; the block
+            # rejoins the access-driven population, so reclassify it
+            # to "unstructured" for any future re-promotion. The
+            # speculative class is preserved across demotes (M20: the
+            # speculative miss accounting fires only via the TTL
+            # sweep, never via this path; if the speculative block
+            # gets re-touched and re-promoted later it should still
+            # carry its class so M20's hit/miss bookkeeping stays
+            # consistent).
+            if block.source_class == "structured":
+                block.source_class = "unstructured"
             # M17: demote (or sideways move) into the no/may pool;
             # insert at the LRU-position correct for this block's
             # actual recent-access pattern.
@@ -1612,6 +1696,32 @@ class FreeKVCacheBlockQueue:
                 f"'speculative' (got {source_class!r})"
             )
         if block.lifecycle_hint == new_hint:
+            # source_class Option D, runner-confirmed-must upgrade: a
+            # speculative block whose hint is already "must" still
+            # needs to flow through ``_do_real_pool_move`` when the
+            # incoming intent is "structured" (segment_refresh
+            # hint=must on a block that the speculative promoter
+            # already moved to must). Without this, the early-exit
+            # below would silently drop the runner's confirmation and
+            # the block would keep the 30s speculative backstop TTL
+            # instead of the 5min structured one.
+            #
+            # We model it as a deferred flip into the same pool: the
+            # ``current_pool == new_hint`` short-circuit inside
+            # ``_do_real_pool_move`` is bypassed via
+            # ``_flush_pending_hint_flips`` -> the move logic, which
+            # we extend in Site 2 to handle the same-pool re-stamp
+            # as part of the speculative-precedence rules.
+            if (
+                new_hint == "must"
+                and source_class == "structured"
+                and block.source_class == "speculative"
+            ):
+                self._pending_hint_flips[block.block_id] = (
+                    block,
+                    new_hint,
+                    source_class,
+                )
             return
 
         if self.mode == VICTIM_POLICY_PURE_LRU:

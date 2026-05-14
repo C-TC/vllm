@@ -520,6 +520,30 @@ class KVCacheManager:
             for group_blocks in new_blocks:
                 for blk in group_blocks:
                     blk.lifecycle_hint = request_hint
+                    # source_class Option D, Site 1 (request-level branch).
+                    # Stamp "structured" at allocate-time when the request
+                    # promotes a block to must via the lifecycle_hint
+                    # plumbing. The block then enters _stamp_must_promotion
+                    # at append_n with the right source_class so it gets
+                    # the 300s structured TTL instead of the 60s
+                    # unstructured TTL, which is the difference behind
+                    # paper §3's "structured blocks survive much longer"
+                    # narrative under the prewarm path that previously
+                    # bypassed the structured-hint updater.
+                    #
+                    # M20 precedence rule: blocks already tagged
+                    # "speculative" are NOT overwritten. Only the
+                    # speculative promoter produces that class; once it
+                    # has run on this block, it owns the short-TTL
+                    # backstop semantics (default 30s). Promotion of a
+                    # speculative block to structured happens later,
+                    # in Site 2's _do_real_pool_move, where we have the
+                    # symmetric runner-confirmed-must signal in hand.
+                    if (
+                        request_hint == "must"
+                        and blk.source_class != "speculative"
+                    ):
+                        blk.source_class = "structured"
         if isinstance(seg_hints, dict) and seg_hints:
             # Per-segment override: for each newly-allocated block whose
             # ``_segment_ids`` overlap a scope_key, apply the per-
@@ -548,6 +572,22 @@ class KVCacheManager:
                             chosen = h
                     if chosen is not None:
                         blk.lifecycle_hint = chosen
+                        # source_class Option D, Site 1 (per-segment
+                        # branch). Same allocate-time stamp as the
+                        # request-level path above. After the M18
+                        # min-wins recompute the per-segment hint may
+                        # resolve to "must" (e.g., the block belongs
+                        # to a structured scope_key); stamp
+                        # source_class so the eventual append_n
+                        # promotion lands the block in the must pool
+                        # with the 300s structured TTL. Speculative
+                        # blocks are preserved per M20 (see Site 1
+                        # above for the rationale).
+                        if (
+                            chosen == "must"
+                            and blk.source_class != "speculative"
+                        ):
+                            blk.source_class = "structured"
 
         # WIRES Phase E5: when the request carries a workflow_segment_id
         # (set by submit_workflow_segment_prewarm via SamplingParams.extra_args

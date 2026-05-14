@@ -165,6 +165,11 @@ class _FakeBlock:
         segment_ids: tuple[str, ...] | None = None,
     ):
         self.lifecycle_hint = "may"
+        # source_class Option D, Site 1: the real KVCacheBlock dataclass
+        # defaults ``source_class`` to "unstructured" (paper §2.3:
+        # access-based promotion is the dominant path). Mirror that
+        # here so the allocate-time stamp behavior matches.
+        self.source_class = "unstructured"
         if segment_ids is not None:
             self._segment_ids = segment_ids
         elif isinstance(segment_id, str) and segment_id:
@@ -184,6 +189,14 @@ def _apply_lifecycle_hints_like_manager(request, new_blocks):
     scope_keys we pick the MIN-priority hint
     (``no`` < ``may`` < ``must``) to honor the most-conservative
     caller's intent.
+
+    source_class Option D, Site 1: when the resolved hint for a
+    block is ``"must"``, stamp ``blk.source_class = "structured"``
+    so the eventual ``_stamp_must_promotion`` at append_n picks up
+    the 300s structured TTL (vs 60s unstructured). Speculative-class
+    blocks are left alone (M20 short-TTL precedence). The
+    speculative-to-structured upgrade is handled later, in Site 2's
+    ``_do_real_pool_move``.
     """
 
     _PRIORITY = {"no": 0, "may": 1, "must": 2}
@@ -193,6 +206,11 @@ def _apply_lifecycle_hints_like_manager(request, new_blocks):
         for group_blocks in new_blocks:
             for blk in group_blocks:
                 blk.lifecycle_hint = request_hint
+                if (
+                    request_hint == "must"
+                    and getattr(blk, "source_class", None) != "speculative"
+                ):
+                    blk.source_class = "structured"
     if isinstance(seg_hints, dict) and seg_hints:
         for group_blocks in new_blocks:
             for blk in group_blocks:
@@ -206,6 +224,11 @@ def _apply_lifecycle_hints_like_manager(request, new_blocks):
                         chosen = h
                 if chosen is not None:
                     blk.lifecycle_hint = chosen
+                    if (
+                        chosen == "must"
+                        and getattr(blk, "source_class", None) != "speculative"
+                    ):
+                        blk.source_class = "structured"
 
 
 def test_legacy_only_applies_uniformly_to_all_blocks():
