@@ -37,15 +37,20 @@ unstructured on cache hit, bumping ``speculation_hit_count`` and
 re-stamping TTL to the unstructured EMA value. M20 ships this; this
 test file regression-guards that semantic.
 
-Test 7 vs Test 8: both bump ``speculation_hit_count`` (both
-confirm the speculation was useful). Test 7 leaves the block as
-``"structured"`` (runner-confirmed); Test 8 leaves it as
-``"unstructured"`` (access-confirmed).
+Test 7 vs Test 8: both confirm the speculation was useful, but
+they bump SEPARATE counters (paper §3.6 fairness: the strict
+M20 hit metric tracks access-driven reuse only). Test 7 (runner
+confirmation, late-arrival hint=must) bumps
+``speculation_runner_confirm_count`` and leaves the block as
+``"structured"``. Test 8 (access confirmation, BlockPool.touch)
+bumps ``speculation_hit_count`` and leaves the block as
+``"unstructured"``. The combined "useful outcome" rate is
+exposed via ``speculation_useful_rate``.
 
 Tests guard the OBSERVABLE downstream value (``block.source_class``,
 ``block.lifecycle_hint``, ``block.ttl_at_promotion_ns``,
-``speculation_hit_count``) per the
-``feedback_test_guards_for_invariants`` rule.
+``speculation_hit_count``, ``speculation_runner_confirm_count``)
+per the ``feedback_test_guards_for_invariants`` rule.
 """
 
 from __future__ import annotations
@@ -326,13 +331,15 @@ def test_speculative_upgrade_to_structured_on_runner_hint(monkeypatch):
     later runner hint=must lands as a deferred
     ``update_block_hint(must, source_class="structured")``, UPGRADES
     to ``"structured"`` + re-stamps TTL to the 5min structured
-    backstop + bumps ``speculation_hit_count``.
+    backstop + bumps ``speculation_runner_confirm_count`` (NOT the
+    strict ``speculation_hit_count``, which stays at 0 because no
+    access-touch happened on this path).
 
-    Rationale: speculation confirmed by runner intent counts as a hit,
-    not a miss; symmetric to the touch-driven hit handled by
-    ``BlockPool.touch`` (Site 3, test 8 below). The difference is the
-    resulting class: structured (runner-confirmed) vs unstructured
-    (access-confirmed)."""
+    Rationale: speculation confirmed by a late-arriving runner hint
+    is a useful outcome, but it is NOT what paper §3.6 measures
+    (access-driven reuse predictive quality). The two counters are
+    held separate so the strict M20 metric stays clean; the union
+    is observable via ``speculation_useful_rate``."""
     monkeypatch.delenv("WIRES_KVCACHE_SPECULATIVE_TTL_MS", raising=False)
     pool = BlockPool(num_gpu_blocks=4, enable_caching=True, hash_block_size=16)
     queue = pool.free_block_queue
@@ -350,6 +357,7 @@ def test_speculative_upgrade_to_structured_on_runner_hint(monkeypatch):
     assert block.ttl_at_promotion_ns == queue._speculative_ttl_ns
     assert queue.speculation_promotion_count == 1
     assert queue.speculation_hit_count == 0
+    assert queue.speculation_runner_confirm_count == 0
     speculative_promoted_at_ns = block.last_promoted_ns
     assert speculative_promoted_at_ns > 0
 
@@ -357,7 +365,8 @@ def test_speculative_upgrade_to_structured_on_runner_hint(monkeypatch):
     # lifecycle_hint is already "must", so this exercises the
     # same-pool re-stamp path inside Site 2 (the upgrade short-circuit
     # in ``update_block_hint`` enqueues a pending flip; flush applies
-    # the speculation_hit_count + structured TTL re-stamp).
+    # the speculation_runner_confirm_count bump + structured TTL
+    # re-stamp).
     queue.update_block_hint(block, "must", source_class="structured")
     queue._flush_pending_hint_flips()
 
@@ -371,28 +380,35 @@ def test_speculative_upgrade_to_structured_on_runner_hint(monkeypatch):
     # - last_promoted_ns refreshed (a re-stamp event, not a stale
     #   timestamp from the original speculative promotion).
     assert block.last_promoted_ns >= speculative_promoted_at_ns
-    # - Speculation hit counted (both confirmation paths bump this
-    #   counter; see test 8 for the access-driven path).
-    assert queue.speculation_hit_count == 1
+    # - Runner-confirm counter bumped; STRICT speculation_hit_count
+    #   stays at 0 (no access-touch happened, so paper §3.6's metric
+    #   correctly excludes this path).
+    assert queue.speculation_runner_confirm_count == 1
+    assert queue.speculation_hit_count == 0
     # - Promotion count unchanged (the original speculative promotion
     #   is already accounted; the upgrade doesn't double-count).
     assert queue.speculation_promotion_count == 1
-    # - Miss count unchanged (this is a HIT, not a miss).
+    # - Miss count unchanged (this is a useful outcome, not a miss).
     assert queue.speculation_miss_count == 0
+    # - Strict hit rate stays at 0/1 = 0; useful rate captures the
+    #   runner-confirm at 1/1 = 1.
+    assert queue.speculation_hit_rate == pytest.approx(0.0)
+    assert queue.speculation_useful_rate == pytest.approx(1.0)
     # - Block stayed in the must pool throughout.
     assert queue._pool_of[block.block_id] == "must"
 
 
 def test_speculative_upgrade_to_unstructured_on_touch(monkeypatch):
-    """Site 3 (M20) regression guard: a block currently classed
+    """Site 3 (M20) STRICT regression guard: a block currently classed
     ``"speculative"``, when touched (cache hit), upgrades to
     ``"unstructured"`` + re-stamps TTL to the unstructured EMA value
-    + bumps ``speculation_hit_count``.
+    + bumps ``speculation_hit_count``. The runner-confirm counter
+    stays at 0 because no runner hint=must arrived on this path.
 
-    Companion to test 7: same hit-counter semantics, different
-    resulting class. Access confirmation -> unstructured (the
-    block joins the access-driven population). Runner confirmation
-    (test 7) -> structured (the runner has explicit must intent)."""
+    Companion to test 7: both confirm speculation, but they bump
+    SEPARATE counters. Access confirmation -> unstructured + bumps
+    the strict M20 hit counter (paper §3.6). Runner confirmation
+    (test 7) -> structured + bumps the runner-confirm counter."""
     monkeypatch.delenv("WIRES_KVCACHE_SPECULATIVE_TTL_MS", raising=False)
     pool = BlockPool(num_gpu_blocks=4, enable_caching=True, hash_block_size=16)
     queue = pool.free_block_queue
@@ -407,17 +423,101 @@ def test_speculative_upgrade_to_unstructured_on_touch(monkeypatch):
     assert block.source_class == "speculative"
     assert block.ttl_at_promotion_ns == queue._speculative_ttl_ns
     assert queue.speculation_hit_count == 0
+    assert queue.speculation_runner_confirm_count == 0
 
     # Drive a cache hit (Site 3).
     pool.touch([block])
 
     # Site 3 observable: source_class upgraded to unstructured, TTL
-    # re-stamped to the unstructured EMA value, hit count bumped.
+    # re-stamped to the unstructured EMA value, STRICT hit count
+    # bumped (paper §3.6 metric); runner-confirm stays at 0.
     assert block.source_class == "unstructured"
     assert block.ttl_at_promotion_ns == queue._unstructured_ttl_at_promotion_ns()
     assert block.ttl_at_promotion_ns != queue._speculative_ttl_ns
     assert queue.speculation_hit_count == 1
+    assert queue.speculation_runner_confirm_count == 0
     assert queue.speculation_promotion_count == 1
     assert queue.speculation_miss_count == 0
-    # Derived metric reaches 1.0 after one hit on one promotion.
+    # Strict hit rate reaches 1.0 after one touch-driven hit on one
+    # promotion; useful rate matches because no runner-confirm
+    # happened.
     assert queue.speculation_hit_rate == pytest.approx(1.0)
+    assert queue.speculation_useful_rate == pytest.approx(1.0)
+
+
+# ===========================================================================
+# Test 9: split-counter pin (paper §3.6 fairness, strict M20 vs Option D)
+# ===========================================================================
+
+
+def test_split_counters_pin_paper_metric_separation(monkeypatch):
+    """Drive both confirmation paths in the SAME queue and pin the
+    counter separation: one access-touch (Site 3, BlockPool.touch) +
+    one runner-confirm (Site 2, deferred update_block_hint flush).
+    The split is what protects paper §3.6 from the conflated bump
+    that the original M20+Option D code shipped with.
+
+    Expected: each counter sees exactly one event; the strict
+    ``speculation_hit_rate`` is 1/2 (touch-only) and the union
+    ``speculation_useful_rate`` is 2/2 (touch + runner-confirm).
+    """
+    monkeypatch.delenv("WIRES_KVCACHE_SPECULATIVE_TTL_MS", raising=False)
+    pool = BlockPool(num_gpu_blocks=8, enable_caching=True, hash_block_size=16)
+    queue = pool.free_block_queue
+    touch_block = pool.blocks[1]
+    runner_block = pool.blocks[2]
+    assert touch_block.lifecycle_hint == "may"
+    assert runner_block.lifecycle_hint == "may"
+
+    # Two segments, each with one speculative block; both seeded into
+    # the same queue (the helper rebinds the global updaters per call,
+    # which is fine because both segments end up driving the same
+    # queue object).
+    _seed_segment_with_block("seg-touch", queue, touch_block)
+    mark_segment_blocks_speculative("seg-touch")
+    queue._flush_pending_hint_flips()
+
+    _seed_segment_with_block("seg-runner", queue, runner_block)
+    mark_segment_blocks_speculative("seg-runner")
+    queue._flush_pending_hint_flips()
+
+    # After two speculative promotions: 2 promotions, 0 hits, 0
+    # runner-confirms.
+    assert queue.speculation_promotion_count == 2
+    assert queue.speculation_hit_count == 0
+    assert queue.speculation_runner_confirm_count == 0
+    assert touch_block.source_class == "speculative"
+    assert runner_block.source_class == "speculative"
+
+    # Path 1: touch-driven hit on touch_block (Site 3).
+    pool.touch([touch_block])
+    assert touch_block.source_class == "unstructured"
+    assert queue.speculation_hit_count == 1
+    assert queue.speculation_runner_confirm_count == 0
+
+    # Path 2: runner-confirmed-must on runner_block (Site 2 same-pool
+    # re-stamp).
+    queue.update_block_hint(runner_block, "must", source_class="structured")
+    queue._flush_pending_hint_flips()
+    assert runner_block.source_class == "structured"
+
+    # Split pinned: each counter sees exactly one event of its kind.
+    assert queue.speculation_hit_count == 1
+    assert queue.speculation_runner_confirm_count == 1
+    assert queue.speculation_promotion_count == 2
+    assert queue.speculation_miss_count == 0
+
+    # Derived rates:
+    # - Strict speculation_hit_rate (paper §3.6) = touch hits / promotions
+    #   = 1/2.
+    assert queue.speculation_hit_rate == pytest.approx(0.5)
+    # - Useful rate = (touch + runner-confirm) / promotions = 2/2.
+    assert queue.speculation_useful_rate == pytest.approx(1.0)
+
+    # Snapshot surface mirrors the in-memory counters.
+    snap = queue.cache_stats_snapshot()
+    assert snap["speculation_hit_count"] == 1
+    assert snap["speculation_runner_confirm_count"] == 1
+    assert snap["speculation_promotion_count"] == 2
+    assert snap["speculation_hit_rate"] == pytest.approx(0.5)
+    assert snap["speculation_useful_rate"] == pytest.approx(1.0)

@@ -934,17 +934,32 @@ class FreeKVCacheBlockQueue:
         #   speculation_promotion_count: total speculative may->must
         #     promotions (incremented when a block enters the must pool
         #     with source_class == "speculative").
-        #   speculation_hit_count: speculative blocks that got reused
-        #     (cache-hit) before TTL fired (incremented in
-        #     BlockPool.touch() when the speculative -> unstructured
-        #     class upgrade happens).
+        #   speculation_hit_count: STRICT M20 metric, paper §3.6
+        #     fairness experiment. Incremented only on the
+        #     access-touch confirmation path (BlockPool.touch upgrade
+        #     speculative -> unstructured). This counts speculation
+        #     that was correctly anticipated by inference reuse and
+        #     is the denominator-stable signal for the speculation
+        #     pattern's predictive quality.
+        #   speculation_runner_confirm_count: Option D late-arrival
+        #     confirmation. Incremented when a runner-issued hint=must
+        #     lands on an already-speculative must block and upgrades
+        #     it to "structured" (engine-side pool re-stamp). This is
+        #     a different kind of useful outcome (the speculative
+        #     pre-promotion saved wall clock vs waiting for the late
+        #     runner hint), but it is NOT what paper §3.6 measures
+        #     and is tracked separately to avoid inflating the strict
+        #     speculation_hit_rate.
         #   speculation_miss_count: speculative blocks demoted by the
         #     TTL sweep without ever being hit (incremented in
         #     _sweep_ttl_must when the demoted block has source_class ==
         #     "speculative").
-        # Derived hit rate via the ``speculation_hit_rate`` property.
+        # Derived rates via the ``speculation_hit_rate`` (strict M20)
+        # and ``speculation_useful_rate`` (M20 hits + runner confirms)
+        # properties / snapshot keys.
         self.speculation_promotion_count: int = 0
         self.speculation_hit_count: int = 0
+        self.speculation_runner_confirm_count: int = 0
         self.speculation_miss_count: int = 0
 
         # M19 (CODE_MISMATCH_NOTES.md): engine-side lazy hint flips.
@@ -1025,7 +1040,12 @@ class FreeKVCacheBlockQueue:
 
     @property
     def speculation_hit_rate(self) -> float | None:
-        """M20: derived metric, hits / promotions for speculative blocks.
+        """M20 STRICT: derived metric, touch-driven hits / promotions
+        for speculative blocks. This is the paper §3.6 fairness
+        experiment metric and intentionally excludes Option D's
+        runner-confirm upgrades (tracked separately via
+        ``speculation_runner_confirm_count`` /
+        ``speculation_useful_rate``).
 
         Returns ``None`` when no speculative promotions have happened
         (avoid 0/0 noise in the cache_stats surface). When the rate
@@ -1036,6 +1056,24 @@ class FreeKVCacheBlockQueue:
         if self.speculation_promotion_count <= 0:
             return None
         return self.speculation_hit_count / self.speculation_promotion_count
+
+    @property
+    def speculation_useful_rate(self) -> float | None:
+        """Combined "useful outcome" rate for speculative promotions:
+        (touch-driven hits + runner-confirmed-must upgrades) divided
+        by total speculative promotions. Counts both forms of useful
+        speculation outcomes (M20 strict cache-hit AND Option D late
+        runner confirmation) without conflating them in the strict
+        ``speculation_hit_rate``.
+
+        Returns ``None`` when no speculative promotions have happened.
+        """
+        if self.speculation_promotion_count <= 0:
+            return None
+        useful = (
+            self.speculation_hit_count + self.speculation_runner_confirm_count
+        )
+        return useful / self.speculation_promotion_count
 
     # --- M5(a): telemetry counter snapshot --------------------------------
     def cache_stats_snapshot(self) -> dict[str, object]:
@@ -1065,10 +1103,20 @@ class FreeKVCacheBlockQueue:
             "unstructured_ema_sample_count": self.unstructured_ema_sample_count,
             "p_h_ema_sample_count": self.p_h_ema_sample_count,
             # M20 speculative source class (CODE_MISMATCH_NOTES.md M20).
+            # ``speculation_hit_count`` is the STRICT M20 metric (paper
+            # §3.6, touch-driven hits only). Option D's runner-confirm
+            # upgrades are tracked separately via
+            # ``speculation_runner_confirm_count`` to avoid inflating
+            # the strict hit rate; the union appears as
+            # ``speculation_useful_rate``.
             "speculation_promotion_count": self.speculation_promotion_count,
             "speculation_hit_count": self.speculation_hit_count,
+            "speculation_runner_confirm_count": (
+                self.speculation_runner_confirm_count
+            ),
             "speculation_miss_count": self.speculation_miss_count,
             "speculation_hit_rate": self.speculation_hit_rate,
+            "speculation_useful_rate": self.speculation_useful_rate,
             # M19 lazy hint flips.
             "lazy_flush_total_blocks": self.lazy_flush_total_blocks,
             # M17 LRU walk-depth histogram + cumulative steps.
@@ -1188,17 +1236,20 @@ class FreeKVCacheBlockQueue:
         # flip ended up where it started), skip the pool move BUT keep
         # going if this is a runner-confirmed-must upgrade on a
         # speculative block: we need to re-stamp source_class + TTL +
-        # bump speculation_hit_count even though pool placement is
-        # unchanged. Site 2's same-pool re-stamp is the engine-side
-        # mirror of Site 3's touch-driven upgrade (see the upgrade
-        # case in the must-promotion branch below).
+        # bump speculation_runner_confirm_count even though pool
+        # placement is unchanged. Site 2's same-pool re-stamp is the
+        # engine-side counterpart to Site 3's touch-driven upgrade,
+        # but it represents a DIFFERENT semantic outcome (late runner
+        # confirmation, not access-driven hit) and so bumps the
+        # separate counter introduced for paper §3.6 fairness (see
+        # the upgrade case in the must-promotion branch below).
         if current_pool == new_hint:
             if (
                 new_hint == "must"
                 and source_class == "structured"
                 and block.source_class == "speculative"
             ):
-                self.speculation_hit_count += 1
+                self.speculation_runner_confirm_count += 1
                 self._stamp_must_promotion(
                     block, time.monotonic_ns(), "structured"
                 )
@@ -1221,14 +1272,18 @@ class FreeKVCacheBlockQueue:
             #    promotion intent is "structured" (runner explicitly
             #    confirms must via segment_refresh hint=must, M9):
             #    UPGRADE speculative -> structured. Speculation
-            #    confirmed by runner intent counts as a hit (the
-            #    speculative pre-promotion saved real wall clock vs
-            #    waiting for the runner hint to land); bump
-            #    speculation_hit_count to mirror the touch-driven hit
-            #    counted by BlockPool.touch (Site 3). The TTL is
-            #    re-stamped to the structured backstop (default 5min)
-            #    by _stamp_must_promotion (which keys off the
-            #    effective class we pass in here).
+            #    confirmed by runner intent is a useful outcome (the
+            #    speculative pre-promotion saved wall clock vs
+            #    waiting for the runner hint to land), but it is NOT
+            #    the same signal as Site 3's touch-driven hit (paper
+            #    §3.6 measures access reuse predictive quality, not
+            #    late runner confirmation). Bump the separate
+            #    speculation_runner_confirm_count counter; the
+            #    combined "useful outcome" rate is exposed via
+            #    speculation_useful_rate. The TTL is re-stamped to
+            #    the structured backstop (default 5min) by
+            #    _stamp_must_promotion (which keys off the effective
+            #    class we pass in here).
             #
             # 2. Block was already "speculative" and the incoming
             #    intent is "speculative" or "unstructured": preserve
@@ -1248,11 +1303,13 @@ class FreeKVCacheBlockQueue:
             effective_source_class = source_class
             if block.source_class == "speculative":
                 if source_class == "structured":
-                    # Case 1: runner-confirmed upgrade. Mirror the
-                    # speculation-hit accounting that Site 3 (touch)
-                    # already does, so both confirmation paths are
-                    # symmetric in the cache_stats output.
-                    self.speculation_hit_count += 1
+                    # Case 1: runner-confirmed upgrade. Bump the
+                    # SEPARATE runner-confirm counter (NOT the strict
+                    # speculation_hit_count owned by Site 3 / touch),
+                    # so paper §3.6's hit-rate metric stays clean and
+                    # the late-runner-confirm signal is independently
+                    # observable via speculation_useful_rate.
+                    self.speculation_runner_confirm_count += 1
                     effective_source_class = "structured"
                 else:
                     # Case 2: preserve speculative.

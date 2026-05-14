@@ -62,8 +62,10 @@ EXPECTED_SNAPSHOT_KEYS = {
     "p_h_ema_sample_count",
     "speculation_promotion_count",
     "speculation_hit_count",
+    "speculation_runner_confirm_count",
     "speculation_miss_count",
     "speculation_hit_rate",
+    "speculation_useful_rate",
     "lazy_flush_total_blocks",
     "lru_insert_count",
     "lru_insert_walk_steps_total",
@@ -127,7 +129,8 @@ def test_snapshot_contains_all_required_keys():
 
 def test_snapshot_initial_values_are_zero_or_none():
     """Fresh queue: every cumulative counter is 0; the derived
-    speculation_hit_rate is None (denominator-safe)."""
+    speculation_hit_rate / speculation_useful_rate are None
+    (denominator-safe)."""
     blocks = [KVCacheBlock(block_id=i) for i in range(2)]
     queue = _three_pool_queue(blocks)
 
@@ -142,6 +145,7 @@ def test_snapshot_initial_values_are_zero_or_none():
         "p_h_ema_sample_count",
         "speculation_promotion_count",
         "speculation_hit_count",
+        "speculation_runner_confirm_count",
         "speculation_miss_count",
         "lazy_flush_total_blocks",
         "lru_insert_count",
@@ -151,8 +155,9 @@ def test_snapshot_initial_values_are_zero_or_none():
         assert snapshot[k] == 0, f"{k} should start at 0, got {snapshot[k]!r}"
     # Histogram: list of four zeros.
     assert snapshot["lru_insert_walk_depth_buckets"] == [0, 0, 0, 0]
-    # Derived rate: None (avoid 0/0 noise).
+    # Derived rates: both None (avoid 0/0 noise).
     assert snapshot["speculation_hit_rate"] is None
+    assert snapshot["speculation_useful_rate"] is None
 
 
 def test_snapshot_speculation_hit_rate_denominator_safe():
@@ -175,6 +180,40 @@ def test_snapshot_speculation_hit_rate_denominator_safe():
     queue.speculation_hit_count = 0
     snap_c = queue.cache_stats_snapshot()
     assert snap_c["speculation_hit_rate"] == pytest.approx(0.0)
+
+
+def test_snapshot_speculation_useful_rate_combines_hit_and_runner_confirm():
+    """``speculation_useful_rate`` returns
+    (speculation_hit_count + speculation_runner_confirm_count) /
+    speculation_promotion_count; denominator-safe (None when no
+    promotions)."""
+    blocks = [KVCacheBlock(block_id=i) for i in range(2)]
+    queue = _three_pool_queue(blocks)
+
+    # Denominator zero -> None.
+    assert queue.cache_stats_snapshot()["speculation_useful_rate"] is None
+
+    # Pure hits, no runner-confirm: useful matches strict hit rate.
+    queue.speculation_promotion_count = 4
+    queue.speculation_hit_count = 1
+    queue.speculation_runner_confirm_count = 0
+    snap_a = queue.cache_stats_snapshot()
+    assert snap_a["speculation_hit_rate"] == pytest.approx(0.25)
+    assert snap_a["speculation_useful_rate"] == pytest.approx(0.25)
+    assert snap_a["speculation_runner_confirm_count"] == 0
+
+    # Add runner-confirm events: useful diverges from strict.
+    queue.speculation_runner_confirm_count = 2
+    snap_b = queue.cache_stats_snapshot()
+    assert snap_b["speculation_hit_rate"] == pytest.approx(0.25)
+    assert snap_b["speculation_useful_rate"] == pytest.approx(0.75)
+    assert snap_b["speculation_runner_confirm_count"] == 2
+
+    # Saturate: hits + confirms == promotions -> useful == 1.0.
+    queue.speculation_hit_count = 2
+    queue.speculation_runner_confirm_count = 2
+    snap_c = queue.cache_stats_snapshot()
+    assert snap_c["speculation_useful_rate"] == pytest.approx(1.0)
 
 
 def test_snapshot_reflects_real_counter_changes():
