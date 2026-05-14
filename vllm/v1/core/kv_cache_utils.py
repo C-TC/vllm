@@ -182,7 +182,7 @@ class KVCacheBlock:
     # ``now``. Demotion (rollback or TTL) does NOT clear this field.
     last_access_ns: int = 0
 
-    # WIRES Phase D / M20: which promotion path put this block into the
+    # WIRES Phase D: which promotion path put this block into the
     # must pool. Drives per-class TTL during the lazy sweep.
     #   "structured"   — explicit CFG-driven promotion via
     #                    update_segment_lifecycle_hint (driver/monitor
@@ -195,20 +195,6 @@ class KVCacheBlock:
     #                    DEFAULT, most blocks reach must this way.
     #                    TTL = _unstructured_ttl_at_promotion_ns()
     #                    (EMA-derived snapshot, bootstrap default 60s).
-    #   "speculative"  — proactive may->must promotion driven by a
-    #                    runner hint that anticipates future reuse
-    #                    (paper §3.2 future-work extension; doc 32 §4
-    #                    OQ6 lists the candidate patterns). Carries a
-    #                    much shorter TTL backstop (_speculative_ttl_ns,
-    #                    default 30s, env
-    #                    WIRES_KVCACHE_SPECULATIVE_TTL_MS) so a wrong
-    #                    speculation only wastes the must slot for a
-    #                    bounded window. Class is TEMPORARY: on the
-    #                    first cache hit, BlockPool.touch() upgrades
-    #                    the block to "unstructured" and re-stamps it
-    #                    with the EMA-based TTL (M20: speculation
-    #                    confirmed -> behave like a normal access-
-    #                    promoted block).
     # Refreshed each time the block is promoted; demotion does not
     # clear it (so a block re-promoted via access continues to use
     # the unstructured TTL).
@@ -547,15 +533,6 @@ _DEFAULT_STRUCTURED_TTL_MS = 300_000
 # least N_BOOTSTRAP samples. After that the estimator drives TTL
 # (snapshot at promotion: T̂_u + k * sqrt(Var_u)).
 _DEFAULT_UNSTRUCTURED_TTL_BOOTSTRAP_MS = 60_000
-# M20 (paper §3.2 future-work extension; CODE_MISMATCH_NOTES.md M20):
-# speculative-source TTL backstop, default 30s. Speculative blocks are
-# proactively promoted from may to must by a runner hint that
-# anticipates future reuse; a much shorter TTL than structured (5min)
-# or unstructured-bootstrap (60s) bounds the cost of a misprediction
-# while still giving the speculated reuse a reasonable window. Class
-# upgrades to "unstructured" on the first cache hit, after which the
-# normal EMA-derived TTL takes over.
-_DEFAULT_SPECULATIVE_TTL_MS = 30_000
 _DEFAULT_UNSTRUCTURED_BOOTSTRAP_SAMPLES = 50
 # Phase C3 EMA smoothing constant (~last 20 samples weighted).
 _DEFAULT_UNSTRUCTURED_EMA_ALPHA = 0.05
@@ -624,19 +601,6 @@ def _resolve_unstructured_bootstrap_ttl_ns_from_env() -> int:
     return _resolve_ttl_ns_from_env(
         "WIRES_KVCACHE_UNSTRUCTURED_BOOTSTRAP_TTL_MS",
         _DEFAULT_UNSTRUCTURED_TTL_BOOTSTRAP_MS,
-    )
-
-
-def _resolve_speculative_ttl_ns_from_env() -> int:
-    """M20: resolve ``WIRES_KVCACHE_SPECULATIVE_TTL_MS`` env var to ns.
-
-    Default 30s. A value of 0 disables the speculative TTL sweep
-    (speculative blocks then live in must until force-evicted by
-    ``popleft_n`` step 3 or upgraded to unstructured by
-    ``BlockPool.touch()`` on first reuse).
-    """
-    return _resolve_ttl_ns_from_env(
-        "WIRES_KVCACHE_SPECULATIVE_TTL_MS", _DEFAULT_SPECULATIVE_TTL_MS
     )
 
 
@@ -746,7 +710,6 @@ class FreeKVCacheBlockQueue:
         mode: str | None = None,
         structured_ttl_ns: int | None = None,
         unstructured_bootstrap_ttl_ns: int | None = None,
-        speculative_ttl_ns: int | None = None,
         access_promotion_threshold: int | None = None,
         unstructured_k: float | None = None,
         ema_alpha: float | None = None,
@@ -770,13 +733,6 @@ class FreeKVCacheBlockQueue:
             unstructured_bootstrap_ttl_ns
             if unstructured_bootstrap_ttl_ns is not None
             else _resolve_unstructured_bootstrap_ttl_ns_from_env()
-        )
-        # M20: speculative-source TTL backstop (default 30s). See
-        # CODE_MISMATCH_NOTES.md M20 for design rationale.
-        self._speculative_ttl_ns: int = (
-            speculative_ttl_ns
-            if speculative_ttl_ns is not None
-            else _resolve_speculative_ttl_ns_from_env()
         )
         self.access_promotion_threshold: int = (
             access_promotion_threshold
@@ -915,37 +871,6 @@ class FreeKVCacheBlockQueue:
         # gives the runner / metrics scrape full visibility into the
         # adaptive-k loop.
         self.p_h_ema_sample_count: int = 0
-        # M20 telemetry (speculative source class):
-        #   speculation_promotion_count: total speculative may->must
-        #     promotions (incremented when a block enters the must pool
-        #     with source_class == "speculative").
-        #   speculation_hit_count: STRICT M20 metric, paper §3.6
-        #     fairness experiment. Incremented only on the
-        #     access-touch confirmation path (BlockPool.touch upgrade
-        #     speculative -> unstructured). This counts speculation
-        #     that was correctly anticipated by inference reuse and
-        #     is the denominator-stable signal for the speculation
-        #     pattern's predictive quality.
-        #   speculation_runner_confirm_count: Option D late-arrival
-        #     confirmation. Incremented when a runner-issued hint=must
-        #     lands on an already-speculative must block and upgrades
-        #     it to "structured" (engine-side pool re-stamp). This is
-        #     a different kind of useful outcome (the speculative
-        #     pre-promotion saved wall clock vs waiting for the late
-        #     runner hint), but it is NOT what paper §3.6 measures
-        #     and is tracked separately to avoid inflating the strict
-        #     speculation_hit_rate.
-        #   speculation_miss_count: speculative blocks demoted by the
-        #     TTL sweep without ever being hit (incremented in
-        #     _sweep_ttl_must when the demoted block has source_class ==
-        #     "speculative").
-        # Derived rates via the ``speculation_hit_rate`` (strict M20)
-        # and ``speculation_useful_rate`` (M20 hits + runner confirms)
-        # properties / snapshot keys.
-        self.speculation_promotion_count: int = 0
-        self.speculation_hit_count: int = 0
-        self.speculation_runner_confirm_count: int = 0
-        self.speculation_miss_count: int = 0
 
         # M19 (CODE_MISMATCH_NOTES.md): engine-side lazy hint flips.
         # Per-block pending pool moves are coalesced here and applied
@@ -1023,43 +948,6 @@ class FreeKVCacheBlockQueue:
             return self._unstructured_k_override
         return self._derive_k_from_ph(self._p_h_hat)
 
-    @property
-    def speculation_hit_rate(self) -> float | None:
-        """M20 STRICT: derived metric, touch-driven hits / promotions
-        for speculative blocks. This is the paper §3.6 fairness
-        experiment metric and intentionally excludes Option D's
-        runner-confirm upgrades (tracked separately via
-        ``speculation_runner_confirm_count`` /
-        ``speculation_useful_rate``).
-
-        Returns ``None`` when no speculative promotions have happened
-        (avoid 0/0 noise in the cache_stats surface). When the rate
-        falls below ~50% the speculation pattern probably isn't
-        worthwhile per the v1 simplification rule (paper §3.2 future
-        work / CODE_MISMATCH_NOTES.md M20).
-        """
-        if self.speculation_promotion_count <= 0:
-            return None
-        return self.speculation_hit_count / self.speculation_promotion_count
-
-    @property
-    def speculation_useful_rate(self) -> float | None:
-        """Combined "useful outcome" rate for speculative promotions:
-        (touch-driven hits + runner-confirmed-must upgrades) divided
-        by total speculative promotions. Counts both forms of useful
-        speculation outcomes (M20 strict cache-hit AND Option D late
-        runner confirmation) without conflating them in the strict
-        ``speculation_hit_rate``.
-
-        Returns ``None`` when no speculative promotions have happened.
-        """
-        if self.speculation_promotion_count <= 0:
-            return None
-        useful = (
-            self.speculation_hit_count + self.speculation_runner_confirm_count
-        )
-        return useful / self.speculation_promotion_count
-
     # --- M5(a): telemetry counter snapshot --------------------------------
     def cache_stats_snapshot(self) -> dict[str, object]:
         """Return a flat dict of every cumulative cache-stats counter
@@ -1070,10 +958,6 @@ class FreeKVCacheBlockQueue:
         (E5 stream, ``engine_cache_stats.jsonl``). Keys are stable
         across releases; new counters are added (never renamed) so
         offline analysis can grow without breaking back-fills.
-
-        ``speculation_hit_rate`` is denominator-protected: returns
-        ``None`` when ``speculation_promotion_count == 0`` (avoid
-        0/0 noise in dashboards).
 
         Cheap by construction: a few attribute reads + a list copy
         for the bucket histogram. Safe to call from the engine tick
@@ -1087,21 +971,6 @@ class FreeKVCacheBlockQueue:
             # EMA estimator sample tallies (Phase C3, M14).
             "unstructured_ema_sample_count": self.unstructured_ema_sample_count,
             "p_h_ema_sample_count": self.p_h_ema_sample_count,
-            # M20 speculative source class (CODE_MISMATCH_NOTES.md M20).
-            # ``speculation_hit_count`` is the STRICT M20 metric (paper
-            # §3.6, touch-driven hits only). Option D's runner-confirm
-            # upgrades are tracked separately via
-            # ``speculation_runner_confirm_count`` to avoid inflating
-            # the strict hit rate; the union appears as
-            # ``speculation_useful_rate``.
-            "speculation_promotion_count": self.speculation_promotion_count,
-            "speculation_hit_count": self.speculation_hit_count,
-            "speculation_runner_confirm_count": (
-                self.speculation_runner_confirm_count
-            ),
-            "speculation_miss_count": self.speculation_miss_count,
-            "speculation_hit_rate": self.speculation_hit_rate,
-            "speculation_useful_rate": self.speculation_useful_rate,
             # M19 lazy hint flips.
             "lazy_flush_total_blocks": self.lazy_flush_total_blocks,
             # M17 LRU walk-depth histogram + cumulative steps.
@@ -1204,11 +1073,10 @@ class FreeKVCacheBlockQueue:
         block may have been popped (eviction) or removed (touch hit)
         between the deferred record time and now.
 
-        source_class Option D, Site 2 (the speculative-precedence
-        rules): the must-promotion branch picks the effective
-        source_class via the precedence laid out below; the demote
-        branch reclassifies a "structured" block to "unstructured"
-        on flip-out-of-must.
+        source_class Option D, Site 2: the must-promotion branch
+        stamps the incoming source_class; the demote branch
+        reclassifies a "structured" block to "unstructured" on
+        flip-out-of-must.
         """
         current_pool = self._pool_of.get(block.block_id)
         if current_pool is None:
@@ -1218,26 +1086,8 @@ class FreeKVCacheBlockQueue:
             # happened. Nothing else to do.
             return
         # If the block is already in the right pool (e.g., back-to-back
-        # flip ended up where it started), skip the pool move BUT keep
-        # going if this is a runner-confirmed-must upgrade on a
-        # speculative block: we need to re-stamp source_class + TTL +
-        # bump speculation_runner_confirm_count even though pool
-        # placement is unchanged. Site 2's same-pool re-stamp is the
-        # engine-side counterpart to Site 3's touch-driven upgrade,
-        # but it represents a DIFFERENT semantic outcome (late runner
-        # confirmation, not access-driven hit) and so bumps the
-        # separate counter introduced for paper §3.6 fairness (see
-        # the upgrade case in the must-promotion branch below).
+        # flip ended up where it started), nothing else to do.
         if current_pool == new_hint:
-            if (
-                new_hint == "must"
-                and source_class == "structured"
-                and block.source_class == "speculative"
-            ):
-                self.speculation_runner_confirm_count += 1
-                self._stamp_must_promotion(
-                    block, time.monotonic_ns(), "structured"
-                )
             return
         self._pools[current_pool].remove(block)
         if new_hint == "must":
@@ -1248,59 +1098,8 @@ class FreeKVCacheBlockQueue:
             # demote (must -> may) and the runner-driven non-must
             # transitions where access-time ordering matters for the
             # LRU eviction class.
-            #
-            # source_class Option D, Site 2 (must-promotion branch).
-            # Resolve the effective source_class with the precedence
-            # rules, then stamp. Three cases worth calling out:
-            #
-            # 1. Block was already "speculative" and the incoming
-            #    promotion intent is "structured" (runner explicitly
-            #    confirms must via segment_refresh hint=must, M9):
-            #    UPGRADE speculative -> structured. Speculation
-            #    confirmed by runner intent is a useful outcome (the
-            #    speculative pre-promotion saved wall clock vs
-            #    waiting for the runner hint to land), but it is NOT
-            #    the same signal as Site 3's touch-driven hit (paper
-            #    §3.6 measures access reuse predictive quality, not
-            #    late runner confirmation). Bump the separate
-            #    speculation_runner_confirm_count counter; the
-            #    combined "useful outcome" rate is exposed via
-            #    speculation_useful_rate. The TTL is re-stamped to
-            #    the structured backstop (default 5min) by
-            #    _stamp_must_promotion (which keys off the effective
-            #    class we pass in here).
-            #
-            # 2. Block was already "speculative" and the incoming
-            #    intent is "speculative" or "unstructured": preserve
-            #    the speculative class. M20 owns the short-TTL
-            #    backstop semantics on this block until either a
-            #    touch hit (Site 3) or a runner-confirmed-must (case
-            #    1 above) upgrades it. We re-stamp last_promoted_ns
-            #    so the freshly re-promoted block gets a full TTL
-            #    window, but keep the source_class.
-            #
-            # 3. Block was non-speculative: use the incoming
-            #    source_class as the effective class (the existing
-            #    Phase C3 behaviour: structured for the runner-driven
-            #    explicit path, unstructured for the access-driven
-            #    path, speculative when this is the speculative
-            #    promoter's first run on the block).
-            effective_source_class = source_class
-            if block.source_class == "speculative":
-                if source_class == "structured":
-                    # Case 1: runner-confirmed upgrade. Bump the
-                    # SEPARATE runner-confirm counter (NOT the strict
-                    # speculation_hit_count owned by Site 3 / touch),
-                    # so paper §3.6's hit-rate metric stays clean and
-                    # the late-runner-confirm signal is independently
-                    # observable via speculation_useful_rate.
-                    self.speculation_runner_confirm_count += 1
-                    effective_source_class = "structured"
-                else:
-                    # Case 2: preserve speculative.
-                    effective_source_class = "speculative"
             self._stamp_must_promotion(
-                block, time.monotonic_ns(), effective_source_class
+                block, time.monotonic_ns(), source_class
             )
             self._pools[new_hint].append(block)
         else:
@@ -1311,13 +1110,7 @@ class FreeKVCacheBlockQueue:
             # 300s backstop TTL. Demoting via update_block_hint means
             # the runner has dropped the must intent; the block
             # rejoins the access-driven population, so reclassify it
-            # to "unstructured" for any future re-promotion. The
-            # speculative class is preserved across demotes (M20: the
-            # speculative miss accounting fires only via the TTL
-            # sweep, never via this path; if the speculative block
-            # gets re-touched and re-promoted later it should still
-            # carry its class so M20's hit/miss bookkeeping stays
-            # consistent).
+            # to "unstructured" for any future re-promotion.
             if block.source_class == "structured":
                 block.source_class = "unstructured"
             # M17: demote (or sideways move) into the no/may pool;
@@ -1457,14 +1250,6 @@ class FreeKVCacheBlockQueue:
             blk = must.popleft_one()
             assert blk is not None
             blk.lifecycle_hint = "may"
-            # M20: speculative block aged out without ever being hit;
-            # this is the "speculation miss via TTL fallback" path.
-            # (Hits are counted in BlockPool.touch() via the class
-            # upgrade; reactive may/no demotes go through
-            # update_block_hint and are explicitly NOT counted as
-            # misses per the spec.)
-            if blk.source_class == "speculative":
-                self.speculation_miss_count += 1
             demoted.append(blk)
             self._pool_of[blk.block_id] = "may"
         if demoted:
@@ -1621,27 +1406,17 @@ class FreeKVCacheBlockQueue:
     def _stamp_must_promotion(
         self, block: KVCacheBlock, now_ns: int, source_class: str
     ) -> None:
-        """Phase C3 / M20: stamp promoted_at + ttl_at_promotion +
+        """Phase C3: stamp promoted_at + ttl_at_promotion +
         source_class on a block as it enters the must pool.
 
         M14: also resets ``_must_hit_count`` so the indicator that
         feeds p̂_h reflects only hits during this must-residency.
-
-        M20: when ``source_class == "speculative"``, picks the short
-        speculative TTL backstop (default 30s) and bumps
-        ``speculation_promotion_count``. The class is temporary; on the
-        first cache hit ``BlockPool.touch()`` upgrades it to
-        ``"unstructured"`` (and counts the hit on
-        ``speculation_hit_count``).
         """
         block.last_promoted_ns = now_ns
         block.source_class = source_class
         block._must_hit_count = 0
         if source_class == "structured":
             block.ttl_at_promotion_ns = self._structured_ttl_ns
-        elif source_class == "speculative":
-            block.ttl_at_promotion_ns = self._speculative_ttl_ns
-            self.speculation_promotion_count += 1
         else:
             block.ttl_at_promotion_ns = self._unstructured_ttl_at_promotion_ns()
 
@@ -1732,38 +1507,12 @@ class FreeKVCacheBlockQueue:
         """
         if new_hint not in self._pools:
             new_hint = "may"
-        if source_class not in ("structured", "unstructured", "speculative"):
+        if source_class not in ("structured", "unstructured"):
             raise ValueError(
-                f"source_class must be 'structured', 'unstructured', or "
-                f"'speculative' (got {source_class!r})"
+                f"source_class must be 'structured' or 'unstructured' "
+                f"(got {source_class!r})"
             )
         if block.lifecycle_hint == new_hint:
-            # source_class Option D, runner-confirmed-must upgrade: a
-            # speculative block whose hint is already "must" still
-            # needs to flow through ``_do_real_pool_move`` when the
-            # incoming intent is "structured" (segment_refresh
-            # hint=must on a block that the speculative promoter
-            # already moved to must). Without this, the early-exit
-            # below would silently drop the runner's confirmation and
-            # the block would keep the 30s speculative backstop TTL
-            # instead of the 5min structured one.
-            #
-            # We model it as a deferred flip into the same pool: the
-            # ``current_pool == new_hint`` short-circuit inside
-            # ``_do_real_pool_move`` is bypassed via
-            # ``_flush_pending_hint_flips`` -> the move logic, which
-            # we extend in Site 2 to handle the same-pool re-stamp
-            # as part of the speculative-precedence rules.
-            if (
-                new_hint == "must"
-                and source_class == "structured"
-                and block.source_class == "speculative"
-            ):
-                self._pending_hint_flips[block.block_id] = (
-                    block,
-                    new_hint,
-                    source_class,
-                )
             return
 
         if self.mode == VICTIM_POLICY_PURE_LRU:

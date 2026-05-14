@@ -371,9 +371,9 @@ def emit_segment_touch(
 #
 # Exports the cumulative counters tracked on ``FreeKVCacheBlockQueue``
 # (must_pool_evicted, ttl_demoted, access_promoted, EMA sample tallies,
-# speculation_*, lazy_flush_total_blocks, LRU walk-depth histogram) into
-# a low-volume JSONL stream so offline analysis can plot them over wall
-# clock without scraping engine logs.
+# lazy_flush_total_blocks, LRU walk-depth histogram) into a low-volume
+# JSONL stream so offline analysis can plot them over wall clock without
+# scraping engine logs.
 #
 # Driven from the scheduler tick (``Scheduler.schedule()``) on a coarse
 # interval (``WIRES_TELEMETRY_CACHE_STATS_INTERVAL_S``, default 1.0).

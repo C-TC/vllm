@@ -530,19 +530,7 @@ class KVCacheManager:
                     # paper §3's "structured blocks survive much longer"
                     # narrative under the prewarm path that previously
                     # bypassed the structured-hint updater.
-                    #
-                    # M20 precedence rule: blocks already tagged
-                    # "speculative" are NOT overwritten. Only the
-                    # speculative promoter produces that class; once it
-                    # has run on this block, it owns the short-TTL
-                    # backstop semantics (default 30s). Promotion of a
-                    # speculative block to structured happens later,
-                    # in Site 2's _do_real_pool_move, where we have the
-                    # symmetric runner-confirmed-must signal in hand.
-                    if (
-                        request_hint == "must"
-                        and blk.source_class != "speculative"
-                    ):
+                    if request_hint == "must":
                         blk.source_class = "structured"
         if isinstance(seg_hints, dict) and seg_hints:
             # Per-segment override: for each newly-allocated block whose
@@ -580,13 +568,8 @@ class KVCacheManager:
                         # to a structured scope_key); stamp
                         # source_class so the eventual append_n
                         # promotion lands the block in the must pool
-                        # with the 300s structured TTL. Speculative
-                        # blocks are preserved per M20 (see Site 1
-                        # above for the rationale).
-                        if (
-                            chosen == "must"
-                            and blk.source_class != "speculative"
-                        ):
+                        # with the 300s structured TTL.
+                        if chosen == "must":
                             blk.source_class = "structured"
 
         # WIRES Phase E5: when the request carries a workflow_segment_id

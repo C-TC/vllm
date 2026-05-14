@@ -198,13 +198,6 @@ class BlockPool:
                 queue.update_block_hint(blk, new_hint, source_class="structured")
 
             segment_actions.set_block_hint_updater(_structured_hint_updater)
-
-            # M20: separate slot for speculative may->must promotion.
-            # See ``set_speculative_block_promoter`` docstring.
-            def _speculative_promoter(blk):
-                queue.update_block_hint(blk, "must", source_class="speculative")
-
-            segment_actions.set_speculative_block_promoter(_speculative_promoter)
         except ImportError:
             pass
 
@@ -519,33 +512,11 @@ class BlockPool:
         import time as _time
 
         now_ns = _time.monotonic_ns()
-        # M19/M20: flush any deferred hint flips so the per-block
+        # M19: flush any deferred hint flips so the per-block
         # ``source_class`` snapshot read below reflects the latest
-        # promotion state. Without this, a block whose speculative
-        # promotion is sitting in the M19 pending dict would still
-        # report the old ``source_class`` and the M20 upgrade branch
-        # below would silently miss it.
+        # promotion state.
         self.free_block_queue._flush_pending_hint_flips()
         for block in blocks:
-            # M20: speculative -> unstructured class upgrade. A cache
-            # hit on a block currently classed as "speculative" confirms
-            # the speculation; promote the block out of the speculative
-            # class so subsequent eviction logic uses the normal EMA-
-            # based TTL (the speculative TTL was a *backstop* for
-            # mispredicted speculation; once a hit lands, the block is
-            # behaving like any access-promoted block). Done BEFORE the
-            # unstructured-EMA feed below so the post-upgrade block is
-            # eligible for the normal sample path. We re-stamp
-            # ``ttl_at_promotion_ns`` and ``last_promoted_ns`` here so
-            # the lazy sweep treats this as a fresh unstructured
-            # promotion (no carryover of the short speculative TTL).
-            if block.source_class == "speculative":
-                block.source_class = "unstructured"
-                block.last_promoted_ns = now_ns
-                block.ttl_at_promotion_ns = (
-                    self.free_block_queue._unstructured_ttl_at_promotion_ns()
-                )
-                self.free_block_queue.speculation_hit_count += 1
             # WIRES Phase C3 (docs/v2/32 §2.4.1 + Q8 answer):
             # If this block is in must-pool with source_class
             # "unstructured", feed the EMA estimator with the

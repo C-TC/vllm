@@ -4,18 +4,17 @@
 
 Per ``paper/CODE_MISMATCH_NOTES.md`` M5(a) the cumulative counters
 maintained on ``FreeKVCacheBlockQueue`` (must_pool_evicted, ttl_demoted,
-access_promoted, the EMA sample tallies, the speculation_*
-counters, lazy_flush_total_blocks, the LRU walk-depth histogram) MUST
-be exposed via the existing engine-telemetry stream so offline
-analysis can plot them over wall clock without scraping engine logs.
+access_promoted, the EMA sample tallies, lazy_flush_total_blocks, the
+LRU walk-depth histogram) MUST be exposed via the existing engine-
+telemetry stream so offline analysis can plot them over wall clock
+without scraping engine logs.
 
 Two surfaces are tested:
 
 1. ``FreeKVCacheBlockQueue.cache_stats_snapshot()`` — the structured
    dict consumed by the emitter. Asserts the schema (every counter
-   present, the derived ``speculation_hit_rate`` is denominator-safe)
-   and that the snapshot reflects observable counter increments after
-   real queue operations.
+   present) and that the snapshot reflects observable counter
+   increments after real queue operations.
 2. ``wires_engine_telemetry.emit_cache_stats(snapshot)`` — emits one
    row to the ``engine_cache_stats`` JSONL stream (E5). Asserts that
    the row contains the snapshot keys + a wall-clock ``ts_epoch``,
@@ -60,12 +59,6 @@ EXPECTED_SNAPSHOT_KEYS = {
     "access_promoted_count",
     "unstructured_ema_sample_count",
     "p_h_ema_sample_count",
-    "speculation_promotion_count",
-    "speculation_hit_count",
-    "speculation_runner_confirm_count",
-    "speculation_miss_count",
-    "speculation_hit_rate",
-    "speculation_useful_rate",
     "lazy_flush_total_blocks",
     "lru_insert_count",
     "lru_insert_walk_steps_total",
@@ -104,7 +97,6 @@ def _three_pool_queue(blocks: list[KVCacheBlock]) -> FreeKVCacheBlockQueue:
         mode=VICTIM_POLICY_WIRES_THREE_POOL,
         structured_ttl_ns=10**12,
         unstructured_bootstrap_ttl_ns=10**12,
-        speculative_ttl_ns=10**12,
     )
 
 
@@ -127,10 +119,8 @@ def test_snapshot_contains_all_required_keys():
     )
 
 
-def test_snapshot_initial_values_are_zero_or_none():
-    """Fresh queue: every cumulative counter is 0; the derived
-    speculation_hit_rate / speculation_useful_rate are None
-    (denominator-safe)."""
+def test_snapshot_initial_values_are_zero():
+    """Fresh queue: every cumulative counter is 0."""
     blocks = [KVCacheBlock(block_id=i) for i in range(2)]
     queue = _three_pool_queue(blocks)
 
@@ -143,10 +133,6 @@ def test_snapshot_initial_values_are_zero_or_none():
         "access_promoted_count",
         "unstructured_ema_sample_count",
         "p_h_ema_sample_count",
-        "speculation_promotion_count",
-        "speculation_hit_count",
-        "speculation_runner_confirm_count",
-        "speculation_miss_count",
         "lazy_flush_total_blocks",
         "lru_insert_count",
         "lru_insert_walk_steps_total",
@@ -155,65 +141,6 @@ def test_snapshot_initial_values_are_zero_or_none():
         assert snapshot[k] == 0, f"{k} should start at 0, got {snapshot[k]!r}"
     # Histogram: list of four zeros.
     assert snapshot["lru_insert_walk_depth_buckets"] == [0, 0, 0, 0]
-    # Derived rates: both None (avoid 0/0 noise).
-    assert snapshot["speculation_hit_rate"] is None
-    assert snapshot["speculation_useful_rate"] is None
-
-
-def test_snapshot_speculation_hit_rate_denominator_safe():
-    """``speculation_hit_rate`` must be denominator-safe across
-    speculation_promotion_count == 0 AND > 0; never raises."""
-    blocks = [KVCacheBlock(block_id=i) for i in range(2)]
-    queue = _three_pool_queue(blocks)
-
-    # Denominator zero: rate is None.
-    snap_a = queue.cache_stats_snapshot()
-    assert snap_a["speculation_hit_rate"] is None
-
-    # Drive a denominator > 0 + a hit.
-    queue.speculation_promotion_count = 4
-    queue.speculation_hit_count = 3
-    snap_b = queue.cache_stats_snapshot()
-    assert snap_b["speculation_hit_rate"] == pytest.approx(0.75)
-
-    # Drive a hit_count == 0, denominator > 0 (cold speculation, no hits).
-    queue.speculation_hit_count = 0
-    snap_c = queue.cache_stats_snapshot()
-    assert snap_c["speculation_hit_rate"] == pytest.approx(0.0)
-
-
-def test_snapshot_speculation_useful_rate_combines_hit_and_runner_confirm():
-    """``speculation_useful_rate`` returns
-    (speculation_hit_count + speculation_runner_confirm_count) /
-    speculation_promotion_count; denominator-safe (None when no
-    promotions)."""
-    blocks = [KVCacheBlock(block_id=i) for i in range(2)]
-    queue = _three_pool_queue(blocks)
-
-    # Denominator zero -> None.
-    assert queue.cache_stats_snapshot()["speculation_useful_rate"] is None
-
-    # Pure hits, no runner-confirm: useful matches strict hit rate.
-    queue.speculation_promotion_count = 4
-    queue.speculation_hit_count = 1
-    queue.speculation_runner_confirm_count = 0
-    snap_a = queue.cache_stats_snapshot()
-    assert snap_a["speculation_hit_rate"] == pytest.approx(0.25)
-    assert snap_a["speculation_useful_rate"] == pytest.approx(0.25)
-    assert snap_a["speculation_runner_confirm_count"] == 0
-
-    # Add runner-confirm events: useful diverges from strict.
-    queue.speculation_runner_confirm_count = 2
-    snap_b = queue.cache_stats_snapshot()
-    assert snap_b["speculation_hit_rate"] == pytest.approx(0.25)
-    assert snap_b["speculation_useful_rate"] == pytest.approx(0.75)
-    assert snap_b["speculation_runner_confirm_count"] == 2
-
-    # Saturate: hits + confirms == promotions -> useful == 1.0.
-    queue.speculation_hit_count = 2
-    queue.speculation_runner_confirm_count = 2
-    snap_c = queue.cache_stats_snapshot()
-    assert snap_c["speculation_useful_rate"] == pytest.approx(1.0)
 
 
 def test_snapshot_reflects_real_counter_changes():
@@ -279,14 +206,15 @@ def test_snapshot_is_json_serialisable():
     """
     blocks = [KVCacheBlock(block_id=i) for i in range(3)]
     queue = _three_pool_queue(blocks)
-    queue.speculation_promotion_count = 2
-    queue.speculation_hit_count = 1
+    queue.must_pool_evicted_count = 2
+    queue.ttl_demoted_count = 5
 
     snapshot = queue.cache_stats_snapshot()
 
     payload = json.dumps(snapshot)
     decoded = json.loads(payload)
-    assert decoded["speculation_hit_rate"] == pytest.approx(0.5)
+    assert decoded["must_pool_evicted_count"] == 2
+    assert decoded["ttl_demoted_count"] == 5
     assert decoded["lru_insert_walk_depth_buckets"] == [0, 0, 0, 0]
 
 
@@ -311,8 +239,8 @@ def test_emit_cache_stats_enabled_writes_row(tmp_path: Path):
 
     blocks = [KVCacheBlock(block_id=i) for i in range(2)]
     queue = _three_pool_queue(blocks)
-    queue.speculation_promotion_count = 4
-    queue.speculation_hit_count = 1
+    queue.must_pool_evicted_count = 4
+    queue.ttl_demoted_count = 1
     snapshot = queue.cache_stats_snapshot()
 
     wet.emit_cache_stats(snapshot)
@@ -332,9 +260,8 @@ def test_emit_cache_stats_enabled_writes_row(tmp_path: Path):
     # ts_epoch is a sane wall-clock value (within the last 60s).
     assert (time.time() - row["ts_epoch"]) < 60.0
     # Snapshot values round-trip verbatim.
-    assert row["speculation_promotion_count"] == 4
-    assert row["speculation_hit_count"] == 1
-    assert row["speculation_hit_rate"] == pytest.approx(0.25)
+    assert row["must_pool_evicted_count"] == 4
+    assert row["ttl_demoted_count"] == 1
 
 
 def test_emit_cache_stats_explicit_ts_epoch(tmp_path: Path):

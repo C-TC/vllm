@@ -193,10 +193,7 @@ def _apply_lifecycle_hints_like_manager(request, new_blocks):
     source_class Option D, Site 1: when the resolved hint for a
     block is ``"must"``, stamp ``blk.source_class = "structured"``
     so the eventual ``_stamp_must_promotion`` at append_n picks up
-    the 300s structured TTL (vs 60s unstructured). Speculative-class
-    blocks are left alone (M20 short-TTL precedence). The
-    speculative-to-structured upgrade is handled later, in Site 2's
-    ``_do_real_pool_move``.
+    the 300s structured TTL (vs 60s unstructured).
     """
 
     _PRIORITY = {"no": 0, "may": 1, "must": 2}
@@ -206,10 +203,7 @@ def _apply_lifecycle_hints_like_manager(request, new_blocks):
         for group_blocks in new_blocks:
             for blk in group_blocks:
                 blk.lifecycle_hint = request_hint
-                if (
-                    request_hint == "must"
-                    and getattr(blk, "source_class", None) != "speculative"
-                ):
+                if request_hint == "must":
                     blk.source_class = "structured"
     if isinstance(seg_hints, dict) and seg_hints:
         for group_blocks in new_blocks:
@@ -224,10 +218,7 @@ def _apply_lifecycle_hints_like_manager(request, new_blocks):
                         chosen = h
                 if chosen is not None:
                     blk.lifecycle_hint = chosen
-                    if (
-                        chosen == "must"
-                        and getattr(blk, "source_class", None) != "speculative"
-                    ):
+                    if chosen == "must":
                         blk.source_class = "structured"
 
 

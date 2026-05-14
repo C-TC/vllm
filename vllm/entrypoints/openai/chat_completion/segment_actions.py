@@ -89,9 +89,7 @@ __all__ = [
     "update_segment_lifecycle_hint",
     "release_segment_instance_contribution",
     "mark_segment_prepare_prefilled",
-    "mark_segment_blocks_speculative",
     "set_block_hint_updater",
-    "set_speculative_block_promoter",
 ]
 
 
@@ -113,15 +111,6 @@ __all__ = [
 # don't exercise the queue.
 _block_hint_updater: Callable[[Any, str], None] | None = None
 
-# M20: callback that promotes a block to "must" with source_class
-# "speculative" (short TTL backstop). Bound by ``BlockPool.__init__`` to
-# a closure over ``free_block_queue.update_block_hint(blk, "must",
-# source_class="speculative")``. Kept as a separate slot from
-# ``_block_hint_updater`` (which is hardcoded to source_class
-# "structured") so the speculative path doesn't risk changing the
-# semantics of the existing structured-promotion callback.
-_speculative_block_promoter: Callable[[Any], None] | None = None
-
 
 def set_block_hint_updater(fn: Callable[[Any, str], None] | None) -> None:
     """Install (or clear) the callback used by ``SegmentRegistry.update_block_hints``
@@ -134,21 +123,6 @@ def set_block_hint_updater(fn: Callable[[Any, str], None] | None) -> None:
     """
     global _block_hint_updater
     _block_hint_updater = fn
-
-
-def set_speculative_block_promoter(fn: Callable[[Any], None] | None) -> None:
-    """M20: install (or clear) the callback used by
-    ``mark_segment_blocks_speculative`` to promote each tagged block to
-    must with source_class "speculative" via the block_pool's queue.
-
-    Called by ``BlockPool.__init__`` with a closure over
-    ``free_block_queue.update_block_hint(blk, "must",
-    source_class="speculative")``. Multiple block_pool instances share
-    this module-level slot, last writer wins (mirrors
-    ``_block_hint_updater`` semantics).
-    """
-    global _speculative_block_promoter
-    _speculative_block_promoter = fn
 
 
 # Action kinds (mirrors runner-side v2/backend/segment_action.py constants).
@@ -824,22 +798,7 @@ class SegmentRegistry:
         prefill_status: str,
         prefill_token_count: int,
     ) -> dict[str, Any]:
-        """Register a segment_prepare action.
-
-        Recognised optional fields on ``action`` (in addition to the
-        usual ``segment_id`` / ``token_hash`` / ``family_id`` / etc.):
-
-          * ``speculative`` (bool, default False): M20 hook for the
-            paper §3.2 future-work extension. When True, downstream
-            block-pool operations on this segment's blocks should use
-            ``source_class="speculative"`` (short TTL backstop, default
-            30s, env ``WIRES_KVCACHE_SPECULATIVE_TTL_MS``). The actual
-            stamping happens later when blocks are promoted via
-            ``mark_segment_blocks_speculative`` (engine-side primitive
-            this commit lands; runner-side patterns that *invoke* it
-            are intentionally left to future work, see
-            CODE_MISMATCH_NOTES.md M20).
-        """
+        """Register a segment_prepare action."""
         token_hash = _normalize_token_hash(action) or ""
         family_id = _resolve_family_id(action) or ""
         segment_id = _optional_str(action.get("segment_id")) or ""
@@ -1724,67 +1683,6 @@ def tag_blocks_with_segment_id(blocks: Any, segment_id: str | None) -> None:
             _registry.register_block_for_segment(segment_id, blk)
         except AttributeError:
             continue
-
-
-def mark_segment_blocks_speculative(segment_id: str | None) -> dict[str, Any]:
-    """M20: speculative-promote every block currently tagged for
-    ``segment_id``.
-
-    Each block is moved to the must pool with
-    ``source_class="speculative"`` (short TTL backstop, default 30s,
-    env ``WIRES_KVCACHE_SPECULATIVE_TTL_MS``). The class upgrades back
-    to ``"unstructured"`` on the first cache hit (see
-    ``BlockPool.touch()``); if no hit lands before the TTL, the lazy
-    sweep demotes the block and increments ``speculation_miss_count``.
-
-    Returns ``{"updated": N, "skipped": K, "reject_reason": str|None}``.
-    Engine-side primitive only: paper §3.2 leaves the runner-side
-    speculation patterns to future work, so there is no built-in caller
-    here. Tests and future runner code can invoke this directly after
-    ``submit_segment_prepare_action`` has tagged the segment's blocks.
-    """
-
-    if not isinstance(segment_id, str) or not segment_id:
-        return {"updated": 0, "skipped": 0, "reject_reason": "missing_segment_id"}
-    promoter = _speculative_block_promoter
-    with _registry._lock:
-        blocks = _registry._blocks_by_segment_id.get(segment_id, [])
-        updated = 0
-        skipped = 0
-        kept: list[Any] = []
-        for blk in blocks:
-            # Stale-tag check on M18 tuple field. The block is live for
-            # this segment iff segment_id appears in the tuple. Test fakes
-            # MUST expose ``_segment_ids`` (the legacy ``_segment_id``
-            # backward-compat property was removed in the M18 cleanup).
-            tagged_ids = getattr(blk, "_segment_ids", ())
-            if segment_id not in tagged_ids:
-                skipped += 1
-                continue
-            try:
-                if promoter is not None:
-                    promoter(blk)
-                else:
-                    # Fallback path (no block_pool wired, e.g. unit
-                    # tests). Stamp the field directly so subsequent
-                    # promote-on-append picks the speculative TTL.
-                    blk.source_class = "speculative"
-                    blk.lifecycle_hint = "must"
-                updated += 1
-                kept.append(blk)
-            except AttributeError:
-                skipped += 1
-        if kept:
-            _registry._blocks_by_segment_id[segment_id] = kept
-        else:
-            _registry._blocks_by_segment_id.pop(segment_id, None)
-        return {
-            "updated": updated,
-            "skipped": skipped,
-            "reject_reason": None
-            if updated > 0
-            else ("no_blocks_for_segment" if not blocks else "all_stale"),
-        }
 
 
 def mark_segment_prepare_prefilled(
