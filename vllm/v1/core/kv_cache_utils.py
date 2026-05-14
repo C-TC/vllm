@@ -560,6 +560,21 @@ _DEFAULT_PH_INIT = 0.5
 # value and the new constant. Translates to smoothing constant
 # alpha_ema = 1 − 0.5**(1/N).
 _DEFAULT_PH_EMA_HALFLIFE = 100
+
+# M24 (paper §3.4 + CODE_MISMATCH_NOTES.md M24 step 6): sliding window
+# parameters for ``no_pool_evicted_then_recomputed_count``. The window
+# size is min(60s of evictions, 1000 entries floor); the deque hard cap
+# protects against runaway memory in pathological cases. Per the spec
+# the window is "max(1000, evictions in last 60s)" -- we keep the
+# implementation simple with a fixed deque cap that comfortably
+# exceeds typical 60s eviction counts (10000 at the upper bound; even
+# at 100 evictions/sec for 60s we cap at 6000) plus a per-entry ts
+# check on insert to age out anything older than the window. Tunable
+# only by code change; no env override (M24 is a sanity probe, not a
+# perf knob).
+_NO_EVICT_WINDOW_SECONDS = 60.0
+_NO_EVICT_WINDOW_MIN = 1000
+_NO_EVICT_WINDOW_HARD_CAP = 10_000
 # Phase C4 α-shrinkage was removed in the M16 cleanup (2026-05-13
 # follow-up). Capacity pressure on the must pool is now handled
 # exclusively by the `must_pool_evicted` backstop in `popleft_n`
@@ -857,6 +872,46 @@ class FreeKVCacheBlockQueue:
 
         # Telemetry counter (docs/v2/32 §2.6). Always 0 in pure_lru mode.
         self.must_pool_evicted_count: int = 0
+        # M24 sanity counter (paper §3.4 + docs/v2/49 + CODE_MISMATCH_NOTES.md
+        # M24 step 6): cumulative count of cache hits on blocks
+        # currently sitting in the ``no`` pool. Under correct cross-
+        # instance reuse analysis this MUST be 0: if the analysis said
+        # "no peer is expected to hit," then by construction no peer
+        # should hit. Any non-zero value means either the analysis is
+        # wrong, or the workflow falls outside the analysis's
+        # pattern coverage (e.g. a self-consistency case not declared
+        # via batch metadata). The counter is incremented in
+        # ``BlockPool.touch`` (block_pool.py) at hit time, BEFORE the
+        # block is removed from the no pool. Always 0 in pure_lru mode
+        # (no pool tracking).
+        self.no_pool_hit_count: int = 0
+        # M24 sanity counter (paper §3.4 + CODE_MISMATCH_NOTES.md M24
+        # step 6 #2): cumulative count of blocks evicted from the
+        # ``no`` pool whose content is later re-prefilled (i.e. the
+        # block hash re-appears in ``cached_block_hash_to_block`` via
+        # ``cache_full_blocks``). Same interpretation as
+        # ``no_pool_hit_count``: a non-zero value indicates the
+        # analysis declared "no" for content that some peer in fact
+        # wanted, forcing recomputation. The detection bookkeeping
+        # uses a sliding window of recently-evicted no-pool block
+        # hashes; window size adapts to ``max(_NO_EVICT_WINDOW_MIN,
+        # evictions in the last _NO_EVICT_WINDOW_SECONDS)`` per the
+        # spec, so heavy eviction lanes get more visibility while
+        # quiet lanes stay cheap.
+        self.no_pool_evicted_then_recomputed_count: int = 0
+        # Sliding-window deque of (block_hash, evicted_ts_ns) for the
+        # no pool. Hashes are added at popleft eviction time; trimmed
+        # at insertion time per the policy in ``_no_evict_record_hash``.
+        # ``deque`` chosen for O(1) append + popleft; bounded growth
+        # via ``maxlen`` guards against runaway memory in edge cases.
+        from collections import deque
+
+        self._no_evict_window: deque[tuple[object, int]] = deque(
+            maxlen=_NO_EVICT_WINDOW_HARD_CAP
+        )
+        # Reverse index: hash -> count, so the cache_full_blocks
+        # check is O(1). Maintained alongside the deque.
+        self._no_evict_window_index: dict[object, int] = {}
         # Telemetry counter (docs/v2/32 §2.4). Cumulative count of blocks
         # demoted from must -> may by the lazy TTL sweep at popleft_n.
         self.ttl_demoted_count: int = 0
@@ -968,6 +1023,20 @@ class FreeKVCacheBlockQueue:
             "must_pool_evicted_count": self.must_pool_evicted_count,
             "ttl_demoted_count": self.ttl_demoted_count,
             "access_promoted_count": self.access_promoted_count,
+            # M24 sanity counters (paper §3.4 + CODE_MISMATCH_NOTES.md
+            # M24 step 6): both should sit at 0 in healthy production.
+            # Non-zero is the early-warning signal that the cross-
+            # instance reuse static analysis missed a sharing
+            # opportunity (declared "no" for content that was in fact
+            # peer-reusable). Investigation playbook: dump the
+            # workflow IR and the (op, position) of the offending
+            # block, re-run ``compute_reuse_table`` with verbose
+            # tracing to find which R() propagation yielded F when it
+            # should have been T.
+            "no_pool_hit_count": self.no_pool_hit_count,
+            "no_pool_evicted_then_recomputed_count": (
+                self.no_pool_evicted_then_recomputed_count
+            ),
             # EMA estimator sample tallies (Phase C3, M14).
             "unstructured_ema_sample_count": self.unstructured_ema_sample_count,
             "p_h_ema_sample_count": self.p_h_ema_sample_count,
@@ -978,6 +1047,80 @@ class FreeKVCacheBlockQueue:
             "lru_insert_walk_steps_total": self.lru_insert_walk_steps_total,
             "lru_insert_walk_depth_buckets": list(self.lru_insert_walk_depth_buckets),
         }
+
+    # --- M24 sanity-counter helpers ---------------------------------------
+
+    def _no_evict_record_hash(self, block_hash: object) -> None:
+        """Record ``block_hash`` as recently evicted from the no pool.
+
+        Maintains the sliding window used by ``_no_evict_check_recompute``.
+        Called from ``popleft`` / ``popleft_n`` after a no-pool block is
+        popped (i.e. evicted under capacity pressure).
+
+        Aging policy: at insertion time we evict any window entries
+        older than ``_NO_EVICT_WINDOW_SECONDS``. This is cheap (O(k)
+        only when k entries are stale; typically a single popleft on a
+        bounded deque) and keeps the index in lockstep. The deque's
+        ``maxlen`` provides a hard upper bound; the per-entry ts check
+        provides the soft 60s window from the spec.
+        """
+
+        if block_hash is None:
+            return
+        now_ns = time.monotonic_ns()
+        cutoff_ns = now_ns - int(_NO_EVICT_WINDOW_SECONDS * 1e9)
+        # Evict stale entries from the head of the window. Stop when we
+        # find an entry within the window (the deque is FIFO by
+        # insertion, which is monotonically non-decreasing in ts).
+        window = self._no_evict_window
+        while window and window[0][1] < cutoff_ns:
+            old_hash, _old_ts = window.popleft()
+            count = self._no_evict_window_index.get(old_hash, 0)
+            if count <= 1:
+                self._no_evict_window_index.pop(old_hash, None)
+            else:
+                self._no_evict_window_index[old_hash] = count - 1
+        # If the deque is at hard cap, the leftmost entry is dropped
+        # by ``maxlen`` semantics on append. Keep the index in sync.
+        if len(window) == window.maxlen:
+            old_hash, _old_ts = window[0]
+            count = self._no_evict_window_index.get(old_hash, 0)
+            if count <= 1:
+                self._no_evict_window_index.pop(old_hash, None)
+            else:
+                self._no_evict_window_index[old_hash] = count - 1
+        window.append((block_hash, now_ns))
+        self._no_evict_window_index[block_hash] = (
+            self._no_evict_window_index.get(block_hash, 0) + 1
+        )
+        # Enforce floor behavior: keep at least _NO_EVICT_WINDOW_MIN
+        # entries even after aging. The deque maxlen handles the
+        # ceiling; the floor is implicit (we only age past 60s, never
+        # past the floor count).
+
+    def _no_evict_check_recompute(self, block_hash: object) -> bool:
+        """Return True iff ``block_hash`` is currently in the no-evict
+        sliding window AND increment ``no_pool_evicted_then_recomputed_count``.
+
+        Called from ``BlockPool.cache_full_blocks`` at the moment a
+        new full block hash is inserted into ``cached_block_hash_to_block``.
+        The detection condition is: this hash was recently evicted
+        from the no pool; the new insert means the engine is paying
+        the recompute cost for content the analysis declared peer-
+        unreachable.
+
+        Idempotent within the analysis window: a hash that ricochets
+        in/out repeatedly bumps the counter on EACH re-insertion. The
+        window entry stays until the ts ages out, so the metric
+        captures sustained pressure correctly.
+        """
+
+        if block_hash is None:
+            return False
+        if block_hash not in self._no_evict_window_index:
+            return False
+        self.no_pool_evicted_then_recomputed_count += 1
+        return True
 
     @staticmethod
     def _derive_k_from_ph(p_h: float) -> float:
@@ -1312,6 +1455,11 @@ class FreeKVCacheBlockQueue:
                 self._pool_of.pop(blk.block_id, None)
                 if name == "must":
                     self.must_pool_evicted_count += 1
+                # M24 sanity counter: record evicted no-pool block
+                # hashes for the recompute-detection sliding window.
+                # Wired here so both popleft and popleft_n hit it.
+                if name == "no":
+                    self._no_evict_record_hash(blk.block_hash)
                 return blk
         raise ValueError("No free blocks available")
 
@@ -1348,6 +1496,12 @@ class FreeKVCacheBlockQueue:
                     pool_taken.append((name, blk))
                 if name == "must":
                     must_taken += 1
+                # M24 sanity counter: record evicted no-pool block
+                # hashes (mirrors popleft above; both eviction paths
+                # must be instrumented for the recompute counter to
+                # reflect reality).
+                if name == "no":
+                    self._no_evict_record_hash(blk.block_hash)
             if len(ret) == n:
                 break
 

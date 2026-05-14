@@ -63,6 +63,11 @@ EXPECTED_SNAPSHOT_KEYS = {
     "lru_insert_count",
     "lru_insert_walk_steps_total",
     "lru_insert_walk_depth_buckets",
+    # M24 sanity counters (paper §3.4 + CODE_MISMATCH_NOTES.md M24
+    # step 6). Both should sit at 0 in healthy production -- non-zero
+    # is the early-warning signal for an analysis miss.
+    "no_pool_hit_count",
+    "no_pool_evicted_then_recomputed_count",
 }
 
 
@@ -136,6 +141,10 @@ def test_snapshot_initial_values_are_zero():
         "lazy_flush_total_blocks",
         "lru_insert_count",
         "lru_insert_walk_steps_total",
+        # M24 sanity counters (also cumulative ints; see
+        # EXPECTED_SNAPSHOT_KEYS above).
+        "no_pool_hit_count",
+        "no_pool_evicted_then_recomputed_count",
     }
     for k in int_counters:
         assert snapshot[k] == 0, f"{k} should start at 0, got {snapshot[k]!r}"

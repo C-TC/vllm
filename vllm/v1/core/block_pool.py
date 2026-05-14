@@ -322,6 +322,17 @@ class BlockPool:
             )
             blk.block_hash = block_hash_with_group_id
             self.cached_block_hash_to_block.insert(block_hash_with_group_id, blk)
+            # M24 sanity counter (paper §3.4 + CODE_MISMATCH_NOTES.md
+            # M24 step 6 #2): if this freshly-cached hash matches a
+            # block recently evicted from the ``no`` pool, the
+            # analysis told the engine "no peer will want this" but
+            # here we are, paying the prefill cost again. Bump the
+            # early-warning counter. The check is O(1) (dict
+            # membership) and silently no-ops for hashes outside the
+            # window.
+            self.free_block_queue._no_evict_check_recompute(
+                block_hash_with_group_id
+            )
             if wires_telem_on:
                 stamp_block_writer(
                     blk,
@@ -517,6 +528,20 @@ class BlockPool:
         # promotion state.
         self.free_block_queue._flush_pending_hint_flips()
         for block in blocks:
+            # M24 sanity counter (paper §3.4 + CODE_MISMATCH_NOTES.md
+            # M24 step 6 #1): if this block is currently in the ``no``
+            # pool, the cross-instance reuse analysis declared "no
+            # peer is expected to hit" -- yet here we are, hitting
+            # it. Bump the early-warning counter BEFORE the touch
+            # logic flips state. Always 0 in healthy production; non-
+            # zero indicates the analysis missed a sharing
+            # opportunity (or the workflow shape is outside the
+            # analysis's pattern coverage). Cheap: one dict.get per
+            # touched block.
+            if (
+                self.free_block_queue._pool_of.get(block.block_id) == "no"
+            ):
+                self.free_block_queue.no_pool_hit_count += 1
             # WIRES Phase C3 (docs/v2/32 §2.4.1 + Q8 answer):
             # If this block is in must-pool with source_class
             # "unstructured", feed the EMA estimator with the
