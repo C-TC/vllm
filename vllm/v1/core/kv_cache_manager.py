@@ -434,7 +434,45 @@ class KVCacheManager:
         Args:
             request: The request to free the blocks.
         """
+        # Oracle liveness hint (v3/12). The request may carry the number of leading
+        # blocks of its [prompt + output] that some future request can still match;
+        # everything past that is dead now that this request is done. Dead blocks are
+        # uncached (so nothing can match them) and moved to the HEAD of the free queue
+        # (so the allocator consumes them before it evicts anything still useful).
+        # Only blocks that actually reached ref_cnt 0 are touched: a block another
+        # running request still holds is not in the free queue at all.
+        k = getattr(request, "oracle_live_prefix_blocks", None)
+        if k is None:
+            self.coordinator.free(request.request_id)
+            return
+
+        doomed: list = []
+        for mgr in self.coordinator.single_type_managers:
+            blocks = mgr.req_to_blocks.get(request.request_id)
+            if blocks:
+                doomed.extend(blocks[k:])
         self.coordinator.free(request.request_id)
+
+        if not doomed:
+            return
+        queue = self.block_pool.free_block_queue
+        moved, seen = [], set()
+        for blk in doomed:
+            if blk.block_id in seen or blk.ref_cnt != 0 or blk.is_null:
+                continue
+            if blk.prev_free_block is None or blk.next_free_block is None:
+                continue                      # not in the free queue: leave it alone
+            seen.add(blk.block_id)
+            bh = blk.block_hash
+            if bh is not None:
+                self.block_pool.oracle_dead_hashes.add(bh)
+            self.block_pool._maybe_evict_cached_block(blk)
+            queue.remove(blk)
+            moved.append(blk)
+        if moved:
+            queue.appendleft_n(moved)
+            self.block_pool.oracle_blocks_reclaimed += len(moved)
+            self.block_pool.maybe_log_oracle_stats()
 
     def remove_skipped_blocks(
         self, request_id: str, total_computed_tokens: int

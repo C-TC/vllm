@@ -80,6 +80,16 @@ class Request:
         self.sampling_params = sampling_params
         self.pooling_params = pooling_params
         self.lora_request = lora_request
+        # Oracle liveness hint (v3/12): number of leading blocks of this request's
+        # [prompt + output] that some future request may still match. Blocks beyond it
+        # are dead the moment this request finishes. None disables the feature, which
+        # is the default and reproduces stock behaviour exactly.
+        self.oracle_live_prefix_blocks: int | None = None
+        if sampling_params is not None and sampling_params.extra_args:
+            _k = sampling_params.extra_args.get("oracle_live_prefix_blocks")
+            if isinstance(_k, int) and _k >= 0:
+                self.oracle_live_prefix_blocks = _k
+
         self.structured_output_request = StructuredOutputRequest.from_sampling_params(
             sampling_params
         )

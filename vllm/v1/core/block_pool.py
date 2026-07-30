@@ -169,6 +169,16 @@ class BlockPool:
         # Cache for block lookup
         self.cached_block_hash_to_block: BlockHashToBlockMap = BlockHashToBlockMap()
 
+        # Oracle liveness-hint telemetry (v3/12). oracle_dead_hashes records every block
+        # hash the hint caused us to uncache; if a later lookup misses on one of those,
+        # the hint was WRONG and oracle_dead_requested counts it. That counter must stay
+        # 0: it is the runtime form of the soundness invariant in the design doc 5(a).
+        self.oracle_blocks_reclaimed: int = 0
+        self.oracle_dead_requested: int = 0
+        self.oracle_dead_hashes: set = set()
+        self._oracle_log_every: int = 5000
+        self._oracle_next_log: int = 5000
+
         # To represent a placeholder block with block_id=0.
         # The ref_cnt of null_block is not maintained, needs special care to
         # avoid freeing it.
@@ -203,6 +213,13 @@ class BlockPool:
                 block_hash_with_group_id
             )
             if not block:
+                # Oracle soundness check (v3/12 section 5a): a miss on a hash the
+                # liveness hint retired means the hint declared a block dead that was
+                # in fact needed again. Must stay 0.
+                if self.oracle_dead_hashes and (
+                    block_hash_with_group_id in self.oracle_dead_hashes
+                ):
+                    self.oracle_dead_requested += 1
                 return None
             cached_blocks.append(block)
         return cached_blocks
@@ -348,6 +365,17 @@ class BlockPool:
                 if self.metrics_collector:
                     self.metrics_collector.on_block_allocated(block)
         return ret
+
+    def maybe_log_oracle_stats(self) -> None:
+        """Log oracle-hint counters occasionally so a sweep can grep the server log."""
+        if self.oracle_blocks_reclaimed >= self._oracle_next_log:
+            self._oracle_next_log += self._oracle_log_every
+            logger.info(
+                "[oracle-hint] blocks_reclaimed=%d dead_requested=%d dead_hashes=%d",
+                self.oracle_blocks_reclaimed,
+                self.oracle_dead_requested,
+                len(self.oracle_dead_hashes),
+            )
 
     def _maybe_evict_cached_block(self, block: KVCacheBlock) -> bool:
         """

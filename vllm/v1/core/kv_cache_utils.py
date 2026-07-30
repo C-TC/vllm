@@ -345,6 +345,33 @@ class FreeKVCacheBlockQueue:
 
         self.num_free_blocks += len(blocks)
 
+    def appendleft_n(self, blocks: list[KVCacheBlock]) -> None:
+        """Put blocks back at the HEAD of the free list, so they are handed out
+        (and therefore consumed) BEFORE anything already queued.
+
+        Added for the oracle liveness-hint experiment (v3/12): blocks that no future
+        request can match are worthless, so the allocator should eat them first instead
+        of cannibalising cache entries that still have a future. Mirror of append_n; a
+        no-op for every code path that does not call it.
+        """
+        if len(blocks) == 0:
+            return
+
+        first_block = self.fake_free_list_head.next_free_block
+        assert first_block is not None, (
+            "next_free_block of fake_free_list_head should always exist"
+        )
+        prev = self.fake_free_list_head
+        for block in blocks:
+            block.prev_free_block = prev
+            prev.next_free_block = block
+            prev = block
+
+        prev.next_free_block = first_block
+        first_block.prev_free_block = prev
+
+        self.num_free_blocks += len(blocks)
+
     def get_all_free_blocks(self) -> list[KVCacheBlock]:
         """Get all free blocks in the free list. Mainly used for testing.
 
