@@ -174,10 +174,11 @@ class BlockPool:
         # the hint was WRONG and oracle_dead_requested counts it. That counter must stay
         # 0: it is the runtime form of the soundness invariant in the design doc 5(a).
         self.oracle_blocks_reclaimed: int = 0
+        self.oracle_hinted_requests: int = 0
         self.oracle_dead_requested: int = 0
         self.oracle_dead_hashes: set = set()
-        self._oracle_log_every: int = 5000
-        self._oracle_next_log: int = 5000
+        self._oracle_log_every: int = 200
+        self._oracle_next_log: int = 200
 
         # To represent a placeholder block with block_id=0.
         # The ref_cnt of null_block is not maintained, needs special care to

@@ -441,7 +441,15 @@ class KVCacheManager:
         # (so the allocator consumes them before it evicts anything still useful).
         # Only blocks that actually reached ref_cnt 0 are touched: a block another
         # running request still holds is not in the free queue at all.
+        # Only retire when the request is genuinely FINISHED. vLLM also calls free() to
+        # PREEMPT a still-running request (_preempt_request asserts status == RUNNING),
+        # and retiring there is wrong twice over: the request is about to resume and
+        # re-prefill exactly those blocks, and the extra misses add pressure that causes
+        # more preemption, which is a thrash loop. Measured on webweaver/off/2000: without
+        # this gate, dead_requested climbed past 1000 and the cell ran ~30x slower.
         k = getattr(request, "oracle_live_prefix_blocks", None)
+        if k is not None and not request.is_finished():
+            k = None
         if k is None:
             self.coordinator.free(request.request_id)
             return
@@ -453,10 +461,25 @@ class KVCacheManager:
                 doomed.extend(blocks[k:])
         self.coordinator.free(request.request_id)
 
+        bp = self.block_pool
+        bp.oracle_hinted_requests += 1
+        if bp.oracle_hinted_requests <= 3:
+            logger.info("[oracle-hint] req=%s k=%s doomed=%d", request.request_id, k, len(doomed))
         if not doomed:
             return
         queue = self.block_pool.free_block_queue
         moved, seen = [], set()
+        try:
+            self._oracle_retire(doomed, queue, moved, seen)
+        except Exception:
+            logger.exception("[oracle-hint] retirement FAILED")
+        if moved:
+            queue.appendleft_n(moved)
+            bp.oracle_blocks_reclaimed += len(moved)
+            bp.maybe_log_oracle_stats()
+        return
+
+    def _oracle_retire(self, doomed, queue, moved, seen):
         for blk in doomed:
             if blk.block_id in seen or blk.ref_cnt != 0 or blk.is_null:
                 continue
@@ -469,10 +492,6 @@ class KVCacheManager:
             self.block_pool._maybe_evict_cached_block(blk)
             queue.remove(blk)
             moved.append(blk)
-        if moved:
-            queue.appendleft_n(moved)
-            self.block_pool.oracle_blocks_reclaimed += len(moved)
-            self.block_pool.maybe_log_oracle_stats()
 
     def remove_skipped_blocks(
         self, request_id: str, total_computed_tokens: int
