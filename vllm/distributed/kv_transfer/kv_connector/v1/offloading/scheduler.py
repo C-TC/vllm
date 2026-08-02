@@ -42,6 +42,10 @@ class OffloadingConnectorScheduler:
         # requests to load for the current scheduler step
         self._reqs_to_load: dict[ReqId, TransferSpec] = {}
         # request blocks are stored in order
+        # WIRES hook 1 telemetry: offload-blocks the liveness hint kept us from writing
+        self.wires_stores_skipped: int = 0
+        self._wires_next_log: int = 2000
+
         # index of next block (of size offloaded_block_size) to offload
         self._next_stored_block_idx: dict[ReqId, int] = {}
         # if GPU prefix caching is enabled,
@@ -210,6 +214,24 @@ class OffloadingConnectorScheduler:
             # with async scheduling, some tokens may be missing
             total_tokens = min(expected_tokens, req.num_tokens)
             num_blocks = total_tokens // self.offloaded_block_size
+
+            # WIRES hook 1 (v3/15 section 6): never write blocks the liveness hint has
+            # declared dead. vLLM stores eagerly and unconditionally, so without this a
+            # measured 55-94% of the store traffic is data no future request can match;
+            # it still costs PCIe, still lengthens the serial store queue, and still
+            # evicts useful blocks out of the host tier.
+            #
+            # This is a clamp on an integer in a loop that already runs: no I/O, no CUDA
+            # call, no lock, and it can only SHORTEN the store list. Skipping a store
+            # degrades to a host miss plus recompute, which is exactly what already
+            # happens when the tier is full and prepare_store returns None.
+            k = getattr(req, "oracle_live_prefix_blocks", None)
+            if k is not None:
+                live_offload_blocks = k // self.block_size_factor
+                if live_offload_blocks < num_blocks:
+                    self.wires_stores_skipped += num_blocks - live_offload_blocks
+                    num_blocks = live_offload_blocks
+
             start_block_idx = self._next_stored_block_idx.get(req_id, 0)
             num_new_blocks = num_blocks - start_block_idx
 
@@ -230,6 +252,10 @@ class OffloadingConnectorScheduler:
                 continue
 
             self._next_stored_block_idx[req_id] = num_blocks
+
+            if self.wires_stores_skipped >= self._wires_next_log:
+                self._wires_next_log += 2000
+                logger.info("[wires-offload] stores_skipped=%d", self.wires_stores_skipped)
 
             if not store_output.block_hashes_to_store:
                 continue
