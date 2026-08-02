@@ -44,6 +44,7 @@ class OffloadingConnectorScheduler:
         # request blocks are stored in order
         # WIRES hook 1 telemetry: offload-blocks the liveness hint kept us from writing
         self.wires_stores_skipped: int = 0
+        self._wires_skipped_hw: dict[ReqId, int] = {}
         self._wires_next_log: int = 2000
 
         # index of next block (of size offloaded_block_size) to offload
@@ -231,13 +232,17 @@ class OffloadingConnectorScheduler:
             if k is not None:
                 live_offload_blocks = k // self.block_size_factor
                 if live_offload_blocks < num_blocks:
-                    # Count only blocks not already stored. This loop runs once per
-                    # scheduler step per request, so counting the whole clamped tail
-                    # would re-count the same blocks every step and inflate the figure
-                    # by orders of magnitude.
-                    self.wires_stores_skipped += max(
-                        0, num_blocks - max(start_block_idx, live_offload_blocks)
-                    )
+                    # Count each block once. This loop runs per scheduler step per
+                    # request, and clamping means the store never happens, so
+                    # _next_stored_block_idx does NOT advance past the skipped tail:
+                    # subtracting start_block_idx is not enough to stop the re-count.
+                    # Keep an explicit high-water mark per request instead.
+                    hw = self._wires_skipped_hw.get(req_id, 0)
+                    if num_blocks > hw:
+                        self.wires_stores_skipped += num_blocks - max(
+                            hw, live_offload_blocks
+                        )
+                        self._wires_skipped_hw[req_id] = num_blocks
                     num_blocks = live_offload_blocks
 
             num_new_blocks = num_blocks - start_block_idx
@@ -361,6 +366,7 @@ class OffloadingConnectorScheduler:
         # TODO(orozery): possibly kickoff offload for last block
         # which may have been deferred due to async scheduling
         self._next_stored_block_idx.pop(req_id, None)
+        self._wires_skipped_hw.pop(req_id, None)
 
         request_being_stored = req_id in self._reqs_being_stored
         return request_being_stored, None
