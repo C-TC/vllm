@@ -225,14 +225,21 @@ class OffloadingConnectorScheduler:
             # call, no lock, and it can only SHORTEN the store list. Skipping a store
             # degrades to a host miss plus recompute, which is exactly what already
             # happens when the tier is full and prepare_store returns None.
+            start_block_idx = self._next_stored_block_idx.get(req_id, 0)
+
             k = getattr(req, "oracle_live_prefix_blocks", None)
             if k is not None:
                 live_offload_blocks = k // self.block_size_factor
                 if live_offload_blocks < num_blocks:
-                    self.wires_stores_skipped += num_blocks - live_offload_blocks
+                    # Count only blocks not already stored. This loop runs once per
+                    # scheduler step per request, so counting the whole clamped tail
+                    # would re-count the same blocks every step and inflate the figure
+                    # by orders of magnitude.
+                    self.wires_stores_skipped += max(
+                        0, num_blocks - max(start_block_idx, live_offload_blocks)
+                    )
                     num_blocks = live_offload_blocks
 
-            start_block_idx = self._next_stored_block_idx.get(req_id, 0)
             num_new_blocks = num_blocks - start_block_idx
 
             if num_new_blocks <= 0:
