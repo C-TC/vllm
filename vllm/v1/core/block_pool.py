@@ -286,6 +286,14 @@ class BlockPool:
                 block_hash, kv_cache_group_id
             )
             blk.block_hash = block_hash_with_group_id
+            # A retired hash that is being cached again is alive once more, so it must leave
+            # oracle_dead_hashes. Without this the set only ever grows and the soundness
+            # counter fires on ordinary LRU misses for any hash the hint ever touched, which
+            # is what made it read nonzero on the heavily preempting cells: a preempted
+            # request re-prefills, re-creates a legitimately retired prefix, and that block is
+            # later evicted normally.
+            if self.oracle_dead_hashes:
+                self.oracle_dead_hashes.discard(block_hash_with_group_id)
             self.cached_block_hash_to_block.insert(block_hash_with_group_id, blk)
             if new_hashes is not None:
                 new_hashes.append(maybe_convert_block_hash(block_hash))
