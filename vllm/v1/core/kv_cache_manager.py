@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import itertools
+from collections import OrderedDict
 from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Literal, overload
@@ -185,6 +186,14 @@ class KVCacheManager:
                 - A list of blocks that are computed for the request.
                 - The number of computed tokens.
         """
+        # v2 oracle hint: apply the retirements this request is carrying before matching.
+        # Safe to do here because the driver only names blocks whose every consumer has
+        # already completed, so nothing this request could match is affected.
+        _ret = getattr(request, "oracle_retire", None)
+        if _ret:
+            self.apply_oracle_retire(_ret)
+            request.oracle_retire = []
+
         # We skip finding the prefix cache hit when prefix caching is
         # disabled or the request is marked as skipping kv cache read
         # (which happens when the request requires prompt logprobs
@@ -426,6 +435,62 @@ class KVCacheManager:
 
         return self.create_kv_cache_blocks(new_blocks)
 
+    # ---- oracle liveness hint, v2 -------------------------------------------------
+    # A bounded record of what each recently finished request had cached, so the driver can
+    # come back and say "blocks from index k of request R are dead now". Hashes rather than
+    # block objects, because a block may have been reallocated in between; the retire path
+    # re-looks-up the hash and only acts if it still maps to that same cached block.
+
+    _ORACLE_RING = 8192
+
+    def _oracle_remember(self, request) -> None:
+        if not hasattr(self, "_oracle_seen"):
+            self._oracle_seen = OrderedDict()
+        hashes: list = []
+        for mgr in self.coordinator.single_type_managers:
+            for blk in mgr.req_to_blocks.get(request.request_id, ()):
+                if blk.block_hash is not None:
+                    hashes.append(blk.block_hash)
+        if not hashes:
+            return
+        self._oracle_seen[request.request_id] = hashes
+        while len(self._oracle_seen) > self._ORACLE_RING:
+            self._oracle_seen.popitem(last=False)
+
+    def apply_oracle_retire(self, pairs) -> None:
+        """Retire blocks [k:] of already finished requests named by the driver.
+
+        The driver only sends a pair once its k has shrunk, and k only ever shrinks, so a
+        lost or late message degrades to plain LRU and never retires something early.
+        """
+        seen_reqs = getattr(self, "_oracle_seen", None)
+        if not seen_reqs or not pairs:
+            return
+        bp = self.block_pool
+        queue = bp.free_block_queue
+        moved, seen = [], set()
+        for rid, k in pairs:
+            hashes = seen_reqs.get(rid)
+            if hashes is None or k >= len(hashes):
+                continue
+            doomed = []
+            for h in hashes[k:]:
+                blk = bp.cached_block_hash_to_block.get_one_block(h)
+                # the block may have been reallocated since; only touch it if this hash
+                # still owns it
+                if blk is not None and blk.block_hash == h:
+                    doomed.append(blk)
+            if doomed:
+                try:
+                    self._oracle_retire(doomed, queue, moved, seen)
+                except Exception:
+                    logger.exception("[oracle-hint] v2 retirement FAILED")
+            seen_reqs[rid] = hashes[:k]
+        if moved:
+            queue.appendleft_n(moved)
+            bp.oracle_blocks_reclaimed += len(moved)
+            bp.maybe_log_oracle_stats()
+
     def free(self, request: Request) -> None:
         """Free the blocks allocated for the request.
         We free the blocks in reverse order so that the tail blocks are evicted
@@ -447,6 +512,13 @@ class KVCacheManager:
         # re-prefill exactly those blocks, and the extra misses add pressure that causes
         # more preemption, which is a thrash loop. Measured on webweaver/off/2000: without
         # this gate, dead_requested climbed past 1000 and the cell ran ~30x slower.
+        # v2 protocol: record this request's block hashes so a LATER message can retire
+        # part of them, and retire nothing now. Deciding at completion is what fixes the
+        # fanout leak and the preemption unsoundness of the dispatch-time integer; see the
+        # note in v3/replay/oracle_hint.py.
+        if getattr(request, "oracle_retire", None) is not None and request.is_finished():
+            self._oracle_remember(request)
+
         k = getattr(request, "oracle_live_prefix_blocks", None)
         if k is not None and not request.is_finished():
             k = None
